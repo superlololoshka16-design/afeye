@@ -48,7 +48,10 @@ jobs:
           set -e
           cd /mnt/chromium
           git clone -q --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
-          export PATH="/mnt/chromium/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
+          export PATH="/mnt/chromium/depot_tools:$PATH"
+          # bootstrap the bundled python/cipd first: `fetch` dies without it
+          gclient --version >/dev/null 2>&1 || true
+          gclient bootstrap --version >/dev/null 2>&1 || true
           fetch --no-history chromium
           cd src
           gclient sync --no-history --with_branch_heads -r "src@refs/tags/${CHROMIUM_REF}"
@@ -100,7 +103,10 @@ jobs:
           fi
           cd /mnt/chromium
           git clone -q --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
-          export PATH="/mnt/chromium/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
+          export PATH="/mnt/chromium/depot_tools:$PATH"
+          # bootstrap the bundled python/cipd first: `fetch` dies without it
+          gclient --version >/dev/null 2>&1 || true
+          gclient bootstrap --version >/dev/null 2>&1 || true
           fetch --no-history chromium
           cd src
           gclient sync --no-history --with_branch_heads -r "src@refs/tags/${CHROMIUM_REF}"
@@ -146,7 +152,10 @@ jobs:
           fi
           cd /mnt/chromium
           git clone -q --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
-          export PATH="/mnt/chromium/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
+          export PATH="/mnt/chromium/depot_tools:$PATH"
+          # bootstrap the bundled python/cipd first: `fetch` dies without it
+          gclient --version >/dev/null 2>&1 || true
+          gclient bootstrap --version >/dev/null 2>&1 || true
           fetch --no-history chromium
           cd src
           gclient sync --no-history --with_branch_heads -r "src@refs/tags/${CHROMIUM_REF}"
