@@ -1,0 +1,220 @@
+name: afeye-build
+
+# Build the patched chrome ONCE; publish it as the repo release `chrome-build`.
+# The crawl workflow (afeye.yml) downloads the asset from that release - the
+# cron path NEVER rebuilds. Re-run this workflow only when patches change.
+#
+# A full chromium build on a 4-core runner exceeds the 6h job cap, so the build
+# walks through artifact-carrying stages: each stage re-syncs the pinned
+# revision, re-applies the patches, restores the previous stage's out/ dir
+# (identical content -> only the re-touched objects rebuild), continues ninja
+# under a hard sub-timeout, and hands the state to the next stage. The stage
+# that finds the finished chrome binary packs the RUNTIME files (not the whole
+# build tree) as the state; the next stage only smoke-tests and releases.
+
+on:
+  workflow_dispatch:
+    inputs:
+      chromium_ref:
+        description: 'chromium tag to build'
+        required: false
+        default: '133.0.6943.98'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: afeye-build
+  cancel-in-progress: false
+
+env:
+  CHROMIUM_REF: ${{ github.event.inputs.chromium_ref || '133.0.6943.98' }}
+  OUT: out/afeye
+  BUILD_WINDOW_SECS: '10500' # 2h55m of ninja inside a 5h50m job
+
+jobs:
+  stage1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: workspace
+        run: |
+          set -e
+          sudo mkdir -p /mnt/chromium /mnt/pack && sudo chown -R runner: /mnt/chromium /mnt/pack
+          df -h / /mnt
+      - name: sync
+        run: |
+          set -e
+          cd /mnt/chromium
+          git clone -q --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          export PATH="/mnt/chromium/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
+          fetch --no-history chromium
+          cd src
+          gclient sync --no-history --with_branch_heads -r "src@refs/tags/${CHROMIUM_REF}"
+          git rev-parse HEAD
+      - name: apply-patches
+        run: bash .github/build/apply_patches.sh /mnt/chromium/src
+      - name: gn-gen
+        run: |
+          set -e
+          export PATH="/mnt/chromium/depot_tools:$PATH"
+          cd /mnt/chromium/src
+          gn gen ${OUT} --args='is_debug=false is_official_build=false is_component_build=false symbol_level=0 blink_symbol_level=0 v8_symbol_level=0 treat_warnings_as_errors=false enable_nacl=false use_remoteexec=false v8_enable_afeye=true blink_enable_afeye=true network_enable_afeye=true'
+      - name: build
+        run: |
+          export PATH="/mnt/chromium/depot_tools:$PATH"
+          cd /mnt/chromium/src
+          timeout ${BUILD_WINDOW_SECS} autoninja -C ${OUT} chrome || echo "stage window exhausted (expected on slow runners)"
+      - name: pack-state
+        run: bash .github/build/pack_state.sh /mnt/chromium/src/${OUT} /mnt/pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: afeye-build-state
+          path: /mnt/pack/*
+          retention-days: 7
+          compression-level: 0
+
+  stage2:
+    needs: stage1
+    if: always() && needs.stage1.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: afeye-build-state
+          path: /mnt/pack
+      - name: workspace
+        run: |
+          sudo mkdir -p /mnt/chromium /mnt/pack2
+          sudo chown -R runner:runner /mnt/chromium /mnt/pack2
+      - name: continue
+        run: |
+          set -e
+          if [ -f /mnt/pack/BUILD_DONE ]; then
+            echo "chrome finished in stage1 - handing state through"
+            mv /mnt/pack/* /mnt/pack2/ 2>/dev/null || true
+            exit 0
+          fi
+          cd /mnt/chromium
+          git clone -q --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          export PATH="/mnt/chromium/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
+          fetch --no-history chromium
+          cd src
+          gclient sync --no-history --with_branch_heads -r "src@refs/tags/${CHROMIUM_REF}"
+          bash "${GITHUB_WORKSPACE}/.github/build/apply_patches.sh" /mnt/chromium/src
+          for f in /mnt/pack/out-part-*.tzst; do tar -I zstd -xf "$f"; done
+          rm -f /mnt/pack/out-part-*.tzst
+          timeout ${BUILD_WINDOW_SECS} autoninja -C ${OUT} chrome || echo "stage window exhausted"
+      - name: pack-state
+        run: |
+          if [ -f /mnt/pack2/BUILD_DONE ]; then exit 0; fi
+          bash "${GITHUB_WORKSPACE}/.github/build/pack_state.sh" /mnt/chromium/src/${OUT} /mnt/pack2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: afeye-build-state-2
+          path: /mnt/pack2/*
+          retention-days: 7
+          compression-level: 0
+
+  stage3:
+    needs: stage2
+    if: always() && needs.stage2.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: afeye-build-state-2
+          path: /mnt/state
+      - name: workspace
+        run: |
+          sudo mkdir -p /mnt/chromium
+          sudo chown -R runner:runner /mnt/chromium
+      - name: restore-or-build
+        run: |
+          set -e
+          if [ -f /mnt/state/BUILD_DONE ]; then
+            echo "chrome already built - runtime state present"
+            mkdir -p /tmp/pkg
+            tar -I zstd -xf /mnt/state/chrome-runtime.tzst -C /tmp/pkg
+            ls -la /tmp/pkg/chrome-linux/chrome
+            exit 0
+          fi
+          cd /mnt/chromium
+          git clone -q --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          export PATH="/mnt/chromium/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
+          fetch --no-history chromium
+          cd src
+          gclient sync --no-history --with_branch_heads -r "src@refs/tags/${CHROMIUM_REF}"
+          bash "${GITHUB_WORKSPACE}/.github/build/apply_patches.sh" /mnt/chromium/src
+          for f in /mnt/state/out-part-*.tzst; do [ -e "$f" ] && tar -I zstd -xf "$f" || true; done
+          autoninja -C ${OUT} chrome
+          ls -la ${OUT}/chrome
+          mkdir -p /tmp/pkg
+          bash "${GITHUB_WORKSPACE}/.github/build/pack_runtime.sh" "${OUT}" /tmp/pkg
+      - name: smoke-test-sinks
+        run: |
+          set -e
+          if [ ! -d /tmp/pkg/chrome-linux ]; then
+            # built locally in this stage: package it first
+            mkdir -p /tmp/pkg
+            bash "${GITHUB_WORKSPACE}/.github/build/pack_runtime.sh" "${OUT}" /tmp/pkg || true
+          fi
+          CHROME=/tmp/pkg/chrome-linux/chrome
+          test -x $CHROME || { echo "::error::chrome binary missing"; exit 1; }
+          sudo apt-get update -qq >/dev/null 2>&1 || true
+          sudo apt-get install -y -qq libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 libatspi2.0-0 libdrm2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64 >/dev/null 2>&1 || true
+          # THE proof: the built chrome must have live sinks AND the eval
+          # chokepoint. Load a page that evals, assert the sink caught it.
+          rm -rf /tmp/afeye-raw /tmp/smoke-profile && mkdir -p /tmp/afeye-raw
+          AFEYE_SINK=1 AFEYE_RAW_DIR=/tmp/afeye-raw $CHROME --headless=new --no-sandbox --disable-gpu \
+            --user-data-dir=/tmp/smoke-profile --dump-dom \
+            'data:text/html,<script>eval("var afeye_smoke=1;function afeye_fn(a){return a+1}");new Function("x","return x*2")(21);</script>' \
+            >/dev/null 2>/tmp/smoke.log || true
+          head -5 /tmp/smoke.log || true
+          ls -la /tmp/afeye-raw/ || true
+          RECS=$(cat /tmp/afeye-raw/*.rec 2>/dev/null | wc -c)
+          echo "sink bytes: $RECS"
+          if [ "${RECS}" -lt 32 ]; then
+            echo "::error::PATCHED CHROME SINKS ARE DEAD - refusing to release a dead build"
+            exit 1
+          fi
+          cat /tmp/afeye-raw/*.rec | strings | grep -q 'afeye-sink/' && echo "HELLO OK"
+          cat /tmp/afeye-raw/*.rec | strings | grep -q 'afeye_fn' && echo "EVAL SINK OK (0013 works)" || { echo "::error::eval source NOT captured by 0013"; exit 1; }
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          cd /tmp/pkg
+          tar -I 'zstd -19 -T2' -cf afeye-chrome-linux64.tzst chrome-linux
+          ls -la afeye-chrome-linux64.tzst
+          python3 - <<'PY'
+          import json, hashlib, subprocess, datetime, os
+          ref = os.environ["CHROMIUM_REF"]
+          try:
+              head = subprocess.run(["git","-C","/mnt/chromium/src","rev-parse","HEAD"],capture_output=True,text=True).stdout.strip() or "n/a"
+          except Exception:
+              head = "n/a"
+          ph = hashlib.sha256()
+          pdir = "/home/runner/work/afeye/afeye/src/patches"
+          for p in sorted(os.listdir(pdir)):
+              if p.endswith(".patch"):
+                  ph.update(open(os.path.join(pdir,p),"rb").read())
+          json.dump({
+              "chromium": ref, "chromium_head": head,
+              "patches_sha256": ph.hexdigest(),
+              "gn": "v8_enable_afeye=true blink_enable_afeye=true network_enable_afeye=true symbol_level=0",
+              "built": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+          }, open("build.json","w"), indent=1)
+          PY
+          cd /home/runner/work/afeye/afeye
+          gh release delete chrome-build --yes 2>/dev/null || true
+          git push origin :refs/tags/chrome-build 2>/dev/null || true
+          gh release create chrome-build /tmp/pkg/afeye-chrome-linux64.tzst /tmp/pkg/build.json \
+            --target "$GITHUB_SHA" --title "afeye patched chrome (${CHROMIUM_REF})" \
+            --notes "Patched chrome, built ONCE from the afeye patch series. Downloaded by the crawl workflow; the cron path never rebuilds. See src/patches/SERIES.md."

@@ -1,0 +1,40 @@
+diff --git a/src/codegen/compiler.cc b/src/codegen/compiler.cc
+index 7cd584f..533ecae 100644
+--- a/src/codegen/compiler.cc
++++ b/src/codegen/compiler.cc
+@@ -8,6 +8,10 @@
+ #include <memory>
+ #include <optional>
+ 
++#ifdef V8_AFEYE
++#include "src/afeye/sink.h"
++#endif
++
+ #include "src/api/api-inl.h"
+ #include "src/asmjs/asm-js.h"
+ #include "src/ast/prettyprinter.h"
+@@ -3220,6 +3224,24 @@ MaybeHandle<JSFunction> Compiler::GetFunctionFromEval(
+     ParsingWhileDebugging parsing_while_debugging) {
+   Isolate* isolate = context->GetIsolate();
+ 
++#ifdef V8_AFEYE
++  // afeye 0013: the single chokepoint of ALL dynamic compilation - direct and
++  // indirect eval, plus the Function constructor (which funnels through
++  // GetFunctionFromValidatedString -> here). api.cc 0002 only sees embedder
++  // compiles; the payload an anti-fraud packer decrypts/assembles at runtime
++  // and hands to the engine exists ONLY at this point. ToCString maps NUL to
++  // ' ' so the NUL-separated EmitTwoStr framing stays exact; the 1 MiB record
++  // cap flags longer sources instead of dropping them.
++  if (v8::afeye::Enabled() && v8_flags.afeye_source) {
++    size_t eval_src_len = 0;
++    std::unique_ptr<char[]> eval_src = source->ToCString(&eval_src_len);
++    if (eval_src != nullptr && eval_src_len > 0) {
++      v8::afeye::EmitTwoStr(v8::afeye::kScriptSource, v8::afeye::NowNs(),
++                            "eval", eval_src.get());
++    }
++  }
++#endif
++
+   // The cache lookup key needs to be aware of the separation between the
+   // parameters and the body to prevent this valid invocation:
+   //   Function("", "function anonymous(\n/**/) {\n}");

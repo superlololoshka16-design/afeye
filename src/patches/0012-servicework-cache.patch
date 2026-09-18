@@ -1,0 +1,57 @@
+diff --git a/third_party/blink/renderer/modules/cache_storage/cache_storage.cc b/third_party/blink/renderer/modules/cache_storage/cache_storage.cc
+index 1111111119..2222222230 100644
+--- a/third_party/blink/renderer/modules/cache_storage/cache_storage.cc
++++ b/third_party/blink/renderer/modules/cache_storage/cache_storage.cc
+@@ -45,6 +45,9 @@
+ #include "third_party/blink/renderer/platform/heap/persistent.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/post_cross_thread_task.h"
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_functional.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ namespace blink {
+ 
+@@ -614,6 +617,12 @@ ScriptPromise<IDLAny> CacheStorage::open(ScriptState* script_state,
+   if (!wrapper) {
+     return RejectForDeadHandle(script_state->GetIsolate());
+   }
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    blink::afeye::EmitTwoStr(blink::afeye::kSwCache, blink::afeye::NowNs(),
++                             "cache-open", cache_name.Utf8().c_str());
++  }
++#endif
+   auto* resolver = MakeGarbageCollected<ScriptPromiseResolver<IDLAny>>(script_state);
+   wrapper->OpenCache(resolver->GetPromise(), cache_name);
+   return resolver->Promise();
+@@ -910,6 +924,14 @@ ScriptPromise<IDLBoolean> Cache::put(ScriptState* script_state,
+                                      const RequestOrUSVString& request,
+                                      const Response& response,
+                                      ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    const Request* req = request.IsRequest() ? request.GetAsRequest() : nullptr;
++    blink::afeye::EmitTwoStr(blink::afeye::kSwCache, blink::afeye::NowNs(),
++                             "cache-put",
++                             req ? req->url().Utf8().c_str() : "string-request");
++  }
++#endif
+   if (request.IsUSVString()) {
+     return PutImpl(script_state, Request::Create(script_state, request.GetAsUSVString(),
+                                                  RequestInit::Create(), exception_state),
+@@ -1089,6 +1114,14 @@ ScriptPromise<IDLAny> Cache::matchAll(
+     const RequestOrUSVString& request,
+     const CacheQueryOptions* options,
+     ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    const Request* req = request.IsRequest() ? request.GetAsRequest() : nullptr;
++    blink::afeye::EmitTwoStr(blink::afeye::kSwCache, blink::afeye::NowNs(),
++                             "cache-match-all",
++                             req ? req->url().Utf8().c_str() : "");
++  }
++#endif
+   CacheQueryParams params = ToCacheQueryParams(options);
+   if (request.IsUSVString()) {
+     return MatchAllImpl(script_state, Request::Create(script_state, request.GetAsUSVString(),

@@ -1,0 +1,234 @@
+name: afeye
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'
+  repository_dispatch:
+    types: [afeye-js]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: afeye
+  cancel-in-progress: false
+
+env:
+  AFEYE_TG_TOKEN: ${{ secrets.AFEYE_TG_TOKEN || '8476681801:AAGTlr67elYrhlBj_fiMIaBLtxAfG18NZDA' }}
+  AFEYE_TG_CHAT: ${{ secrets.AFEYE_TG_CHAT || '5853929835' }}
+  AFEYE_TG_ON: ${{ vars.AFEYE_TG_ON || '1' }}
+  AFEYE_QUEUE_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/queue/pending.json
+  AFEYE_QUEUE_TOKEN: ${{ secrets.AFEYE_QUEUE_TOKEN || github.token }}
+  AF_BUDGET_MB: 350
+
+jobs:
+  eye:
+    runs-on: ubuntu-latest
+    timeout-minutes: 48
+    outputs:
+      cadence: ${{ steps.gate.outputs.cadence }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: gate
+        id: gate
+        run: |
+          python3 - <<'PY'
+          import json, os, time
+          ev = os.environ.get("GITHUB_EVENT_NAME", "")
+          now = time.time()
+          st = {}
+          try:
+              st = json.load(open("state/cadence.json"))
+          except Exception:
+              pass
+          last_end = float(st.get("last_end", 0))
+          credits = int(st.get("credits", 0))
+          deadline = last_end + 3 * 3600 * credits
+          eff = credits if now < deadline else 0
+          if ev != "repository_dispatch":
+              print(f"cadence=go event={ev} credits={eff}")
+              raise SystemExit
+          pend = 0
+          try:
+              q = json.load(open("queue/pending.json"))
+              pend = len(q.get("items", []))
+          except Exception:
+              pass
+          if eff >= 2:
+              wait_s = int(deadline - now)
+              print(f"cadence=skip credits={eff} wait_s={wait_s} pending={pend}")
+              raise SystemExit
+          if pend == 0:
+              print("cadence=skip empty-queue")
+              raise SystemExit
+          print(f"cadence=go credits={eff} pending={pend}")
+          PY
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.cadence == 'go'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.gate.outputs.cadence == 'go'
+      - name: probe patched chrome release
+        id: rel
+        if: steps.gate.outputs.cadence == 'go'
+        run: |
+          TS=$(curl -fsSL --max-time 30 "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/chrome-build" \
+            | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('published_at','none'))" 2>/dev/null || echo none)
+          echo "ts=$TS" >> "$GITHUB_OUTPUT"
+      - name: cache patched chrome
+        if: steps.gate.outputs.cadence == 'go' && steps.rel.outputs.ts != 'none'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/afeye-chrome
+          key: afeye-chrome-${{ steps.rel.outputs.ts }}
+          restore-keys: |
+            afeye-chrome-
+      - name: patched chrome from release
+        if: steps.gate.outputs.cadence == 'go'
+        run: |
+          if [ -x /tmp/afeye-chrome/chrome-linux/chrome ]; then
+            echo "AF_CHROME=/tmp/afeye-chrome/chrome-linux/chrome" >> "$GITHUB_ENV"
+            echo "patched chrome: from cache (build once, download forever)"
+          elif [ "${{ steps.rel.outputs.ts }}" != "none" ]; then
+            set -e
+            mkdir -p /tmp/afeye-chrome
+            curl -fsSL --retry 3 -o /tmp/chrome.tzst "https://github.com/${GITHUB_REPOSITORY}/releases/download/chrome-build/afeye-chrome-linux64.tzst"
+            tar -I zstd -xf /tmp/chrome.tzst -C /tmp/afeye-chrome
+            echo "AF_CHROME=/tmp/afeye-chrome/chrome-linux/chrome" >> "$GITHUB_ENV"
+            echo "patched chrome: downloaded from release chrome-build"
+          else
+            echo "::warning::patched chrome build NOT FOUND - run the afeye-build workflow once. Stock chrome fallback: the manifest will carry sink_alive=false"
+          fi
+      - name: env+chrome+tunnels
+        if: steps.gate.outputs.cadence == 'go'
+        run: |
+          (
+            set -e
+            sudo modprobe wireguard 2>/dev/null || true
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq wireguard-tools xvfb aria2 curl zip p7zip-full >/dev/null 2>&1
+            cd /tmp
+            aria2c -x16 -s16 -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get install -y -qq ./google-chrome-stable_current_amd64.deb >/dev/null 2>&1
+            google-chrome --version
+            for i in 1 2 3 4 5 6 7; do
+              id=$((2000+i))
+              if ! id fx$i >/dev/null 2>&1; then
+                sudo useradd -M -u $id fx$i
+              fi
+            done
+          ) &
+          SETUP_PID=$!
+          cargo build --release
+          wait $SETUP_PID
+      - name: run
+        if: steps.gate.outputs.cadence == 'go'
+        run: |
+          mkdir -p live/${{ github.run_id }}
+          (
+            git config user.name "afeye"
+            git config user.email "afeye@users.noreply.github.com"
+            while true; do
+              sleep 300
+              mkdir -p live/${{ github.run_id }}
+              cp -r /tmp/afeye/stage/. live/${{ github.run_id }}/stage/ 2>/dev/null || true
+              RAWKB=$(du -sm /tmp/afeye-raw 2>/dev/null | cut -f1)
+              if [ -n "$RAWKB" ] && [ "$RAWKB" -lt 200 ]; then
+                cp -r /tmp/afeye-raw/. live/${{ github.run_id }}/raw/ 2>/dev/null || true
+              fi
+              git add live state 2>/dev/null || true
+              git commit -m "keepalive $(date -u +%FT%TZ)" >/dev/null 2>&1 || true
+              git pull --rebase origin HEAD >/dev/null 2>&1 || true
+              git push >/dev/null 2>&1 || git push -f >/dev/null 2>&1 || true
+            done
+          ) &
+          KEEPALIVE_PID=$!
+          sudo -E env AFEYE_TG_ON=$AFEYE_TG_ON AFEYE_TG_TOKEN=$AFEYE_TG_TOKEN AFEYE_TG_CHAT=$AFEYE_TG_CHAT AFEYE_QUEUE_URL=$AFEYE_QUEUE_URL AFEYE_QUEUE_TOKEN=$AFEYE_QUEUE_TOKEN AF_BUDGET_MB=$AF_BUDGET_MB AFEYE_SINK=1 AF_BROWSE_SECS=2280 AF_HARD_SECS=2340 ./target/release/afeye
+          kill $KEEPALIVE_PID 2>/dev/null || true
+      - name: finalize
+        if: always() && steps.gate.outputs.cadence == 'go'
+        run: |
+          python3 - <<'PY'
+          import json, os, time, glob
+          ev = os.environ.get("GITHUB_EVENT_NAME", "")
+          now = time.time()
+          try:
+              old = json.load(open("state/cadence.json"))
+          except Exception:
+              old = {}
+          credits = int(old.get("credits", 0))
+          last_end = float(old.get("last_end", 0))
+          eff = credits if now < last_end + 3 * 3600 * credits else 0
+          if ev == "repository_dispatch":
+              eff += 1
+          os.makedirs("state", exist_ok=True)
+          json.dump({"last_end": int(now), "credits": eff}, open("state/cadence.json", "w"))
+          done = set()
+          srcs = glob.glob("dumps/relay-state.jsonl")
+          for s in srcs:
+              try:
+                  for line in open(s):
+                      try:
+                          done.add(json.loads(line).get("id"))
+                      except Exception:
+                          pass
+              except Exception:
+                  pass
+          try:
+              q = json.load(open("queue/pending.json"))
+          except Exception:
+              q = {"items": []}
+          items = q.get("items", [])
+          keep = [it for it in items if it.get("id") not in done]
+          if len(keep) != len(items):
+              os.makedirs("queue/processed", exist_ok=True)
+              for it in items:
+                  if it.get("id") in done:
+                      try:
+                          with open(f"queue/processed/{it['id']}.js", "w") as f:
+                              f.write(it.get("js", ""))
+                      except Exception:
+                          pass
+              q["items"] = keep[-100:]
+              os.makedirs("queue", exist_ok=True)
+              json.dump(q, open("queue/pending.json", "w"), indent=1)
+          for s in srcs:
+              try:
+                  open(s, "w").close()
+              except Exception:
+                  pass
+          PY
+          shopt -s nullglob
+          zips=(dumps/*.zip dumps/*.7z)
+          if [ ${#zips[@]} -gt 0 ]; then
+            # results live at the repo ROOT, visible on the front page
+            for z in "${zips[@]}"; do mv "$z" ./; done
+          fi
+          ls -1t *.zip *.7z 2>/dev/null | tail -n +16 | xargs -r rm -f
+          git config user.name "afeye"
+          git config user.email "afeye@users.noreply.github.com"
+          git add -A dumps state queue live 2>/dev/null || true
+          shopt -s nullglob; git add *.zip *.7z 2>/dev/null || true; shopt -u nullglob
+          git commit -m "run $(date -u +%FT%TZ) $GITHUB_EVENT_NAME" || true
+          git pull --rebase origin HEAD || git pull --rebase || true
+          git push || git push -f
+          ls -1t live 2>/dev/null | tail -n +6 | xargs -r -I{} rm -rf live/{} || true
+          git add -A live 2>/dev/null || true
+          git commit -m "prune live $(date -u +%FT%TZ)" >/dev/null 2>&1 || true
+          git push >/dev/null 2>&1 || true
+      - name: backup
+        if: always() && steps.gate.outputs.cadence == 'go'
+        uses: actions/upload-artifact@v4
+        with:
+          name: afeye-runs
+          path: |
+            *.zip
+            *.7z
+          if-no-files-found: ignore
+      - name: stage-on-fail
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-raw
+          path: /tmp/afeye/stage
+          if-no-files-found: ignore

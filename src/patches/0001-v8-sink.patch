@@ -1,0 +1,375 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index f8a0507..c8cfddc 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -221,6 +221,9 @@ declare_args() {
+   # Enables various testing features.
+   v8_enable_test_features = ""
+ 
++  # afeye: sink plumbing compiled in when true; env-activated at runtime.
++  v8_enable_afeye = false
++
+   # Enable short builtins call instruction sequences by un-embedding builtins.
+   # Sets -DV8_SHORT_BUILTIN_CALLS
+   v8_enable_short_builtin_calls = ""
+@@ -804,6 +807,10 @@ config("internal_config_base") {
+ config("internal_config") {
+   defines = []
+ 
++  if (v8_enable_afeye) {
++    defines += [ "V8_AFEYE" ]
++  }
++
+   # Only targets in this file and its subdirs can depend on this.
+   visibility = [ "./*" ]
+ 
+@@ -3384,6 +3391,7 @@ v8_header_set("v8_internal_headers") {
+     "include/v8-metrics.h",
+     "include/v8-unwinder-state.h",
+     "include/v8-wasm-trap-handler-posix.h",
++    "src/afeye/sink.h",
+     "src/api/api-arguments-inl.h",
+     "src/api/api-arguments.h",
+     "src/api/api-inl.h",
+@@ -5392,6 +5400,7 @@ v8_source_set("v8_base_without_compiler") {
+ 
+   sources = [
+     ### gcmole(all) ###
++    "src/afeye/sink.cc",
+     "src/api/api-arguments.cc",
+     "src/api/api-natives.cc",
+     "src/api/api.cc",
+diff --git a/src/afeye/sink.cc b/src/afeye/sink.cc
+new file mode 100644
+index 0000000..78d66cf
+--- /dev/null
++++ b/src/afeye/sink.cc
+@@ -0,0 +1,263 @@
++#include "src/afeye/sink.h"
++
++#ifdef V8_AFEYE
++
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <time.h>
++#include <unistd.h>
++
++namespace v8 {
++namespace afeye {
++namespace {
++
++constexpr size_t kRingBytes = 8u << 20;
++constexpr size_t kMaxRecord = 1u << 20;
++constexpr uint32_t kSpanCap = 64u * 1024u;
++constexpr const char* kLayer = "v8";
++
++std::atomic<bool> g_on{false};
++std::atomic<uint64_t> g_dropped{0};
++std::once_flag g_init_once;
++
++struct Ring {
++  std::atomic_flag lock = ATOMIC_FLAG_INIT;
++  size_t head = 0;
++  size_t tail = 0;
++  uint8_t data[kRingBytes + kMaxRecord];
++};
++Ring g_ring;
++
++uint64_t MonoNs() {
++  struct timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
++         static_cast<uint64_t>(ts.tv_nsec);
++}
++
++bool EnvOn() {
++  const char* v = ::getenv("AFEYE_SINK");
++  return v != nullptr && *v != '\0' && v[0] != '0';
++}
++
++const char* RawDir() {
++  static const char* kDir = []() -> const char* {
++    const char* v = ::getenv("AFEYE_RAW_DIR");
++    return (v != nullptr && *v != '\0') ? v : "/tmp/afeye-raw";
++  }();
++  return kDir;
++}
++
++void WriteAll(int fd, const uint8_t* p, size_t n) {
++  size_t off = 0;
++  while (off < n) {
++    ssize_t w = ::write(fd, p + off, n - off);
++    if (w < 0) {
++      if (errno == EINTR) continue;
++      return;
++    }
++    if (w == 0) return;
++    off += static_cast<size_t>(w);
++  }
++}
++
++void EmitHello(int fd) {
++  char msg[96];
++  int n = std::snprintf(msg, sizeof(msg), "afeye-sink/%s v2 pid=%d", kLayer,
++                        static_cast<int>(::getpid()));
++  if (n <= 0) return;
++  uint8_t rec[16 + 96];
++  uint32_t total = 16 + static_cast<uint32_t>(n);
++  std::memcpy(rec, &total, sizeof(total));
++  rec[4] = 0;
++  rec[5] = 0;
++  rec[6] = 0;
++  rec[7] = 0;
++  uint64_t ts = MonoNs();
++  std::memcpy(rec + 8, &ts, sizeof(ts));
++  std::memcpy(rec + 16, msg, static_cast<size_t>(n));
++  WriteAll(fd, rec, total);
++}
++
++void DrainLoop() {
++  char pid[16];
++  std::snprintf(pid, sizeof(pid), "%d", static_cast<int>(::getpid()));
++  std::string path = std::string(RawDir()) + "/" + kLayer + "-" + pid + ".rec";
++  int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
++  if (fd >= 0) EmitHello(fd);
++  std::vector<uint8_t> buf;
++  for (;;) {
++    size_t len = 0;
++    bool have = false;
++    while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
++    }
++    if (g_ring.tail != g_ring.head) {
++      uint32_t len32;
++      std::memcpy(&len32, g_ring.data + g_ring.tail, sizeof(len32));
++      len = len32;
++      if (len < 16 || len > kMaxRecord) {
++        g_ring.tail = g_ring.head;
++      } else {
++        buf.assign(g_ring.data + g_ring.tail,
++                   g_ring.data + g_ring.tail + len);
++        size_t nt = g_ring.tail + len;
++        if (nt >= kRingBytes) nt -= kRingBytes;
++        g_ring.tail = nt;
++        have = true;
++      }
++    }
++    g_ring.lock.clear(std::memory_order_release);
++    if (have) {
++      if (fd >= 0) {
++        WriteAll(fd, buf.data(), len);
++      } else {
++        fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
++        if (fd >= 0) EmitHello(fd);
++      }
++    } else {
++      std::this_thread::sleep_for(std::chrono::microseconds(500));
++    }
++  }
++}
++
++void InitOnce() {
++  if (!EnvOn()) return;
++  ::mkdir(RawDir(), 0777);
++  ::chmod(RawDir(), 0777);
++  g_on.store(true, std::memory_order_release);
++  std::thread(DrainLoop).detach();
++  std::atexit([] { Flush(500); });
++}
++
++}  // namespace
++
++bool Enabled() {
++  std::call_once(g_init_once, InitOnce);
++  return g_on.load(std::memory_order_acquire);
++}
++
++uint64_t NowNs() { return MonoNs(); }
++
++void EmitFlags(uint8_t kind, uint64_t ts_ns, uint8_t flags, const void* data,
++               uint32_t len) {
++  if (!g_on.load(std::memory_order_acquire)) return;
++  if (data == nullptr || len == 0) return;
++  if (len > kMaxRecord - 16) {
++    len = kMaxRecord - 16;
++    flags |= 1;
++  }
++  const size_t need = 16 + static_cast<size_t>(len);
++  while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
++  }
++  const size_t h = g_ring.head;
++  const size_t t = g_ring.tail;
++  const size_t used = (h >= t) ? h - t : kRingBytes - t + h;
++  if (kRingBytes - used < need + 8) {
++    g_ring.lock.clear(std::memory_order_release);
++    g_dropped.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++  uint8_t* rec = g_ring.data + h;
++  const uint32_t total = static_cast<uint32_t>(need);
++  std::memcpy(rec, &total, sizeof(total));
++  rec[4] = kind;
++  rec[5] = flags;
++  rec[6] = 0;
++  rec[7] = 0;
++  std::memcpy(rec + 8, &ts_ns, sizeof(ts_ns));
++  std::memcpy(rec + 16, data, len);
++  size_t nh = h + need;
++  if (nh >= kRingBytes) nh -= kRingBytes;
++  g_ring.head = nh;
++  g_ring.lock.clear(std::memory_order_release);
++}
++
++void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len) {
++  EmitFlags(kind, ts_ns, 0, data, len);
++}
++
++void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s) {
++  if (s == nullptr) return;
++  EmitFlags(kind, ts_ns, 0, s, static_cast<uint32_t>(std::strlen(s)));
++}
++
++void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b) {
++  if (a == nullptr || b == nullptr) return;
++  size_t la = std::strlen(a);
++  size_t lb = std::strlen(b);
++  bool trunc = false;
++  const size_t kCap = kMaxRecord - 17;
++  if (la > kCap) {
++    la = kCap;
++    trunc = true;
++  }
++  if (lb > kCap - la) {
++    lb = kCap - la;
++    trunc = true;
++  }
++  static thread_local std::string buf;
++  buf.clear();
++  buf.reserve(la + lb + 1);
++  buf.append(a, la);
++  buf.push_back('\0');
++  buf.append(b, lb);
++  EmitFlags(kind, ts_ns, trunc ? 1 : 0, buf.data(),
++            static_cast<uint32_t>(buf.size()));
++}
++
++void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
++              const uint8_t* bytes, uint32_t n) {
++  if (tag == nullptr || bytes == nullptr || n == 0) return;
++  size_t lt = std::strlen(tag);
++  if (lt > 64) lt = 64;
++  bool trunc = false;
++  if (n > kSpanCap) {
++    n = kSpanCap;
++    trunc = true;
++  }
++  static thread_local std::vector<char> buf;
++  buf.clear();
++  buf.reserve(lt + 1 + n);
++  buf.insert(buf.end(), tag, tag + lt);
++  buf.push_back('\0');
++  buf.insert(buf.end(), reinterpret_cast<const char*>(bytes),
++             reinterpret_cast<const char*>(bytes) + n);
++  EmitFlags(kind, ts_ns, trunc ? 1 : 0, buf.data(),
++            static_cast<uint32_t>(buf.size()));
++}
++
++uint64_t SinkDropped() { return g_dropped.load(std::memory_order_relaxed); }
++
++bool Flush(uint32_t timeout_ms) {
++  if (!g_on.load(std::memory_order_acquire)) return true;
++  auto deadline = std::chrono::steady_clock::now() +
++                  std::chrono::milliseconds(timeout_ms);
++  while (std::chrono::steady_clock::now() < deadline) {
++    bool empty;
++    while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
++    }
++    empty = g_ring.tail == g_ring.head;
++    g_ring.lock.clear(std::memory_order_release);
++    if (empty) return true;
++    std::this_thread::sleep_for(std::chrono::microseconds(200));
++  }
++  return false;
++}
++
++}
++}  // namespace v8
++
++#endif
+diff --git a/src/afeye/sink.h b/src/afeye/sink.h
+new file mode 100644
+index 0000000..65da4d1
+--- /dev/null
++++ b/src/afeye/sink.h
+@@ -0,0 +1,43 @@
++#ifndef V8_AFEYE_SINK_H_
++#define V8_AFEYE_SINK_H_
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef V8_AFEYE
++
++namespace v8 {
++namespace afeye {
++
++enum EventKind : uint8_t {
++  kSinkHello = 0,
++  kScriptSource = 1,
++  kBytecodeEntry = 2,
++  kWasmModule = 3,
++  kWasmMemory = 4,
++  kWasmTable = 5,
++  kMicrotaskEnqueue = 6,
++  kMicrotaskRun = 7,
++  kCallCompleted = 8,
++  kAtomics = 9,
++  kSabBacking = 10,
++};
++
++bool Enabled();
++uint64_t NowNs();
++void EmitFlags(uint8_t kind, uint64_t ts_ns, uint8_t flags, const void* data,
++               uint32_t len);
++void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
++void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s);
++void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b);
++void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
++              const uint8_t* bytes, uint32_t n);
++uint64_t SinkDropped();
++bool Flush(uint32_t timeout_ms);
++
++}
++}  // namespace v8
++
++#endif
++
++#endif
+diff --git a/src/flags/flag-definitions.h b/src/flags/flag-definitions.h
+index 20a696f..0e3ae53 100644
+--- a/src/flags/flag-definitions.h
++++ b/src/flags/flag-definitions.h
+@@ -3265,6 +3265,11 @@ DEFINE_BOOL(print_builtin_size, false, "print code size for builtins")
+ #define FLAG FLAG_READONLY
+ #endif
+ 
++#ifdef V8_AFEYE
++DEFINE_BOOL(afeye_trace, false, "mirror trace-ignition-exec tuples into the afeye sink")
++DEFINE_BOOL(afeye_source, true, "emit raw script sources to the afeye sink")
++#endif
++
+ // elements.cc
+ DEFINE_BOOL(trace_elements_transitions, false, "trace elements transitions")
+ 

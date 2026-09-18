@@ -1,0 +1,241 @@
+diff --git a/third_party/blink/renderer/modules/permissions/permissions.cc b/third_party/blink/renderer/modules/permissions/permissions.cc
+index ddddddddde..eeeeeeeeef 100644
+--- a/third_party/blink/renderer/modules/permissions/permissions.cc
++++ b/third_party/blink/renderer/modules/permissions/permissions.cc
+@@ -40,6 +40,9 @@
+ #include "third_party/blink/renderer/platform/bindings/exception_state.h"
+ #include "third_party/blink/renderer/platform/heap/heap_allocator.h"
+ #include "third_party/blink/renderer/platform/wtf/functional.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ namespace blink {
+ 
+@@ -227,6 +230,13 @@ ScriptPromise<PermissionStatus> Permissions::query(
+     ScriptState* script_state,
+     const PermissionDescriptor& permission_descriptor,
+     ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    blink::afeye::EmitTwoStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                             "permissions-query",
++                             permission_descriptor.name().Utf8().c_str());
++  }
++#endif
+   ExecutionContext* execution_context = ExecutionContext::From(script_state);
+   mojom::blink::PermissionName name = PermissionNameFromDescriptor(permission_descriptor, exception_state);
+   if (exception_state.HadException()) {
+diff --git a/third_party/blink/renderer/modules/mediastream/media_devices.cc b/third_party/blink/renderer/modules/mediastream/media_devices.cc
+index ffffffff0..0000000002 100644
+--- a/third_party/blink/renderer/modules/mediastream/media_devices.cc
++++ b/third_party/blink/renderer/modules/mediastream/media_devices.cc
+@@ -52,6 +52,9 @@
+ #include "third_party/blink/renderer/platform/heap/visitor.h"
+ #include "third_party/blink/renderer/platform/wtf/functional.h"
+ #include "third_party/blink/renderer/platform/wtf/vector.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ namespace blink {
+ 
+@@ -856,6 +859,15 @@ ScriptPromise<IDLSequence<MediaDeviceInfo>> MediaDevices::enumerateDevices(
+   if (!execution_context) {
+     exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError, "The current context is not valid anymore.");
+     return ScriptPromise<IDLAny>();
+   }
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    // Marker only: the actual device identities (deviceId/label/kind/groupId)
++    // are captured in MediaDeviceInfo's constructor below, where the promise
++    // resolution materializes them.
++    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                          "enumerate-devices");
++  }
++#endif
+   auto* resolver = MakeGarbageCollected<ScriptPromiseResolver<IDLSequence<MediaDeviceInfo>>>(script_state);
+   auto promise = resolver->Promise();
+diff --git a/third_party/blink/renderer/modules/mediastream/media_device_info.cc b/third_party/blink/renderer/modules/mediastream/media_device_info.cc
+index 1111111120..2222222231 100644
+--- a/third_party/blink/renderer/modules/mediastream/media_device_info.cc
++++ b/third_party/blink/renderer/modules/mediastream/media_device_info.cc
+@@ -31,6 +31,9 @@
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_media_device_info.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ namespace blink {
+ 
+@@ -60,6 +63,18 @@ MediaDeviceInfo::MediaDeviceInfo(const String& device_id,
+                                  const String& label,
+                                  const String& group_id)
+     : device_id_(device_id), label_(label), group_id_(group_id) {
++#ifdef BLINK_AFEYE
++  // afeye: the REAL enumeration payload the anti-fraud reads - every device
++  // identity the promise resolves with, not a marker. kind is fixed at
++  // construction by the subclasses (audioinput/videoinput/audiooutput).
++  if (blink::afeye::Enabled()) {
++    blink::afeye::EmitTwoStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                             "device-info",
++                             (String(device_id) + "|" + label_ + "|" + group_id_)
++                                 .Utf8()
++                                 .c_str());
++  }
++#endif
+ }
+ 
+ void MediaDeviceInfo::Trace(Visitor* visitor) const {
+diff --git a/third_party/blink/renderer/core/timing/performance.cc b/third_party/blink/renderer/core/timing/performance.cc
+index 1111111116..2222222227 100644
+--- a/third_party/blink/renderer/core/timing/performance.cc
++++ b/third_party/blink/renderer/core/timing/performance.cc
+@@ -44,6 +44,9 @@
+ #include "third_party/blink/renderer/core/timing/worker_global_scope_performance.h"
+ #include "third_party/blink/renderer/core/timing/window_performance.h"
+ #include "third_party/blink/renderer/platform/instrumentation/traced_value.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ namespace blink {
+ 
+@@ -411,6 +414,14 @@ PerformanceMeasure* Performance::measure(const String& measure_name,
+                                          const String& start_mark,
+                                          const String& end_mark,
+                                          ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char buf[512];
++    std::snprintf(buf, sizeof(buf), "perf-measure name=%s",
++                  measure_name.Utf8().c_str());
++    blink::afeye::EmitStr(blink::afeye::kPerfEntry, blink::afeye::NowNs(), buf);
++  }
++#endif
+   if (!start_mark.empty()) {
+   }
+   return Measure(measure_name, start_mark, end_mark, exception_state);
+@@ -429,6 +441,14 @@ DOMHighResTimeStamp Performance::now() const {
+   return MonotonicTimeToDOMHighResTimeStamp(TimeTicksForNow()) + time_origin_;
+ }
+ 
++#ifdef BLINK_AFEYE
++void Performance::AfeyeMark(const String& mark_name) {
++  if (!blink::afeye::Enabled()) return;
++  blink::afeye::EmitTwoStr(blink::afeye::kPerfEntry, blink::afeye::NowNs(), "perf-mark",
++                           mark_name.Utf8().c_str());
++}
++#endif
++
+ PerformanceMark* Performance::mark(const String& mark_name,
+                                    const MarkOptions* mark_options,
+                                    ExceptionState& exception_state) {
+diff --git a/third_party/blink/renderer/core/timing/performance.h b/third_party/blink/renderer/core/timing/performance.h
+index 3333333338..4444444449 100644
+--- a/third_party/blink/renderer/core/timing/performance.h
++++ b/third_party/blink/renderer/core/timing/performance.h
+@@ -233,6 +233,10 @@ class CORE_EXPORT Performance : public EventTarget {
+ 
+   virtual void RestoreOldPerformanceMetrics() {}
+ 
++#ifdef BLINK_AFEYE
++  void AfeyeMark(const String& mark_name);
++#endif
++
+  protected:
+   Performance(ExecutionContext*, double time_origin);
+   void AddedEventListener(const AtomicString& event_type) override;
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index 5555555560..6666666671 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -84,6 +84,9 @@
+ #include "ui/gfx/geometry/skia_conversions.h"
+ #include "wtf/allocator/allocator.h"
+ #include "wtf/text/string_builder.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ namespace blink {
+ 
+@@ -1131,7 +1134,10 @@ String HTMLCanvasElement::toDataURL(const String& mime_type,
+                                     const ScriptValue& quality,
+                                     ExceptionState& exception_state) const {
+   if (!OriginClean()) {
+     exception_state.ThrowSecurityError("Tainted canvases cannot be exported.");
++#ifdef BLINK_AFEYE
++    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(), "toDataURL:tainted");
++#endif
+     return String();
+   }
+   CanvasRenderingContext* context = RenderingContext();
+@@ -1163,8 +1176,21 @@ String HTMLCanvasElement::toDataURL(const String& mime_type,
+                                     const ScriptValue& quality,
+                                     ExceptionState& exception_state) const {
++#ifdef BLINK_AFEYE
++  // afeye: re-anchor on the final `return data_url.GetString();` of
++  // toDataURL - emit the readback (the canvas fingerprint value) there.
++  AfeyeToDataURL(data_url);
++#endif
+   return data_url.GetString();
+ }
+ 
++#ifdef BLINK_AFEYE
++void HTMLCanvasElement::AfeyeToDataURL(const String& data_url) {
++  if (!blink::afeye::Enabled() || data_url.empty()) return;
++  blink::afeye::EmitTwoStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                           "toDataURL", data_url.Utf8().c_str());
++}
++#endif
++
+ void HTMLCanvasElement::toBlob(V8HTMLCanvasElement::ToBlobCallback* callback,
+                                const String& mime_type,
+                                const ScriptValue& quality,
+diff --git a/third_party/blink/renderer/core/offscreencanvas/offscreencanvas.cc b/third_party/blink/renderer/core/offscreencanvas/offscreencanvas.cc
+index 7777777781..8888888892 100644
+--- a/third_party/blink/renderer/core/offscreencanvas/offscreencanvas.cc
++++ b/third_party/blink/renderer/core/offscreencanvas/offscreencanvas.cc
+@@ -54,6 +54,9 @@
+ #include "third_party/blink/renderer/platform/graphics/gpu/shared_gpu_context.h"
+ #include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ namespace blink {
+ 
+@@ -269,6 +272,14 @@ ImageBitmap* OffscreenCanvas::TransferToImageBitmap(ExceptionState& exception_st
+ }
+ 
+ void OffscreenCanvas::Commit(Platform::GraphicsContext* context) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char buf[96];
++    std::snprintf(buf, sizeof(buf), "offscreen-commit %zux%zu",
++                  Size().width(), Size().height());
++    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(), buf);
++  }
++#endif
+   if (!IsOffscreenCanvasRegistered()) {
+     // In this case the canvas is not being displayed on screen, nothing to
+     // commit.
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.h b/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
+index 999999999c..aaaaaaaaad 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
+@@ -264,6 +264,10 @@ class CORE_EXPORT HTMLCanvasElement final
+   void ClearRect(const gfx::Rect&);
+ 
+  private:
++#ifdef BLINK_AFEYE
++  void AfeyeToDataURL(const String& data_url);
++#endif
++
+   enum ErrorMode {
+     kInnocuous,
+     kCrossOrigin,

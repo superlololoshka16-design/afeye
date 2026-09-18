@@ -1,0 +1,474 @@
+diff --git a/services/network/public/cpp/afeye_sink.h b/services/network/public/cpp/afeye_sink.h
+new file mode 100644
+index 0000000000..5555555563
+--- /dev/null
++++ b/services/network/public/cpp/afeye_sink.h
+@@ -0,0 +1,36 @@
++#ifndef SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
++#define SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef NET_AFEYE
++
++namespace network {
++namespace afeye {
++
++enum EventKind : uint8_t {
++  kSinkHello = 0,
++  kNetReq = 17,
++  kNetRespBody = 18,
++  kWebSocket = 19,
++};
++
++bool Enabled();
++uint64_t NowNs();
++void EmitFlags(uint8_t kind, uint64_t ts_ns, uint8_t flags, const void* data,
++               uint32_t len);
++void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
++void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s);
++void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b);
++void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
++              const uint8_t* bytes, uint32_t n);
++uint64_t SinkDropped();
++bool Flush(uint32_t timeout_ms);
++
++}
++}  // namespace network
++
++#endif
++
++#endif
+diff --git a/services/network/public/cpp/afeye_sink.cc b/services/network/public/cpp/afeye_sink.cc
+new file mode 100644
+index 0000000000..6666666674
+--- /dev/null
++++ b/services/network/public/cpp/afeye_sink.cc
+@@ -0,0 +1,263 @@
++#include "services/network/public/cpp/afeye_sink.h"
++
++#ifdef NET_AFEYE
++
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <time.h>
++#include <unistd.h>
++
++namespace network {
++namespace afeye {
++namespace {
++
++constexpr size_t kRingBytes = 8u << 20;
++constexpr size_t kMaxRecord = 1u << 20;
++constexpr uint32_t kSpanCap = 256u * 1024u;
++constexpr const char* kLayer = "net";
++
++std::atomic<bool> g_on{false};
++std::atomic<uint64_t> g_dropped{0};
++std::once_flag g_init_once;
++
++struct Ring {
++  std::atomic_flag lock = ATOMIC_FLAG_INIT;
++  size_t head = 0;
++  size_t tail = 0;
++  uint8_t data[kRingBytes + kMaxRecord];
++};
++Ring g_ring;
++
++uint64_t MonoNs() {
++  struct timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
++         static_cast<uint64_t>(ts.tv_nsec);
++}
++
++bool EnvOn() {
++  const char* v = ::getenv("AFEYE_SINK");
++  return v != nullptr && *v != '\0' && v[0] != '0';
++}
++
++const char* RawDir() {
++  static const char* kDir = []() -> const char* {
++    const char* v = ::getenv("AFEYE_RAW_DIR");
++    return (v != nullptr && *v != '\0') ? v : "/tmp/afeye-raw";
++  }();
++  return kDir;
++}
++
++void WriteAll(int fd, const uint8_t* p, size_t n) {
++  size_t off = 0;
++  while (off < n) {
++    ssize_t w = ::write(fd, p + off, n - off);
++    if (w < 0) {
++      if (errno == EINTR) continue;
++      return;
++    }
++    if (w == 0) return;
++    off += static_cast<size_t>(w);
++  }
++}
++
++void EmitHello(int fd) {
++  char msg[96];
++  int n = std::snprintf(msg, sizeof(msg), "afeye-sink/%s v2 pid=%d", kLayer,
++                        static_cast<int>(::getpid()));
++  if (n <= 0) return;
++  uint8_t rec[16 + 96];
++  uint32_t total = 16 + static_cast<uint32_t>(n);
++  std::memcpy(rec, &total, sizeof(total));
++  rec[4] = 0;
++  rec[5] = 0;
++  rec[6] = 0;
++  rec[7] = 0;
++  uint64_t ts = MonoNs();
++  std::memcpy(rec + 8, &ts, sizeof(ts));
++  std::memcpy(rec + 16, msg, static_cast<size_t>(n));
++  WriteAll(fd, rec, total);
++}
++
++void DrainLoop() {
++  char pid[16];
++  std::snprintf(pid, sizeof(pid), "%d", static_cast<int>(::getpid()));
++  std::string path = std::string(RawDir()) + "/" + kLayer + "-" + pid + ".rec";
++  int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
++  if (fd >= 0) EmitHello(fd);
++  std::vector<uint8_t> buf;
++  for (;;) {
++    size_t len = 0;
++    bool have = false;
++    while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
++    }
++    if (g_ring.tail != g_ring.head) {
++      uint32_t len32;
++      std::memcpy(&len32, g_ring.data + g_ring.tail, sizeof(len32));
++      len = len32;
++      if (len < 16 || len > kMaxRecord) {
++        g_ring.tail = g_ring.head;
++      } else {
++        buf.assign(g_ring.data + g_ring.tail,
++                   g_ring.data + g_ring.tail + len);
++        size_t nt = g_ring.tail + len;
++        if (nt >= kRingBytes) nt -= kRingBytes;
++        g_ring.tail = nt;
++        have = true;
++      }
++    }
++    g_ring.lock.clear(std::memory_order_release);
++    if (have) {
++      if (fd >= 0) {
++        WriteAll(fd, buf.data(), len);
++      } else {
++        fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
++        if (fd >= 0) EmitHello(fd);
++      }
++    } else {
++      std::this_thread::sleep_for(std::chrono::microseconds(500));
++    }
++  }
++}
++
++void InitOnce() {
++  if (!EnvOn()) return;
++  ::mkdir(RawDir(), 0777);
++  ::chmod(RawDir(), 0777);
++  g_on.store(true, std::memory_order_release);
++  std::thread(DrainLoop).detach();
++  std::atexit([] { Flush(500); });
++}
++
++}  // namespace
++
++bool Enabled() {
++  std::call_once(g_init_once, InitOnce);
++  return g_on.load(std::memory_order_acquire);
++}
++
++uint64_t NowNs() { return MonoNs(); }
++
++void EmitFlags(uint8_t kind, uint64_t ts_ns, uint8_t flags, const void* data,
++               uint32_t len) {
++  if (!g_on.load(std::memory_order_acquire)) return;
++  if (data == nullptr || len == 0) return;
++  if (len > kMaxRecord - 16) {
++    len = kMaxRecord - 16;
++    flags |= 1;
++  }
++  const size_t need = 16 + static_cast<size_t>(len);
++  while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
++  }
++  const size_t h = g_ring.head;
++  const size_t t = g_ring.tail;
++  const size_t used = (h >= t) ? h - t : kRingBytes - t + h;
++  if (kRingBytes - used < need + 8) {
++    g_ring.lock.clear(std::memory_order_release);
++    g_dropped.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++  uint8_t* rec = g_ring.data + h;
++  const uint32_t total = static_cast<uint32_t>(need);
++  std::memcpy(rec, &total, sizeof(total));
++  rec[4] = kind;
++  rec[5] = flags;
++  rec[6] = 0;
++  rec[7] = 0;
++  std::memcpy(rec + 8, &ts_ns, sizeof(ts_ns));
++  std::memcpy(rec + 16, data, len);
++  size_t nh = h + need;
++  if (nh >= kRingBytes) nh -= kRingBytes;
++  g_ring.head = nh;
++  g_ring.lock.clear(std::memory_order_release);
++}
++
++void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len) {
++  EmitFlags(kind, ts_ns, 0, data, len);
++}
++
++void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s) {
++  if (s == nullptr) return;
++  EmitFlags(kind, ts_ns, 0, s, static_cast<uint32_t>(std::strlen(s)));
++}
++
++void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b) {
++  if (a == nullptr || b == nullptr) return;
++  size_t la = std::strlen(a);
++  size_t lb = std::strlen(b);
++  bool trunc = false;
++  const size_t kCap = kMaxRecord - 17;
++  if (la > kCap) {
++    la = kCap;
++    trunc = true;
++  }
++  if (lb > kCap - la) {
++    lb = kCap - la;
++    trunc = true;
++  }
++  static thread_local std::string buf;
++  buf.clear();
++  buf.reserve(la + lb + 1);
++  buf.append(a, la);
++  buf.push_back('\0');
++  buf.append(b, lb);
++  EmitFlags(kind, ts_ns, trunc ? 1 : 0, buf.data(),
++            static_cast<uint32_t>(buf.size()));
++}
++
++void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
++              const uint8_t* bytes, uint32_t n) {
++  if (tag == nullptr || bytes == nullptr || n == 0) return;
++  size_t lt = std::strlen(tag);
++  if (lt > 64) lt = 64;
++  bool trunc = false;
++  if (n > kSpanCap) {
++    n = kSpanCap;
++    trunc = true;
++  }
++  static thread_local std::vector<char> buf;
++  buf.clear();
++  buf.reserve(lt + 1 + n);
++  buf.insert(buf.end(), tag, tag + lt);
++  buf.push_back('\0');
++  buf.insert(buf.end(), reinterpret_cast<const char*>(bytes),
++             reinterpret_cast<const char*>(bytes) + n);
++  EmitFlags(kind, ts_ns, trunc ? 1 : 0, buf.data(),
++            static_cast<uint32_t>(buf.size()));
++}
++
++uint64_t SinkDropped() { return g_dropped.load(std::memory_order_relaxed); }
++
++bool Flush(uint32_t timeout_ms) {
++  if (!g_on.load(std::memory_order_acquire)) return true;
++  auto deadline = std::chrono::steady_clock::now() +
++                  std::chrono::milliseconds(timeout_ms);
++  while (std::chrono::steady_clock::now() < deadline) {
++    bool empty;
++    while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
++    }
++    empty = g_ring.tail == g_ring.head;
++    g_ring.lock.clear(std::memory_order_release);
++    if (empty) return true;
++    std::this_thread::sleep_for(std::chrono::microseconds(200));
++  }
++  return false;
++}
++
++}
++}  // namespace network
++
++#endif
+diff --git a/services/network/public/cpp/BUILD.gn b/services/network/public/cpp/BUILD.gn
+index 7777777782..8888888893 100644
+--- a/services/network/public/cpp/BUILD.gn
++++ b/services/network/public/cpp/BUILD.gn
+@@ -12,6 +12,10 @@ import("//third_party/protobuf/proto_library.gni")
+ 
+ visibility = [ "//services/*", "//content/*" ]
+ 
++declare_args() {
++  network_enable_afeye = false
++}
++
+ component("network_cpp") {
+   sources = [
+     "annotation_manager.cc",
+@@ -320,6 +329,14 @@ component("network_cpp") {
+     "url_loader_factory.cc",
+     "url_loader_factory.h",
+   ]
++
++  if (network_enable_afeye) {
++    sources += [
++      "afeye_sink.cc",
++      "afeye_sink.h",
++    ]
++    defines = [ "NET_AFEYE" ]
++  }
+ 
+   public_deps = [
+     "//base",
+diff --git a/services/network/url_loader.cc b/services/network/url_loader.cc
+index 1111111118..2222222229 100644
+--- a/services/network/url_loader.cc
++++ b/services/network/url_loader.cc
+@@ -130,6 +130,9 @@
+ #include "url/gurl.h"
+ #include "url/origin.h"
+ #include "url/url_constants.h"
++#ifdef NET_AFEYE
++#include "services/network/public/cpp/afeye_sink.h"
++#endif
+ 
+ namespace network {
+ 
+@@ -2479,6 +2482,43 @@ void URLLoader::StartRequest() {
+ 
+   backend_request_timer_ = nullptr;
+   has_backend_request_timer_ = false;
++#ifdef NET_AFEYE
++  if (network::afeye::Enabled() && request_.url.is_valid()) {
++    network::afeye::EmitTwoStr(network::afeye::kNetReq,
++                               network::afeye::NowNs(),
++                               request_.method.c_str(),
++                               request_.url.spec().c_str());
++    std::string wire_headers;
++    request_.headers.ToString(&wire_headers);
++    if (!wire_headers.empty()) {
++      network::afeye::EmitTwoStr(network::afeye::kNetReq,
++                                 network::afeye::NowNs(),
++                                 "req-headers", wire_headers.c_str());
++    }
++    if (request_.request_body) {
++      uint64_t total_body = 0;
++      for (const auto& element : request_.request_body->elements()) {
++        if (element.type() != network::DataElement::Tag::kBytes) {
++          continue;
++        }
++        const std::string& chunk = element.AsBytes().payload();
++        total_body += chunk.size();
++        if (chunk.empty()) {
++          continue;
++        }
++        network::afeye::EmitSpan(network::afeye::kNetReq,
++                                 network::afeye::NowNs(), "req-body",
++                                 reinterpret_cast<const uint8_t*>(chunk.data()),
++                                 static_cast<uint32_t>(chunk.size()));
++      }
++      char body_sum[64];
++      std::snprintf(body_sum, sizeof(body_sum), "req-body-total=%llu",
++                    static_cast<unsigned long long>(total_body));
++      network::afeye::EmitStr(network::afeye::kNetReq,
++                              network::afeye::NowNs(), body_sum);
++    }
++  }
++#endif
+   DCHECK(!has_backend_request_timer_);
+   CreateDataPipeForConsumerAndStartRequestIfNecessary();
+ }
+@@ -3101,6 +3140,26 @@ void URLLoader::OnReceiveResponse(
+     network::URLLoaderCompletionStatus* status,
+     mojo::ScopedDataPipeConsumerHandle body) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++#ifdef NET_AFEYE
++  if (network::afeye::Enabled() && request_.url.is_valid()) {
++    if (response_head_ && response_head_->headers) {
++      std::string raw = response_head_->headers->raw_headers();
++      if (!raw.empty()) {
++        network::afeye::EmitTwoStr(network::afeye::kNetRespBody,
++                                   network::afeye::NowNs(),
++                                   "resp-headers", raw.c_str());
++      }
++    }
++    if (response_head_) {
++      char mime_info[160];
++      std::snprintf(mime_info, sizeof(mime_info), "resp-mime=%s code=%d",
++                    response_head_->mime_type.c_str(),
++                    response_head_->headers ? response_head_->headers->response_code() : 0);
++      network::afeye::EmitStr(network::afeye::kNetRespBody,
++                              network::afeye::NowNs(), mime_info);
++    }
++  }
++#endif
+   DispatchResponse();
+ }
+ 
+@@ -3320,4 +3377,17 @@ void URLLoader::OnComplete(const URLLoaderCompletionStatus& status) {
+   }
+   NotifyCompleted(status);
++#ifdef NET_AFEYE
++  if (network::afeye::Enabled() && request_.url.is_valid()) {
++    char head[512];
++    int nw = std::snprintf(head, sizeof(head),
++                           "complete url=%s code=%d decoded_body=%llu",
++                           request_.url.spec().c_str(), status.error_code,
++                           static_cast<unsigned long long>(response_body_length_));
++    if (nw > 0) {
++      network::afeye::EmitStr(network::afeye::kNetRespBody,
++                              network::afeye::NowNs(), head);
++    }
++  }
++#endif
+   CleanupResponseBodyDecoder(response_body_length_);
+ }
+diff --git a/services/network/web_socket.cc b/services/network/web_socket.cc
+index 3333333340..4444444451 100644
+--- a/services/network/web_socket.cc
++++ b/services/network/web_socket.cc
+@@ -65,6 +65,9 @@
+ #include "net/websockets/websocket_frame.h"
+ #include "net/websockets/websocket_channel.h"
+ #include "url/gurl.h"
++#ifdef NET_AFEYE
++#include "services/network/public/cpp/afeye_sink.h"
++#endif
+ 
+ namespace network {
+ 
+@@ -1231,6 +1234,15 @@ void WebSocket::OnDataFrame(bool fin,
+                             WebSocketMessageType type,
+                             base::span<const uint8_t> payload) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++#ifdef NET_AFEYE
++  if (network::afeye::Enabled()) {
++    network::afeye::EmitSpan(network::afeye::kWebSocket,
++                             network::afeye::NowNs(),
++                             fin ? "ws-frame-fin" : "ws-frame",
++                             payload.data(),
++                             static_cast<uint32_t>(std::min<size_t>(payload.size(), 256u * 1024u)));
++  }
++#endif
+   switch (type) {
+     case WebSocketMessageType::TEXT:
+       // We accumulate text frames in |receive_frame_text_messages_| and send

@@ -1,0 +1,88 @@
+name: afeye-test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: afeye-test
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: probe patched chrome release
+        id: rel
+        run: |
+          TS=$(curl -fsSL --max-time 30 "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/chrome-build" \
+            | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('published_at','none'))" 2>/dev/null || echo none)
+          echo "ts=$TS" >> "$GITHUB_OUTPUT"
+      - name: cache patched chrome
+        if: steps.rel.outputs.ts != 'none'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/afeye-chrome
+          key: afeye-chrome-${{ steps.rel.outputs.ts }}
+          restore-keys: |
+            afeye-chrome-
+      - name: patched chrome from release
+        run: |
+          if [ -x /tmp/afeye-chrome/chrome-linux/chrome ]; then
+            echo "AF_CHROME=/tmp/afeye-chrome/chrome-linux/chrome" >> "$GITHUB_ENV"
+            echo "patched chrome: cache"
+          elif [ "${{ steps.rel.outputs.ts }}" != "none" ]; then
+            set -e
+            mkdir -p /tmp/afeye-chrome
+            curl -fsSL --retry 3 -o /tmp/chrome.tzst "https://github.com/${GITHUB_REPOSITORY}/releases/download/chrome-build/afeye-chrome-linux64.tzst"
+            tar -I zstd -xf /tmp/chrome.tzst -C /tmp/afeye-chrome
+            echo "AF_CHROME=/tmp/afeye-chrome/chrome-linux/chrome" >> "$GITHUB_ENV"
+          else
+            echo "::warning::patched chrome not built yet - stock chrome, sink_alive=false expected"
+          fi
+      - name: env+chrome
+        run: |
+          (
+            set -e
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq aria2 curl zip p7zip-full >/dev/null 2>&1
+            cd /tmp
+            aria2c -x16 -s16 -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get install -y -qq ./google-chrome-stable_current_amd64.deb >/dev/null 2>&1
+            google-chrome --version
+          ) &
+          SETUP_PID=$!
+          cargo build --release
+          wait $SETUP_PID
+      - name: run-test
+        run: |
+          AFEYE_SINK=1 AF_LOCAL=1 AF_TEST_HEADLESS=1 AF_BROWSE_SECS=170 AF_HARD_SECS=310 AF_BUDGET_MB=120 ./target/release/afeye --test
+      - name: push-test-zip
+        if: always()
+        run: |
+          shopt -s nullglob
+          zips=(dumps/*.zip dumps/*.7z)
+          if [ ${#zips[@]} -gt 0 ]; then
+            mkdir -p dumps/test
+            mv dumps/*.zip dumps/*.7z dumps/test/ 2>/dev/null || true
+            ls -1t dumps/test/* 2>/dev/null | tail -n +13 | xargs -r rm -f
+            git config user.name "afeye"
+            git config user.email "afeye@users.noreply.github.com"
+            git add dumps/test
+            git commit -m "test $(date -u +%FT%TZ)" || true
+            git pull --rebase origin HEAD || git pull --rebase || true
+            git push || git push -f
+          fi
+      - name: backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: afeye-test-runs
+          path: dumps/test/*
+          if-no-files-found: ignore

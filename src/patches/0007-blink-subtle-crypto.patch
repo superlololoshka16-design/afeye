@@ -1,0 +1,186 @@
+diff --git a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
+index 1111111115..2222222226 100644
+--- a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
++++ b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
+@@ -45,6 +45,9 @@
+ #include "third_party/blink/public/platform/web_crypto.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/platform/wtf/functional.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ namespace blink {
+ 
+@@ -758,6 +761,24 @@ static ScriptPromise<IDLArrayBuffer> EncryptOrEncryptInternal(
+     ExceptionState& exception_state,
+     SubtleCrypto::Operation operation) {
+   AlgorithmIdentifier algorithm_identifier = ToAlgorithmIdentifier(script_state->GetIsolate(), algorithm);
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    // Input side of every encrypt/decrypt call, BEFORE BoringSSL: the exact
++    // plaintext the anti-fraud layer hands to the primitive, plus the
++    // algorithm name so offline analysis can join primitive -> payload.
++    String algo = algorithm_identifier.GetString();
++    char tag[80];
++    int nw = std::snprintf(tag, sizeof(tag), "%s:%s",
++                           operation == SubtleCrypto::kEncrypt ? "encrypt" : "decrypt",
++                           algo.IsEmpty() ? "?" : algo.Utf8().c_str());
++    if (nw > 0) {
++      blink::afeye::EmitSpan(blink::afeye::kCryptoOp, blink::afeye::NowNs(),
++                             tag,
++                             static_cast<const uint8_t*>(data.Bytes().data()),
++                             static_cast<uint32_t>(std::min<size_t>(data.Bytes().size(), 64u << 10)));
++    }
++  }
++#endif
+   AlgorithmError error;
+   String historically_named_import_algorithm;
+   if (!GetKeyAlgorithmForOperation(script_state->GetIsolate(), operation, algorithm_identifier, historically_named_import_algorithm).empty()) {
+@@ -1145,6 +1168,21 @@ ScriptPromise<IDLArrayBuffer> SubtleCrypto::digest(
+       const V8AlgorithmIdentifier* raw_algorithm,
+       const BufferSource* data,
+       ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    AlgorithmIdentifier algo_id = ToAlgorithmIdentifier(script_state->GetIsolate(), raw_algorithm);
++    String algo = algo_id.GetString();
++    char tag[64];
++    int nw = std::snprintf(tag, sizeof(tag), "digest:%s",
++                           algo.IsEmpty() ? "?" : algo.Utf8().c_str());
++    if (nw > 0) {
++      blink::afeye::EmitSpan(blink::afeye::kCryptoOp, blink::afeye::NowNs(),
++                             tag,
++                             static_cast<const uint8_t*>(data->Bytes().data()),
++                             static_cast<uint32_t>(std::min<size_t>(data->Bytes().size(), 64u << 10)));
++    }
++  }
++#endif
+   AlgorithmIdentifier algorithm_identifier = ToAlgorithmIdentifier(script_state->GetIsolate(), raw_algorithm);
+   WebCryptoAlgorithm algorithm;
+   if (!ParseHashAlgorithm(algorithm_identifier, algorithm, exception_state)) {
+@@ -1224,6 +1261,20 @@ ScriptPromise<IDLAny> SubtleCrypto::sign(
+       ScriptPromiseResolverBase<IDLAny>* resolver =
+       MakeGarbageCollected<ScriptPromiseResolverBase<IDLAny>>(script_state);
+   AlgorithmIdentifier algorithm_identifier = ToAlgorithmIdentifier(script_state->GetIsolate(), raw_algorithm);
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    String algo = algorithm_identifier.GetString();
++    char tag[64];
++    int nw = std::snprintf(tag, sizeof(tag), "sign:%s",
++                           algo.IsEmpty() ? "?" : algo.Utf8().c_str());
++    if (nw > 0) {
++      blink::afeye::EmitSpan(blink::afeye::kCryptoOp, blink::afeye::NowNs(),
++                             tag,
++                             static_cast<const uint8_t*>(data->Bytes().data()),
++                             static_cast<uint32_t>(std::min<size_t>(data->Bytes().size(), 64u << 10)));
++    }
++  }
++#endif
+   // Get the key algorithm and usage for the given operation.
+   WebCryptoKeyAlgorithm key_algorithm;
+   if (!key->GetKeyAlgorithmForOperation(WebCryptoOperation::kSign, key_algorithm, exception_state)) {
+@@ -1847,7 +1898,19 @@ ScriptPromise<IDLAny> SubtleCrypto::importKey(
+       const V8AlgorithmIdentifier* raw_algorithm,
+       bool extractable,
+       const Vector<String>& key_usages,
+       ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    blink::afeye::EmitSpan(blink::afeye::kCryptoOp, blink::afeye::NowNs(),
++                           "import-key",
++                           static_cast<const uint8_t*>(key_data->Bytes().data()),
++                           static_cast<uint32_t>(std::min<size_t>(key_data->Bytes().size(), 64u << 10)));
++    AlgorithmIdentifier algo_id = ToAlgorithmIdentifier(script_state->GetIsolate(), raw_algorithm);
++    String algo = algo_id.GetString();
++    blink::afeye::EmitTwoStr(blink::afeye::kCryptoOp, blink::afeye::NowNs(),
++                             "import-params", algo.IsEmpty() ? "?" : algo.Utf8().c_str());
++  }
++#endif
+   AlgorithmIdentifier algorithm_identifier = ToAlgorithmIdentifier(script_state->GetIsolate(), raw_algorithm);
+   WebCryptoAlgorithm algorithm;
+   if (!ParseAlgorithmIdentifierForImport(format, algorithm_identifier, algorithm, exception_state)) {
+@@ -1931,7 +1993,15 @@ ScriptPromise<IDLAny> SubtleCrypto::deriveBits(
+   if (key->type() != "secret") {
+     exception_state.ThrowDOMException(DOMExceptionCode::kInvalidAccessError, "Secret key needed for derived bits");
+     return ScriptPromise<IDLAny>::Rejected(scope.GetScriptState(), exception_state);
+   }
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char bits[40];
++    std::snprintf(bits, sizeof(bits), "%llu", static_cast<unsigned long long>(length_bits));
++    blink::afeye::EmitTwoStr(blink::afeye::kCryptoOp, blink::afeye::NowNs(),
++                             "derive-bits", bits);
++  }
++#endif
+   CryptoResult* result = LazyResult(scope).Get();
+   WebCryptoAlgorithm algorithm;
+   if (!AlgorithmIdentifierForDerivedBits(...)
+diff --git a/third_party/blink/renderer/modules/crypto/crypto.cc b/third_party/blink/renderer/modules/crypto/crypto.cc
+index 2222222231..3333333342 100644
+--- a/third_party/blink/renderer/modules/crypto/crypto.cc
++++ b/third_party/blink/renderer/modules/crypto/crypto.cc
+@@ -35,6 +35,9 @@
+ #include "third_party/blink/renderer/bindings/core/v8/v8_union_array_buffer_array_buffer_view.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ namespace blink {
+ 
+@@ -120,7 +123,23 @@ NotShared<DOMArrayBufferView> Crypto::getRandomValues(
+     NotShared<DOMArrayBufferView> array,
+     ExceptionState& exception_state) const {
+   // afeye hook goes immediately before the return, so the view is already
+   // filled with the random bytes the page will consume.
++#ifdef BLINK_AFEYE
++  // afeye: emit the generated random material AFTER the fill: anti-fraud
++  // schemes derive nonces and keystream seeds from getRandomValues; having
++  // the actual bytes on the timeline makes their later ciphertexts
++  // attributable and (with the plaintext spans) decodable.
++  if (blink::afeye::Enabled() && array) {
++    DOMArrayBufferView* view = array.Get();
++    if (view && view->ByteLength() > 0) {
++      blink::afeye::EmitSpan(blink::afeye::kCryptoOp, blink::afeye::NowNs(),
++                             "get-random-values",
++                             static_cast<const uint8_t*>(view->Data()),
++                             static_cast<uint32_t>(
++                                 std::min<size_t>(view->ByteLength(), 64u << 10)));
++    }
++  }
++#endif
+   return array;
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/crypto/crypto_key.cc b/third_party/blink/renderer/modules/crypto/crypto_key.cc
+index 3333333337..4444444448 100644
+--- a/third_party/blink/renderer/modules/crypto/crypto_key.cc
++++ b/third_party/blink/renderer/modules/crypto/crypto_key.cc
+@@ -39,6 +39,9 @@
+ #include "third_party/blink/public/platform/web_crypto.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_union_array_buffer_array_buffer_view.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ namespace blink {
+ 
+@@ -193,6 +196,15 @@ CryptoKey* CryptoKey::Create(const WebCryptoKey& key, bool extractable, WebCrypto
+ CryptoKey::CryptoKey(const WebCryptoKey& key, bool extractable, ScriptWrappable* script_key)
+     : key_(key), extractable_(extractable), script_key_(script_key) {
+   usages_mask_ = key.NullableUsagesMask();
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char buf[96];
++    std::snprintf(buf, sizeof(buf), "cryptokey type=%c extractable=%d algorithm=%d",
++                  static_cast<char>(key.GetType()), extractable ? 1 : 0,
++                  static_cast<int>(key.Algorithm().Id()));
++    blink::afeye::EmitStr(blink::afeye::kCryptoOp, blink::afeye::NowNs(), buf);
++  }
++#endif
+ }
+ 
+ void CryptoKey::Trace(Visitor* visitor) const {

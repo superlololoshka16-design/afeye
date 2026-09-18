@@ -1,0 +1,169 @@
+diff --git a/src/execution/microtask-queue.cc b/src/execution/microtask-queue.cc
+index 1111111114..2222222225 100644
+--- a/src/execution/microtask-queue.cc
++++ b/src/execution/microtask-queue.cc
+@@ -12,6 +12,9 @@
+ #include "src/execution/isolate.h"
+ #include "src/objects/js-array-buffer.h"
+ #include "src/objects/promise.h"
++#ifdef V8_AFEYE
++#include "src/afeye/sink.h"
++#endif
+ 
+ namespace v8 {
+ namespace internal {
+@@ -82,6 +85,16 @@ MicrotaskQueue::~MicrotaskQueue() {
+   DCHECK(!size_);
+ }
+ 
++#ifdef V8_AFEYE
++void MicrotaskQueue::AfeyeEnqueueRecord(int context_id) {
++  if (!v8::afeye::Enabled()) return;
++  uint64_t record[2] = {static_cast<uint64_t>(size_ + 1),
++                        static_cast<uint64_t>(static_cast<uint32_t>(context_id))};
++  v8::afeye::Emit(v8::afeye::kMicrotaskEnqueue, v8::afeye::NowNs(), record,
++                  sizeof(record));
++}
++#endif
++
+ void MicrotaskQueue::EnqueueMicrotask(v8::Local<Function> v8_function,
+                                       v8::Local<v8::Value> v8_receiver,
+                                       base::Vector<v8::Local<v8::Value>> v8_args) {
+@@ -105,6 +122,9 @@ void MicrotaskQueue::EnqueueMicrotask(DirectHandle<CallableTask> microtask) {
+   DCHECK_EQ(microtask->GetReadOnlyRoots().callable_task_map(),
+             microtask->map(isolate_));
+   ring_buffer_[ring_buffer_mask_ & size_++] = *HeapObjectReference::Create(isolate_->heap(), microtask);
++#ifdef V8_AFEYE
++  AfeyeEnqueueRecord(microtask->GetCreationContextId().value_or(0));
++#endif
+ }
+ 
+ void MicrotaskQueue::EnqueueMicrotask(DirectHandle<PromiseReaction> microtask) {
+@@ -113,6 +133,9 @@ void MicrotaskQueue::EnqueueMicrotask(DirectHandle<PromiseReaction> microtask) {
+   DCHECK_EQ(microtask->GetReadOnlyRoots().promise_reaction_map(),
+             microtask->map(isolate_));
+   ring_buffer_[ring_buffer_mask_ & size_++] = *HeapObjectReference::Create(isolate_->heap(), microtask);
++#ifdef V8_AFEYE
++  AfeyeEnqueueRecord(microtask->GetCreationContextId().value_or(0));
++#endif
+ }
+ 
+ void MicrotaskQueue::EnqueueMicrotask(DirectHandle<PromiseReactionThenFinally> microtask) {
+@@ -121,6 +144,9 @@ void MicrotaskQueue::EnqueueMicrotask(DirectHandle<PromiseReactionThenFinally> m
+   DCHECK_EQ(microtask->GetReadOnlyRoots().promise_reaction_then_finally_map(),
+             microtask->map(isolate_));
+   ring_buffer_[ring_buffer_mask_ & size_++] = *HeapObjectReference::Create(isolate_->heap(), microtask);
++#ifdef V8_AFEYE
++  AfeyeEnqueueRecord(microtask->GetCreationContextId().value_or(0));
++#endif
+ }
+ 
+ void MicrotaskQueue::EnqueueMicrotask(DirectHandle<PromiseReactionCatchFinally> microtask) {
+@@ -129,5 +155,8 @@ void MicrotaskQueue::EnqueueMicrotask(DirectHandle<PromiseReactionCatchFinally>
+   DCHECK_EQ(microtask->GetReadOnlyRoots().promise_reaction_catch_finally_map(),
+             microtask->map(isolate_));
+   ring_buffer_[ring_buffer_mask_ & size_++] = *HeapObjectReference::Create(isolate_->heap(), microtask);
++#ifdef V8_AFEYE
++  AfeyeEnqueueRecord(microtask->GetCreationContextId().value_or(0));
++#endif
+ }
+ 
+@@ -285,3 +314,20 @@ void MicrotaskQueue::PerformCheckpointInternal(v8::Isolate* v8_isolate) {
++#ifdef V8_AFEYE
++  // afeye: one record per checkpoint: queue sizes before/after plus
++  // wall-clock bounds. Enqueue records + these bounds reconstruct the exact
++  // async pipeline shape (how many reactions drained, how long the drain
++  // took) without touching the per-microtask interpreter loop.
++  uint64_t afeye_t0 = v8::afeye::NowNs();
++  int64_t afeye_s0 = static_cast<int64_t>(size_);
++  PerformCheckpoint(v8_isolate);
++  if (v8::afeye::Enabled()) {
++    uint64_t record[4] = {static_cast<uint64_t>(afeye_s0),
++                          static_cast<uint64_t>(size_),
++                          afeye_t0, v8::afeye::NowNs()};
++    v8::afeye::Emit(v8::afeye::kMicrotaskRun, afeye_t0, record, sizeof(record));
++  }
++  return;
++#endif
++  PerformCheckpoint(v8_isolate);
+ void MicrotaskQueue::RunMicrotasks(v8::Isolate* v8_isolate) {
+   v8::Isolate::SuppressMicrotaskExecution suppress(v8_isolate);
+   Isolate* isolate = reinterpret_cast<Isolate*>(v8_isolate);
+diff --git a/src/execution/microtask-queue.h b/src/execution/microtask-queue.h
+index 3333333336..4444444447 100644
+--- a/src/execution/microtask-queue.h
++++ b/src/execution/microtask-queue.h
+@@ -237,6 +237,10 @@ class V8_EXPORT MicrotaskQueue final : public v8::internal::MicrotaskQueueBase {
+   static constexpr size_t kMinimumCapacity = 8;
+ 
+  private:
++#ifdef V8_AFEYE
++  void AfeyeEnqueueRecord(int context_id);
++#endif
++
+   void OnCompletedForInspector(v8::Isolate* v8_isolate);
+ 
+   template <typename T>
+diff --git a/src/api/api.cc b/src/api/api.cc
+index bbbbbbbbbb..cccccccccc 100644
+--- a/src/api/api.cc
++++ b/src/api/api.cc
+@@ -8231,6 +8231,11 @@ Local<SharedArrayBuffer> v8::SharedArrayBuffer::New(Isolate* v8_isolate,
+   Utils::ApiCheck(i::v8_flags.harmony_sharedarraybuffer,
+                   "v8::SharedArrayBuffer::New",
+                   "SharedArrayBuffer is disabled");
++#ifdef V8_AFEYE
++  if (!backing_store.IsEmpty()) {
++    backing_store->AfeyeRecord(true);
++  }
++#endif
+   RETURN_EMPTY_ON_FAILED_EXECUTION(SharedArrayBuffer);
+   Local<SharedArrayBuffer> result = FromPrivate(
+       isolate, isolate->factory()->NewJSSharedArrayBuffer(std::move(backing_store)));
+diff --git a/src/objects/backing-store.cc b/src/objects/backing-store.cc
+index 7777777779..8888888890 100644
+--- a/src/objects/backing-store.cc
++++ b/src/objects/backing-store.cc
+@@ -20,6 +20,9 @@
+ #include "src/sandbox/sandbox.h"
+ #include "src/tracing/trace-event.h"
+ #include "src/utils/allocation.h"
++#ifdef V8_AFEYE
++#include "src/afeye/sink.h"
++#endif
+ 
+ namespace v8 {
+ namespace internal {
+@@ -666,6 +669,17 @@ std::unique_ptr<BackingStore> BackingStore::TryAllocateAndPartiallyCommitMemory(
+   return result;
+ }
+ 
++#ifdef V8_AFEYE
++void BackingStore::AfeyeRecord(bool shared) {
++  if (!v8::afeye::Enabled()) return;
++  uint64_t record[3] = {byte_length_,
++                        max_byte_length_,
++                        shared ? 1u : 0u};
++  v8::afeye::Emit(v8::afeye::kSabBacking, v8::afeye::NowNs(), record,
++                  sizeof(record));
++}
++#endif
++
+ std::unique_ptr<BackingStore> BackingStore::AllocateWasmMemory(Isolate* isolate,
+                                                               size_t initial_pages,
+                                                               size_t maximum_pages,
+diff --git a/src/objects/backing-store.h b/src/objects/backing-store.h
+index 999999999a..aaaaaaaaab 100644
+--- a/src/objects/backing-store.h
++++ b/src/objects/backing-store.h
+@@ -412,6 +412,10 @@ class BackingStore : public BackingStoreBase {
+   void ClearSharedWasmMemoryObjects(Isolate* isolate);
+ #endif
+ 
++#ifdef V8_AFEYE
++  void AfeyeRecord(bool shared);
++#endif
++
+  private:
+   friend class GlobalBackingStoreRegistry;
+   BackingStore(void* buffer_start, size_t byte_length, size_t max_byte_length,

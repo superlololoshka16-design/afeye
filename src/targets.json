@@ -1,0 +1,8 @@
+{
+  "targets": [
+    "https://chat.z.ai/auth",
+    "https://chat.z.ai/",
+    "https://accounts.x.ai/sign-up?redirect=grok-com",
+    "https://freebuff.com/login"
+  ]
+}

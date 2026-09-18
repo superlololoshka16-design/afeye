@@ -1,0 +1,42 @@
+[package]
+name = "afeye"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
+
+[profile.release.package.chromiumoxide_cdp]
+codegen-units = 64
+opt-level = 1
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "net", "fs", "io-util", "signal"] }
+futures = "0.3"
+chromiumoxide = { version = "0.9", default-features = false }
+crossbeam-channel = "0.5"
+dashmap = "6"
+bumpalo = { version = "3", features = ["collections"] }
+bytes = "1"
+simdutf8 = "0.1"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+base64 = "0.22"
+rand = { version = "0.8", features = ["small_rng"] }
+itoa = "1"
+ryu = "1"
+core_affinity = "0.8"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[test]]
+name = "sink_roundtrip"
+path = "src/tests/sink_roundtrip.rs"

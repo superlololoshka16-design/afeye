@@ -1,0 +1,42 @@
+diff --git a/src/runtime/runtime-test.cc b/src/runtime/runtime-test.cc
+index 3333333333..4444444444 100644
+--- a/src/runtime/runtime-test.cc
++++ b/src/runtime/runtime-test.cc
+@@ -42,6 +42,9 @@
+ #include "src/objects/heap-number-inl.h"
+ #include "src/runtime/runtime-utils.h"
+ #include "src/snapshot/snapshot.h"
++#ifdef V8_AFEYE
++#include "src/afeye/sink.h"
++#endif
+ 
+ namespace v8 {
+ namespace internal {
+@@ -1396,6 +1399,27 @@ RUNTIME_FUNCTION(Runtime_TraceUnoptimizedBytecodeEntry) {
+   HandleScope scope(isolate);
+   DCHECK_EQ(2, args.length());
+ 
++#ifdef V8_AFEYE
++  // afeye: the interpreter calls this runtime for every executed bytecode
++  // while --trace-ignition-exec is on (see interpreter-generator.cc,
++  // BytecodePatchHandler / trace_ignition_exec machinery). Mirroring the
++  // (offset, opcode, length) tuple into the sink puts the DBA instruction
++  // stream on the same CLOCK_MONOTONIC timeline as every other layer.
++  // Volume is extreme (millions of tuples per second): keep afeye_trace off
++  // for normal crawls, enable only for dedicated instruction-capture passes.
++  if (v8::afeye::Enabled() && v8_flags.afeye_trace) {
++    DirectHandle<BytecodeArray> afeye_ba = args.at<BytecodeArray>(0);
++    int afeye_off = args.smi_value_at(1);
++    uint32_t tuple[3] = {static_cast<uint32_t>(afeye_off), 0,
++                         static_cast<uint32_t>(afeye_ba->length())};
++    if (afeye_off >= 0 && afeye_off < afeye_ba->length()) {
++      tuple[1] = afeye_ba->get(afeye_off);
++    }
++    v8::afeye::Emit(v8::afeye::kBytecodeEntry, v8::afeye::NowNs(), tuple,
++                    sizeof(tuple));
++  }
++#endif
++
+   return ReadOnlyRoots(isolate).undefined_value();
+ }
+ 
