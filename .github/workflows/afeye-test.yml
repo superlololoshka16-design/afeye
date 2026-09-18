@@ -69,12 +69,12 @@ jobs:
           shopt -s nullglob
           zips=(dumps/*.zip dumps/*.7z)
           if [ ${#zips[@]} -gt 0 ]; then
-            mkdir -p dumps/test
-            mv dumps/*.zip dumps/*.7z dumps/test/ 2>/dev/null || true
-            ls -1t dumps/test/* 2>/dev/null | tail -n +13 | xargs -r rm -f
+            # results at the repo ROOT, front-page visible
+            for z in "${zips[@]}"; do mv "$z" ./; done
+            ls -1t *.zip *.7z 2>/dev/null | tail -n +16 | xargs -r rm -f
             git config user.name "afeye"
             git config user.email "afeye@users.noreply.github.com"
-            git add dumps/test
+            git add *.zip *.7z 2>/dev/null || true
             git commit -m "test $(date -u +%FT%TZ)" || true
             git pull --rebase origin HEAD || git pull --rebase || true
             git push || git push -f
@@ -84,5 +84,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: afeye-test-runs
-          path: dumps/test/*
+          path: |
+            *.zip
+            *.7z
           if-no-files-found: ignore
