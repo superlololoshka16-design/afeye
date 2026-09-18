@@ -348,7 +348,7 @@ index 0000000000..1111111111
      deps += [ "third_party/vtune:v8_vtune_trace_mark" ]
 +  if (v8_enable_afeye) {
 +    sources += [ "src/afeye/sink.cc" ]
-+    defines += [ "V8_AFEYE" ]
++    defines = [ "V8_AFEYE" ]
 +  }
    }
  }

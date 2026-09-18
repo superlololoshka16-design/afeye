@@ -327,13 +327,10 @@ index 0000000000..1111111111
  
  component("network_service") {
    sources = [
-@@ -312,7 +317,15 @@
-       "websocket_interceptor.h",
-       "websocket_throttler.cc",
-       "websocket_throttler.h",
--    ]
-+  ]
-+
+@@ -447,6 +452,13 @@
+   }
+ 
+   defines = [ "IS_NETWORK_SERVICE_IMPL" ]
 +  if (network_enable_afeye) {
 +    sources += [
 +      "afeye_sink.cc",
@@ -341,9 +338,9 @@ index 0000000000..1111111111
 +    ]
 +    defines += [ "NET_AFEYE" ]
 +  }
-   }
+ }
  
-   if (is_chromeos) {
+ if (is_linux || is_chromeos) {
 
 --- a/services/network/url_loader.cc
 +++ b/services/network/url_loader.cc

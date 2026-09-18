@@ -345,7 +345,7 @@ index 0000000000..1111111111
 +      "afeye/sink.cc",
 +      "afeye/sink.h",
 +    ]
-+    public_configs += [ ":afeye_config" ]
++    public_configs = [ ":afeye_config" ]
 +  }
 +
    if (current_cpu == "loong64") {
