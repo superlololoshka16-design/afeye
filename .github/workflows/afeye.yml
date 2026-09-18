@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: afeye
@@ -28,6 +29,7 @@ jobs:
     timeout-minutes: 48
     outputs:
       cadence: ${{ steps.gate.outputs.cadence }}
+      chrome: ${{ steps.chrome.outputs.mode }}
     steps:
       - uses: actions/checkout@v4
       - name: gate
@@ -64,53 +66,59 @@ jobs:
               raise SystemExit
           print(f"cadence=go credits={eff} pending={pend}")
           PY
-      - uses: dtolnay/rust-toolchain@stable
+      - name: chrome
+        id: chrome
         if: steps.gate.outputs.cadence == 'go'
-      - uses: Swatinem/rust-cache@v2
-        if: steps.gate.outputs.cadence == 'go'
-      - name: probe patched chrome release
-        id: rel
-        if: steps.gate.outputs.cadence == 'go'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          TS=$(curl -fsSL --max-time 30 "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/chrome-build" \
-            | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('published_at','none'))" 2>/dev/null || echo none)
-          echo "ts=$TS" >> "$GITHUB_OUTPUT"
-      - name: cache patched chrome
-        if: steps.gate.outputs.cadence == 'go' && steps.rel.outputs.ts != 'none'
-        uses: actions/cache@v4
-        with:
-          path: /tmp/afeye-chrome
-          key: afeye-chrome-${{ steps.rel.outputs.ts }}
-          restore-keys: |
-            afeye-chrome-
-      - name: patched chrome from release
-        if: steps.gate.outputs.cadence == 'go'
-        run: |
-          if [ -x /tmp/afeye-chrome/chrome-linux/chrome ]; then
-            echo "AF_CHROME=/tmp/afeye-chrome/chrome-linux/chrome" >> "$GITHUB_ENV"
-            echo "patched chrome: from cache (build once, download forever)"
-          elif [ "${{ steps.rel.outputs.ts }}" != "none" ]; then
-            set -e
-            mkdir -p /tmp/afeye-chrome
-            curl -fsSL --retry 3 -o /tmp/chrome.tzst "https://github.com/${GITHUB_REPOSITORY}/releases/download/chrome-build/afeye-chrome-linux64.tzst"
-            tar -I zstd -xf /tmp/chrome.tzst -C /tmp/afeye-chrome
-            echo "AF_CHROME=/tmp/afeye-chrome/chrome-linux/chrome" >> "$GITHUB_ENV"
-            echo "patched chrome: downloaded from release chrome-build"
+          set -e
+          REL="https://github.com/${{ github.repository }}/releases/latest/download/chrome.tgz"
+          if curl -sfL -o /tmp/chrome.tgz "$REL"; then
+            sudo mkdir -p /opt/afeye-chrome
+            sudo tar xzf /tmp/chrome.tgz -C /opt/afeye-chrome
+            sudo chmod -R a+rX /opt/afeye-chrome
+            CHROME_BIN=/opt/afeye-chrome/chrome
+            test -x "$CHROME_BIN"
+            # sink liveness probe: the patched build writes a sink-hello .rec
+            # before the first page even loads
+            rm -rf /tmp/afeye-smoke && mkdir -p /tmp/afeye-smoke
+            AFEYE_SINK=1 AFEYE_RAW_DIR=/tmp/afeye-smoke \
+              "$CHROME_BIN" --headless=new --no-sandbox --disable-gpu \
+              --user-data-dir=/tmp/afeye-smoke-prof --dump-dom about:blank >/dev/null 2>&1 || true
+            N=$(ls /tmp/afeye-smoke/ 2>/dev/null | wc -l)
+            echo "sink smoke: $N record files"
+            if [ "$N" -eq 0 ]; then
+              echo "::warning::patched chrome ran but wrote zero sink records"
+            fi
+            echo "AF_CHROME=$CHROME_BIN" >> "$GITHUB_ENV"
+            echo "mode=patched" >> "$GITHUB_OUTPUT"
+            "$CHROME_BIN" --version
           else
-            echo "::warning::patched chrome build NOT FOUND - run the afeye-build workflow once. Stock chrome fallback: the manifest will carry sink_alive=false"
+            echo "mode=missing" >> "$GITHUB_OUTPUT"
+            echo "no chrome release yet - kicking the build chain and skipping this crawl"
+            gh workflow run afeye-build.yml --ref "${{ github.ref_name }}" || true
           fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.cadence == 'go' && steps.chrome.outputs.mode == 'patched'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.gate.outputs.cadence == 'go' && steps.chrome.outputs.mode == 'patched'
       - name: env+chrome+tunnels
-        if: steps.gate.outputs.cadence == 'go'
+        if: steps.gate.outputs.cadence == 'go' && steps.chrome.outputs.mode == 'patched'
         run: |
           (
             set -e
             sudo modprobe wireguard 2>/dev/null || true
             sudo apt-get update -qq
             sudo apt-get install -y -qq wireguard-tools xvfb aria2 curl zip p7zip-full >/dev/null 2>&1
-            cd /tmp
-            aria2c -x16 -s16 -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-            sudo apt-get install -y -qq ./google-chrome-stable_current_amd64.deb >/dev/null 2>&1
-            google-chrome --version
+            # wg configs come from the repo secret, never from the tree
+            if [ -n "${{ secrets.WG_CONF_B64 }}" ]; then
+              mkdir -p wg
+              echo '${{ secrets.WG_CONF_B64 }}' | base64 -d | tar xz -C wg
+              ls wg/*.conf | wc -l
+            else
+              echo "WG_CONF_B64 secret not set - tunnel crawl impossible"
+            fi
             for i in 1 2 3 4 5 6 7; do
               id=$((2000+i))
               if ! id fx$i >/dev/null 2>&1; then
@@ -122,7 +130,7 @@ jobs:
           cargo build --release
           wait $SETUP_PID
       - name: run
-        if: steps.gate.outputs.cadence == 'go'
+        if: steps.gate.outputs.cadence == 'go' && steps.chrome.outputs.mode == 'patched'
         run: |
           mkdir -p live/${{ github.run_id }}
           (
@@ -146,7 +154,7 @@ jobs:
           sudo -E env AFEYE_TG_ON=$AFEYE_TG_ON AFEYE_TG_TOKEN=$AFEYE_TG_TOKEN AFEYE_TG_CHAT=$AFEYE_TG_CHAT AFEYE_QUEUE_URL=$AFEYE_QUEUE_URL AFEYE_QUEUE_TOKEN=$AFEYE_QUEUE_TOKEN AF_BUDGET_MB=$AF_BUDGET_MB AFEYE_SINK=1 AF_BROWSE_SECS=2280 AF_HARD_SECS=2340 ./target/release/afeye
           kill $KEEPALIVE_PID 2>/dev/null || true
       - name: finalize
-        if: always() && steps.gate.outputs.cadence == 'go'
+        if: always() && steps.gate.outputs.cadence == 'go' && steps.chrome.outputs.mode == 'patched'
         run: |
           python3 - <<'PY'
           import json, os, time, glob
@@ -199,16 +207,23 @@ jobs:
                   pass
           PY
           shopt -s nullglob
-          zips=(dumps/*.zip dumps/*.7z)
+          # the result zip lands at the REPO ROOT - the main page shows the
+          # capture directly, per the requirement
+          zips=(dumps/*.zip)
           if [ ${#zips[@]} -gt 0 ]; then
-            # results live at the repo ROOT, visible on the front page
-            for z in "${zips[@]}"; do mv "$z" ./; done
+            main=$(ls -1t dumps/*.zip | head -1)
+            cp "$main" .
+            if [ -f "${main%.zip}.manifest.json" ]; then
+              cp "${main%.zip}.manifest.json" .
+            fi
+            # keep the 3 newest zips (+manifests) at root, drop the rest
+            ls -1t *.zip 2>/dev/null | tail -n +4 | xargs -r rm -f
+            ls -1t *.manifest.json 2>/dev/null | tail -n +4 | xargs -r rm -f
+            ls -1t dumps/*.zip dumps/*.7z 2>/dev/null | tail -n +17 | xargs -r rm -f
           fi
-          ls -1t *.zip *.7z 2>/dev/null | tail -n +16 | xargs -r rm -f
           git config user.name "afeye"
           git config user.email "afeye@users.noreply.github.com"
-          git add -A dumps state queue live 2>/dev/null || true
-          shopt -s nullglob; git add *.zip *.7z 2>/dev/null || true; shopt -u nullglob
+          git add dumps state queue live *.zip *.manifest.json 2>/dev/null || true
           git commit -m "run $(date -u +%FT%TZ) $GITHUB_EVENT_NAME" || true
           git pull --rebase origin HEAD || git pull --rebase || true
           git push || git push -f
@@ -217,18 +232,11 @@ jobs:
           git commit -m "prune live $(date -u +%FT%TZ)" >/dev/null 2>&1 || true
           git push >/dev/null 2>&1 || true
       - name: backup
-        if: always() && steps.gate.outputs.cadence == 'go'
+        if: always() && steps.gate.outputs.cadence == 'go' && steps.chrome.outputs.mode == 'patched'
         uses: actions/upload-artifact@v4
         with:
           name: afeye-runs
           path: |
-            *.zip
-            *.7z
-          if-no-files-found: ignore
-      - name: stage-on-fail
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: stage-raw
-          path: /tmp/afeye/stage
+            dumps/*.zip
+            dumps/*.7z
           if-no-files-found: ignore

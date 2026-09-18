@@ -1,31 +1,25 @@
-diff --git a/third_party/blink/renderer/platform/afeye/sink.h b/third_party/blink/renderer/platform/afeye/sink.h
+diff --git a/services/network/afeye_sink.h b/services/network/afeye_sink.h
 new file mode 100644
-index 0000000000..3333333333
+index 0000000000..1111111111
 --- /dev/null
-+++ b/third_party/blink/renderer/platform/afeye/sink.h
-@@ -0,0 +1,42 @@
-+#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
-+#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
++++ b/services/network/afeye_sink.h
+@@ -0,0 +1,36 @@
++#ifndef SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
++#define SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
 +
 +#include <stddef.h>
 +#include <stdint.h>
 +
-+#ifdef BLINK_AFEYE
++#ifdef NET_AFEYE
 +
-+namespace blink {
++namespace network {
 +namespace afeye {
 +
 +enum EventKind : uint8_t {
 +  kSinkHello = 0,
-+  kCryptoOp = 11,
-+  kTimer = 12,
-+  kPerfEntry = 13,
-+  kMessage = 14,
-+  kStructuredClone = 15,
-+  kFingerprint = 16,
++  kNetReq = 17,
++  kNetRespBody = 18,
 +  kWebSocket = 19,
-+  kClientHints = 20,
-+  kSwCache = 21,
 +};
 +
 +bool Enabled();
@@ -41,20 +35,22 @@ index 0000000000..3333333333
 +bool Flush(uint32_t timeout_ms);
 +
 +}
-+}  // namespace blink
++}  // namespace network
 +
 +#endif
 +
 +#endif
-diff --git a/third_party/blink/renderer/platform/afeye/sink.cc b/third_party/blink/renderer/platform/afeye/sink.cc
++
+
+diff --git a/services/network/afeye_sink.cc b/services/network/afeye_sink.cc
 new file mode 100644
-index 0000000000..4444444444
+index 0000000000..1111111111
 --- /dev/null
-+++ b/third_party/blink/renderer/platform/afeye/sink.cc
++++ b/services/network/afeye_sink.cc
 @@ -0,0 +1,263 @@
-+#include "third_party/blink/renderer/platform/afeye/sink.h"
++#include "services/network/afeye_sink.h"
 +
-+#ifdef BLINK_AFEYE
++#ifdef NET_AFEYE
 +
 +#include <atomic>
 +#include <cerrno>
@@ -74,14 +70,14 @@ index 0000000000..4444444444
 +#include <time.h>
 +#include <unistd.h>
 +
-+namespace blink {
++namespace network {
 +namespace afeye {
 +namespace {
 +
 +constexpr size_t kRingBytes = 8u << 20;
 +constexpr size_t kMaxRecord = 1u << 20;
-+constexpr uint32_t kSpanCap = 64u * 1024u;
-+constexpr const char* kLayer = "blink";
++constexpr uint32_t kSpanCap = 256u * 1024u;
++constexpr const char* kLayer = "net";
 +
 +std::atomic<bool> g_on{false};
 +std::atomic<uint64_t> g_dropped{0};
@@ -312,40 +308,206 @@ index 0000000000..4444444444
 +}
 +
 +}
-+}  // namespace blink
++}  // namespace network
 +
 +#endif
-diff --git a/third_party/blink/renderer/platform/BUILD.gn b/third_party/blink/renderer/platform/BUILD.gn
-index 5555555558..6666666669 100644
---- a/third_party/blink/renderer/platform/BUILD.gn
-+++ b/third_party/blink/renderer/platform/BUILD.gn
-@@ -182,6 +182,14 @@ config("blink_platform_impl_config") {
-   ]
++
+
+--- a/services/network/BUILD.gn
++++ b/services/network/BUILD.gn
+@@ -8,6 +8,11 @@
+ import("//net/features.gni")
+ import("//services/network/public/cpp/features.gni")
+ import("//testing/libfuzzer/fuzzer_test.gni")
++
++declare_args() {
++  # afeye: env-activated record sink compiled into the network service.
++  network_enable_afeye = false
++}
+ 
+ component("network_service") {
+   sources = [
+@@ -312,7 +317,15 @@
+       "websocket_interceptor.h",
+       "websocket_throttler.cc",
+       "websocket_throttler.h",
+-    ]
++  ]
++
++  if (network_enable_afeye) {
++    sources += [
++      "afeye_sink.cc",
++      "afeye_sink.h",
++    ]
++    defines += [ "NET_AFEYE" ]
++  }
+   }
+ 
+   if (is_chromeos) {
+
+--- a/services/network/url_loader.cc
++++ b/services/network/url_loader.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include "services/network/url_loader.h"
++#ifdef NET_AFEYE
++#include <string>
++#include "services/network/afeye_sink.h"
++#endif
+ 
+ #include <algorithm>
+ #include <limits>
+@@ -633,6 +637,31 @@
+ void URLLoader::SetUpUpload(
+     const ResourceRequest& request,
+     base::expected<std::vector<base::File>, net::Error> file_open_result) {
++#ifdef NET_AFEYE
++  if (network::afeye::Enabled() && request.request_body) {
++    uint64_t afeye_total = 0;
++    for (const auto& afeye_el : request.request_body->elements()) {
++      if (afeye_el.type() != network::DataElement::Tag::kBytes) {
++        continue;
++      }
++      const auto& afeye_bytes = afeye_el.As<network::DataElementBytes>().bytes();
++      afeye_total += afeye_bytes.size();
++      if (!afeye_bytes.empty()) {
++        network::afeye::EmitSpan(network::afeye::kNetReq,
++                                 network::afeye::NowNs(), "req-body",
++                                 afeye_bytes.data(),
++                                 static_cast<uint32_t>(afeye_bytes.size()));
++      }
++    }
++    if (afeye_total) {
++      char afeye_sum[80];
++      std::snprintf(afeye_sum, sizeof(afeye_sum), "req-body-total=%llu",
++                    static_cast<unsigned long long>(afeye_total));
++      network::afeye::EmitStr(network::afeye::kNetReq,
++                             network::afeye::NowNs(), afeye_sum);
++    }
++  }
++#endif
+   if (file_opener_for_upload_) {
+     file_opener_for_upload_.reset();
+     // This corresponds to the LogBlockedBy call made just before creating
+@@ -739,6 +768,20 @@
  }
  
-+declare_args() {
-+  blink_enable_afeye = false
-+}
-+
-+config("afeye_config") {
-+  defines = [ "BLINK_AFEYE" ]
-+}
-+
- visibility_blink_platform = [
-   "//third_party/blink/public/mojom",
-   "//third_party/blink/renderer",
-@@ -1553,6 +1562,14 @@ component("platform") {
-     "wtf/wtf_size_t.cc",
-   ]
- 
-+  if (blink_enable_afeye) {
-+    sources += [
-+      "afeye/sink.cc",
-+      "afeye/sink.h",
-+    ]
-+    public_configs += [ ":afeye_config" ]
+ void URLLoader::ScheduleStart() {
++#ifdef NET_AFEYE
++  if (network::afeye::Enabled() && url_request_) {
++    network::afeye::EmitTwoStr(network::afeye::kNetReq,
++                               network::afeye::NowNs(),
++                               url_request_->method().c_str(),
++                               url_request_->url().spec().c_str());
++    std::string afeye_headers = url_request_->extra_request_headers().ToString();
++    if (!afeye_headers.empty()) {
++      network::afeye::EmitTwoStr(network::afeye::kNetReq,
++                                 network::afeye::NowNs(), "req-headers",
++                                 afeye_headers.c_str());
++    }
 +  }
-+
-   configs += [
-     "//third_party/blink/renderer/platform:blink_platform_impl_config",
-     "//third_party/blink/renderer/platform:wtf_config",
++#endif
+   TRACE_EVENT("loading", "URLLoader::ScheduleStart",
+               net::NetLogWithSourceToFlow(url_request_->net_log()));
+   bool defer = false;
+@@ -1195,6 +1238,28 @@
+ }
+ 
+ void URLLoader::ContinueOnResponseStarted() {
++#ifdef NET_AFEYE
++  if (network::afeye::Enabled() && url_request_) {
++    const net::HttpResponseInfo& afeye_info = url_request_->response_info();
++    if (afeye_info.headers) {
++      std::string afeye_raw = afeye_info.headers->raw_headers();
++      if (!afeye_raw.empty()) {
++        network::afeye::EmitTwoStr(network::afeye::kNetRespBody,
++                                   network::afeye::NowNs(),
++                                   "resp-headers", afeye_raw.c_str());
++      }
++      std::string afeye_mime;
++      if (afeye_info.headers->GetMimeType(&afeye_mime)) {
++        char afeye_code[96];
++        std::snprintf(afeye_code, sizeof(afeye_code),
++                      "resp-mime=%s code=%d", afeye_mime.c_str(),
++                      afeye_info.headers->response_code());
++        network::afeye::EmitStr(network::afeye::kNetRespBody,
++                                 network::afeye::NowNs(), afeye_code);
++      }
++    }
++  }
++#endif
+   // Do not account header bytes when reporting received body bytes to client.
+   reported_total_encoded_bytes_ =
+       url_request_->GetTotalReceivedBytes().InBytes();
+@@ -1647,6 +1712,18 @@
+   url_read_state_ = URLReadState::kWaitMojoPipeWritable;
+ 
+   size_t new_data_offset = pending_write_buffer_offset_;
++#ifdef NET_AFEYE
++  if (network::afeye::Enabled() && pending_write_ && num_bytes > 0 &&
++      !into_slop_bucket) {
++    const uint8_t* afeye_p = reinterpret_cast<const uint8_t*>(
++        pending_write_->buffer()) + new_data_offset;
++    network::afeye::EmitSpan(network::afeye::kNetRespBody,
++                             network::afeye::NowNs(), "resp-body",
++                             afeye_p,
++                             static_cast<uint32_t>(
++                                 num_bytes > 0x40000 ? 0x40000 : num_bytes));
++  }
++#endif
+   MaybeCollectDurableMessage(new_data_offset, num_bytes);
+ 
+   if (num_bytes > 0) {
+@@ -1941,6 +2018,21 @@
+ }
+ 
+ void URLLoader::NotifyCompleted(int error_code) {
++#ifdef NET_AFEYE
++  if (network::afeye::Enabled() && url_request_) {
++    char afeye_fin[512];
++    int afeye_n = std::snprintf(afeye_fin, sizeof(afeye_fin),
++                               "complete url=%s err=%d recv=%lld",
++                               url_request_->url().spec().c_str(),
++                               error_code,
++                               static_cast<long long>(
++                                   url_request_->GetTotalReceivedBytes().InBytes()));
++    if (afeye_n > 0) {
++      network::afeye::EmitStr(network::afeye::kNetRespBody,
++                             network::afeye::NowNs(), afeye_fin);
++    }
++  }
++#endif
+   // Ensure sending the final upload progress message here, since
+   // OnResponseCompleted can be called without OnResponseStarted on cancellation
+   // or error cases.
+
+--- a/services/network/websocket.cc
++++ b/services/network/websocket.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "services/network/websocket.h"
++#ifdef NET_AFEYE
++#include "services/network/afeye_sink.h"
++#endif
+ 
+ #include <inttypes.h>
+ #include <string.h>
+@@ -411,6 +414,16 @@
+     bool fin,
+     net::WebSocketFrameHeader::OpCode type,
+     base::span<const char> payload) {
++#ifdef NET_AFEYE
++  if (network::afeye::Enabled() && payload.size() > 0) {
++    network::afeye::EmitSpan(network::afeye::kWebSocket,
++                             network::afeye::NowNs(),
++                             fin ? "ws-frame-fin" : "ws-frame",
++                             reinterpret_cast<const uint8_t*>(payload.data()),
++                             static_cast<uint32_t>(
++                                 payload.size() > 0x40000 ? 0x40000                                                         : payload.size()));
++  }
++#endif
+   DVLOG(3) << "WebSocketEventHandler::OnDataFrame @"
+            << reinterpret_cast<void*>(this) << " fin=" << fin
+            << " type=" << type << " data is " << payload.size() << " bytes";

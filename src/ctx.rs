@@ -134,11 +134,6 @@ pub struct Cn {
     pub poke: AtomicU64,
     pub stop: AtomicBool,
     pub dead: AtomicBool,
-    // afeye v123: our own driver footprint must be visible, never silent.
-    // pauses = debugger-statement traps auto-resumed; ownskip = our own
-    // evaluation/boot scripts excluded from the executing-script capture.
-    pub pauses: AtomicU64,
-    pub ownskip: AtomicU64,
 }
 
 impl Cn {
@@ -157,8 +152,6 @@ impl Cn {
             poke: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             dead: AtomicBool::new(false),
-            pauses: AtomicU64::new(0),
-            ownskip: AtomicU64::new(0),
         }
     }
 
@@ -208,15 +201,12 @@ pub struct Ctx {
     pub gl_spoof: bool,
     pub budget: AtomicU64,
     pub chrome: PathBuf,
+    /// Full --user-agent value built from the real chrome version. Kills the
+    /// HeadlessChrome token that stock headless builds leak into every
+    /// request and into navigator.userAgent.
+    pub ua: String,
     pub display: String,
     pub endpoints: DashMap<u32, u64>,
-    // afeye v123 stealth: one consistent UA everywhere (flag + CDP override +
-    // full Sec-CH-UA brand list). No HeadlessChrome token can ever leave the
-    // process, headless or not, patched build or stock.
-    pub ua: String,
-    pub ua_major: String,
-    pub ua_full: String,
-    pub inject_hash: [u8; 32],
 }
 
 #[cfg(test)]

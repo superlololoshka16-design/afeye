@@ -74,13 +74,13 @@ fn sink_patch_roundtrip_is_byte_exact() {
     for p in [
         "0001-v8-sink.patch",
         "0006-blink-sink.patch",
-        "0011-network-wire.patch",
+        "0012-network-wire.patch",
     ] {
-        extract_new_files(&manifest.join("src/patches").join(p), &src);
+        extract_new_files(&manifest.join("patches").join(p), &src);
     }
     let v8_sink = src.join("src/afeye/sink.cc");
     let blink_sink = src.join("third_party/blink/renderer/platform/afeye/sink.cc");
-    let net_sink = src.join("services/network/public/cpp/afeye_sink.cc");
+    let net_sink = src.join("services/network/afeye_sink.cc");
     assert!(v8_sink.exists(), "v8 sink not extracted");
     assert!(blink_sink.exists(), "blink sink not extracted");
     assert!(net_sink.exists(), "net sink not extracted");

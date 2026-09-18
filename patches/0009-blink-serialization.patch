@@ -1,0 +1,95 @@
+--- a/third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.cc
++++ b/third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.cc
+@@ -29,6 +29,9 @@
+  */
+ 
+ #include "third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -240,6 +243,17 @@
+ SerializedScriptValue::SerializedScriptValue(DataBufferPtr data)
+     : data_buffer_(std::move(data)),
+       has_registered_external_allocation_(false) {}
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    auto afeye_span = data_buffer_.as_span();
++    if (!afeye_span.empty()) {
++      blink::afeye::EmitSpan(blink::afeye::kStructuredClone,
++                             blink::afeye::NowNs(), "ssv",
++                             reinterpret_cast<const uint8_t*>(afeye_span.data()),
++                             static_cast<uint32_t>(afeye_span.size()));
++    }
++  }
++#endif
+ 
+ void SerializedScriptValue::SetImageBitmapContentsArray(
+     ImageBitmapContentsArray contents) {
+
+--- a/third_party/blink/renderer/core/messaging/message_port.cc
++++ b/third_party/blink/renderer/core/messaging/message_port.cc
+@@ -25,6 +25,9 @@
+  */
+ 
+ #include "third_party/blink/renderer/core/messaging/message_port.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <memory>
+ #include <optional>
+@@ -103,6 +106,12 @@
+                               const ScriptValue& message,
+                               const PostMessageOptions* options,
+                               ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    blink::afeye::EmitStr(blink::afeye::kMessage, blink::afeye::NowNs(),
++                          "message-port-post");
++  }
++#endif
+   if (!IsEntangled())
+     return;
+   DCHECK(GetExecutionContext());
+
+--- a/third_party/blink/renderer/modules/broadcastchannel/broadcast_channel.cc
++++ b/third_party/blink/renderer/modules/broadcastchannel/broadcast_channel.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "third_party/blink/renderer/modules/broadcastchannel/broadcast_channel.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include "base/metrics/histogram_functions.h"
+ #include "base/notreached.h"
+@@ -74,6 +77,12 @@
+ 
+ void BroadcastChannel::postMessage(const ScriptValue& message,
+                                    ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    blink::afeye::EmitStr(blink::afeye::kMessage, blink::afeye::NowNs(),
++                          "broadcast-post");
++  }
++#endif
+   // If the receiver is not bound because `close` was called on this
+   // BroadcastChannel instance, raise an exception per the spec. Otherwise,
+   // in cases like the instance being created in an iframe that is now detached,
+@@ -174,6 +183,12 @@
+ }
+ 
+ void BroadcastChannel::OnMessage(BlinkCloneableMessage message) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    blink::afeye::EmitStr(blink::afeye::kMessage, blink::afeye::NowNs(),
++                          "broadcast-recv");
++  }
++#endif
+   auto* context = GetExecutionContext();
+ 
+   // Queue a task to dispatch the event.

@@ -27,7 +27,7 @@ pub const DEFAULT_RAW_DIR: &str = "/tmp/afeye-raw";
 const MAX_RECORD: u32 = 16 + (1 << 20);
 const PREVIEW: usize = 4096;
 
-const KINDS: [&str; 22] = [
+const KINDS: [&str; 23] = [
     "sink-hello",
     "script-source",
     "bytecode-entry",
@@ -50,7 +50,14 @@ const KINDS: [&str; 22] = [
     "websocket",
     "client-hints",
     "sw-cache",
+    // kind 22: blink-layer script source (patches/0007) - same executing
+    // script as the v8 layer, captured at the blink hand-off with the
+    // document-resolved URL for provenance.
+    "script-source",
 ];
+
+/// Highest valid kind byte the collector will accept in a record header.
+const MAX_KIND: u8 = (KINDS.len() - 1) as u8;
 
 fn kind_name(kind: u8) -> &'static str {
     KINDS.get(kind as usize).copied().unwrap_or("unknown")
@@ -201,7 +208,7 @@ pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &
             t >= 16
                 && t <= MAX_RECORD as usize
                 && p + t <= len
-                && partial[p + 4] <= 21
+                && partial[p + 4] <= MAX_KIND
                 && partial[p + 5] <= 1
                 && partial[p + 6] == 0
                 && partial[p + 7] == 0
@@ -214,7 +221,7 @@ pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &
             let total = total_at(consumed) as usize;
             let header_ok = total >= 16
                 && total <= MAX_RECORD as usize
-                && partial[consumed + 4] <= 21
+                && partial[consumed + 4] <= MAX_KIND
                 && partial[consumed + 5] <= 1
                 && partial[consumed + 6] == 0
                 && partial[consumed + 7] == 0;
@@ -326,12 +333,6 @@ impl Collector {
         )
     }
 
-    /// Live view of the counters, for the 30s sink-liveness watchdog: a run on
-    /// a build without the patches must never look healthy.
-    pub fn stats_handle(&self) -> Arc<Mutex<Stats>> {
-        self.stats.clone()
-    }
-
     pub fn spawn_dirs(raw_dir: PathBuf, out_dir: PathBuf) -> Collector {
         let _ = fs::create_dir_all(&out_dir);
         let stop = Arc::new(AtomicBool::new(false));
@@ -368,6 +369,38 @@ impl Collector {
             raw_dir,
             out_dir,
             state,
+        }
+    }
+
+    /// sink-hello records seen so far, summed over the three layers.
+    /// Proof whether the running chrome actually contains afeye sinks:
+    /// a stock build writes nothing to the raw dir, ever.
+    pub fn hellos(&self) -> u64 {
+        self.stats
+            .lock()
+            .map(|s| {
+                ["v8/sink-hello", "blink/sink-hello", "net/sink-hello"]
+                    .iter()
+                    .filter_map(|k| s.per.get(*k).copied())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Shared read-only probe usable from another thread before `stop()`.
+    /// Returns a closure reading the live sink-hello count.
+    pub fn hellos_handle(&self) -> impl Fn() -> u64 + Send + 'static {
+        let stats = self.stats.clone();
+        move || {
+            stats
+                .lock()
+                .map(|s| {
+                    ["v8/sink-hello", "blink/sink-hello", "net/sink-hello"]
+                        .iter()
+                        .filter_map(|k| s.per.get(*k).copied())
+                        .sum()
+                })
+                .unwrap_or(0)
         }
     }
 

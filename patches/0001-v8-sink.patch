@@ -1,25 +1,32 @@
-diff --git a/services/network/public/cpp/afeye_sink.h b/services/network/public/cpp/afeye_sink.h
+diff --git a/v8/src/afeye/sink.h b/v8/src/afeye/sink.h
 new file mode 100644
-index 0000000000..5555555563
+index 0000000000..1111111111
 --- /dev/null
-+++ b/services/network/public/cpp/afeye_sink.h
-@@ -0,0 +1,36 @@
-+#ifndef SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
-+#define SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
++++ b/v8/src/afeye/sink.h
+@@ -0,0 +1,43 @@
++#ifndef V8_AFEYE_SINK_H_
++#define V8_AFEYE_SINK_H_
 +
 +#include <stddef.h>
 +#include <stdint.h>
 +
-+#ifdef NET_AFEYE
++#ifdef V8_AFEYE
 +
-+namespace network {
++namespace v8 {
 +namespace afeye {
 +
 +enum EventKind : uint8_t {
 +  kSinkHello = 0,
-+  kNetReq = 17,
-+  kNetRespBody = 18,
-+  kWebSocket = 19,
++  kScriptSource = 1,
++  kBytecodeEntry = 2,
++  kWasmModule = 3,
++  kWasmMemory = 4,
++  kWasmTable = 5,
++  kMicrotaskEnqueue = 6,
++  kMicrotaskRun = 7,
++  kCallCompleted = 8,
++  kAtomics = 9,
++  kSabBacking = 10,
 +};
 +
 +bool Enabled();
@@ -35,20 +42,22 @@ index 0000000000..5555555563
 +bool Flush(uint32_t timeout_ms);
 +
 +}
-+}  // namespace network
++}  // namespace v8
 +
 +#endif
 +
 +#endif
-diff --git a/services/network/public/cpp/afeye_sink.cc b/services/network/public/cpp/afeye_sink.cc
++
+
+diff --git a/v8/src/afeye/sink.cc b/v8/src/afeye/sink.cc
 new file mode 100644
-index 0000000000..6666666674
+index 0000000000..1111111111
 --- /dev/null
-+++ b/services/network/public/cpp/afeye_sink.cc
++++ b/v8/src/afeye/sink.cc
 @@ -0,0 +1,263 @@
-+#include "services/network/public/cpp/afeye_sink.h"
++#include "src/afeye/sink.h"
 +
-+#ifdef NET_AFEYE
++#ifdef V8_AFEYE
 +
 +#include <atomic>
 +#include <cerrno>
@@ -68,14 +77,14 @@ index 0000000000..6666666674
 +#include <time.h>
 +#include <unistd.h>
 +
-+namespace network {
++namespace v8 {
 +namespace afeye {
 +namespace {
 +
 +constexpr size_t kRingBytes = 8u << 20;
 +constexpr size_t kMaxRecord = 1u << 20;
-+constexpr uint32_t kSpanCap = 256u * 1024u;
-+constexpr const char* kLayer = "net";
++constexpr uint32_t kSpanCap = 64u * 1024u;
++constexpr const char* kLayer = "v8";
 +
 +std::atomic<bool> g_on{false};
 +std::atomic<uint64_t> g_dropped{0};
@@ -306,169 +315,55 @@ index 0000000000..6666666674
 +}
 +
 +}
-+}  // namespace network
++}  // namespace v8
 +
 +#endif
-diff --git a/services/network/public/cpp/BUILD.gn b/services/network/public/cpp/BUILD.gn
-index 7777777782..8888888893 100644
---- a/services/network/public/cpp/BUILD.gn
-+++ b/services/network/public/cpp/BUILD.gn
-@@ -12,6 +12,10 @@ import("//third_party/protobuf/proto_library.gni")
- 
- visibility = [ "//services/*", "//content/*" ]
- 
-+declare_args() {
-+  network_enable_afeye = false
-+}
 +
- component("network_cpp") {
-   sources = [
-     "annotation_manager.cc",
-@@ -320,6 +329,14 @@ component("network_cpp") {
-     "url_loader_factory.cc",
-     "url_loader_factory.h",
+
+--- a/v8/BUILD.gn
++++ b/v8/BUILD.gn
+@@ -63,6 +63,9 @@
+ 
+   # Sets -DVERIFY_PREDICTABLE
+   v8_enable_verify_predictable = false
++
++  # afeye: env-activated record sink compiled into v8 (patches/SERIES.md).
++  v8_enable_afeye = false
+ 
+   # Enable DWARF line info for Torque files.
+   # TODO(olivf): Find out how this works on other platforms.
+@@ -2662,6 +2665,9 @@
+     ":v8_tracing",
    ]
-+
-+  if (network_enable_afeye) {
-+    sources += [
-+      "afeye_sink.cc",
-+      "afeye_sink.h",
-+    ]
-+    defines = [ "NET_AFEYE" ]
+   if (v8_enable_experimental_tq_to_tsa) {
++  if (v8_enable_afeye) {
++    sources += [ "src/afeye/sink.h" ]
 +  }
- 
-   public_deps = [
-     "//base",
-diff --git a/services/network/url_loader.cc b/services/network/url_loader.cc
-index 1111111118..2222222229 100644
---- a/services/network/url_loader.cc
-+++ b/services/network/url_loader.cc
-@@ -130,6 +130,9 @@
- #include "url/gurl.h"
- #include "url/origin.h"
- #include "url/url_constants.h"
-+#ifdef NET_AFEYE
-+#include "services/network/public/cpp/afeye_sink.h"
-+#endif
- 
- namespace network {
- 
-@@ -2479,6 +2482,43 @@ void URLLoader::StartRequest() {
- 
-   backend_request_timer_ = nullptr;
-   has_backend_request_timer_ = false;
-+#ifdef NET_AFEYE
-+  if (network::afeye::Enabled() && request_.url.is_valid()) {
-+    network::afeye::EmitTwoStr(network::afeye::kNetReq,
-+                               network::afeye::NowNs(),
-+                               request_.method.c_str(),
-+                               request_.url.spec().c_str());
-+    std::string wire_headers;
-+    request_.headers.ToString(&wire_headers);
-+    if (!wire_headers.empty()) {
-+      network::afeye::EmitTwoStr(network::afeye::kNetReq,
-+                                 network::afeye::NowNs(),
-+                                 "req-headers", wire_headers.c_str());
-+    }
-+    if (request_.request_body) {
-+      uint64_t total_body = 0;
-+      for (const auto& element : request_.request_body->elements()) {
-+        if (element.type() != network::DataElement::Tag::kBytes) {
-+          continue;
-+        }
-+        const std::string& chunk = element.AsBytes().payload();
-+        total_body += chunk.size();
-+        if (chunk.empty()) {
-+          continue;
-+        }
-+        network::afeye::EmitSpan(network::afeye::kNetReq,
-+                                 network::afeye::NowNs(), "req-body",
-+                                 reinterpret_cast<const uint8_t*>(chunk.data()),
-+                                 static_cast<uint32_t>(chunk.size()));
-+      }
-+      char body_sum[64];
-+      std::snprintf(body_sum, sizeof(body_sum), "req-body-total=%llu",
-+                    static_cast<unsigned long long>(total_body));
-+      network::afeye::EmitStr(network::afeye::kNetReq,
-+                              network::afeye::NowNs(), body_sum);
-+    }
-+  }
-+#endif
-   DCHECK(!has_backend_request_timer_);
-   CreateDataPipeForConsumerAndStartRequestIfNecessary();
- }
-@@ -3101,6 +3140,26 @@ void URLLoader::OnReceiveResponse(
-     network::URLLoaderCompletionStatus* status,
-     mojo::ScopedDataPipeConsumerHandle body) {
-   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+#ifdef NET_AFEYE
-+  if (network::afeye::Enabled() && request_.url.is_valid()) {
-+    if (response_head_ && response_head_->headers) {
-+      std::string raw = response_head_->headers->raw_headers();
-+      if (!raw.empty()) {
-+        network::afeye::EmitTwoStr(network::afeye::kNetRespBody,
-+                                   network::afeye::NowNs(),
-+                                   "resp-headers", raw.c_str());
-+      }
-+    }
-+    if (response_head_) {
-+      char mime_info[160];
-+      std::snprintf(mime_info, sizeof(mime_info), "resp-mime=%s code=%d",
-+                    response_head_->mime_type.c_str(),
-+                    response_head_->headers ? response_head_->headers->response_code() : 0);
-+      network::afeye::EmitStr(network::afeye::kNetRespBody,
-+                              network::afeye::NowNs(), mime_info);
-+    }
-+  }
-+#endif
-   DispatchResponse();
- }
- 
-@@ -3320,4 +3377,17 @@ void URLLoader::OnComplete(const URLLoaderCompletionStatus& status) {
+     deps += [ ":run_torque_to_tsa" ]
    }
-   NotifyCompleted(status);
-+#ifdef NET_AFEYE
-+  if (network::afeye::Enabled() && request_.url.is_valid()) {
-+    char head[512];
-+    int nw = std::snprintf(head, sizeof(head),
-+                           "complete url=%s code=%d decoded_body=%llu",
-+                           request_.url.spec().c_str(), status.error_code,
-+                           static_cast<unsigned long long>(response_body_length_));
-+    if (nw > 0) {
-+      network::afeye::EmitStr(network::afeye::kNetRespBody,
-+                              network::afeye::NowNs(), head);
-+    }
+ 
+@@ -7040,6 +7046,10 @@
+       "src/extensions/vtunedomain-support-extension.h",
+     ]
+     deps += [ "third_party/vtune:v8_vtune_trace_mark" ]
++  if (v8_enable_afeye) {
++    sources += [ "src/afeye/sink.cc" ]
++    defines += [ "V8_AFEYE" ]
 +  }
-+#endif
-   CleanupResponseBodyDecoder(response_body_length_);
+   }
  }
-diff --git a/services/network/web_socket.cc b/services/network/web_socket.cc
-index 3333333340..4444444451 100644
---- a/services/network/web_socket.cc
-+++ b/services/network/web_socket.cc
-@@ -65,6 +65,9 @@
- #include "net/websockets/websocket_frame.h"
- #include "net/websockets/websocket_channel.h"
- #include "url/gurl.h"
-+#ifdef NET_AFEYE
-+#include "services/network/public/cpp/afeye_sink.h"
-+#endif
  
- namespace network {
- 
-@@ -1231,6 +1234,15 @@ void WebSocket::OnDataFrame(bool fin,
-                             WebSocketMessageType type,
-                             base::span<const uint8_t> payload) {
-   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+#ifdef NET_AFEYE
-+  if (network::afeye::Enabled()) {
-+    network::afeye::EmitSpan(network::afeye::kWebSocket,
-+                             network::afeye::NowNs(),
-+                             fin ? "ws-frame-fin" : "ws-frame",
-+                             payload.data(),
-+                             static_cast<uint32_t>(std::min<size_t>(payload.size(), 256u * 1024u)));
-+  }
-+#endif
-   switch (type) {
-     case WebSocketMessageType::TEXT:
-       // We accumulate text frames in |receive_frame_text_messages_| and send
+
+--- a/v8/src/flags/flag-definitions.h
++++ b/v8/src/flags/flag-definitions.h
+@@ -3146,6 +3146,10 @@
+ // codegen.cc
+ DEFINE_BOOL(lazy, true, "use lazy compilation")
+ DEFINE_BOOL(lazy_eval, true, "use lazy compilation during eval")
++
++// afeye sink control (patches/0001). Unconditional: FlagValues is one
++// struct shared by every translation unit that includes this header.
++DEFINE_BOOL(afeye_source, true, "emit raw script sources to the afeye sink")
+ DEFINE_BOOL(lazy_streaming, true,
+             "use lazy compilation during streaming compilation")
+ DEFINE_BOOL(max_lazy, false, "ignore eager compilation hints")

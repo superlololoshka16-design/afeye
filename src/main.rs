@@ -77,9 +77,6 @@ struct MRun {
     collect_truncated: u64,
     collect_corrupt: u64,
     sink_alive: bool,
-    ua: String,
-    pauses: u64,
-    ownskip: u64,
     test: bool,
 }
 
@@ -184,14 +181,7 @@ async fn run() -> Result<(), String> {
     let out = root.join("dumps");
     let (tx, rx) = crossbeam_channel::unbounded::<FxEvent>();
     let (atx, arx) = crossbeam_channel::unbounded::<events::Art>();
-    // v123 layout: all code lives in src/ - targets move with it; the old
-    // root placement stays as a fallback so runners from either layout work.
-    let tp = root.join("src/targets.json");
-    let targets = if tp.exists() {
-        load_targets(&tp)?
-    } else {
-        load_targets(&root.join("targets.json"))?
-    };
+    let targets = load_targets(&root.join("targets.json"))?;
     let mut tunnels: Vec<Tunnel> = Vec::new();
     if !local {
         let wgdir = root.join("wg");
@@ -224,27 +214,7 @@ async fn run() -> Result<(), String> {
     for (_, v) in ctx::VENDORS {
         interner.intern(v);
     }
-    let chrome = find_chrome().ok_or("chrome binary not found")?;
     let binding = format!("_k{}z", t0ms % 997);
-    // afeye v123: UA pinned to the engine we actually run. A fake version is
-    // itself a fingerprint (engine-level features expose the real major).
-    let chrome_ver = browser::chrome_version(&chrome)
-        .or_else(|| std::env::var("AF_UA_VER").ok())
-        .unwrap_or_else(|| "153.0.0.0".to_owned());
-    let ua_major = chrome_ver
-        .split('.')
-        .next()
-        .unwrap_or("153")
-        .to_owned();
-    let ua = format!(
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{} Safari/537.36",
-        chrome_ver
-    );
-    eprintln!("[afeye] chrome {chrome_ver} ua pinned (major {ua_major})");
-    let inject_hash: [u8; 32] = *blake3::hash(
-        inject::source(&binding, std::env::var("AF_GL_SPOOF").is_ok()).as_bytes(),
-    )
-    .as_bytes();
     let slot = timefmt::slot(t0ms, 30);
     let rid = timefmt::run_id(t0ms);
     let stage_run = stage.join(&slot);
@@ -252,24 +222,8 @@ async fn run() -> Result<(), String> {
     // C++ sink collector: up before any chrome exists, drained after every
     // chrome is dead, so the raw record timeline lands inside the zip.
     let collector = collect::Collector::spawn(&stage);
-    // afeye v123: sink liveness is a hard fact, never silent. 30s in, zero
-    // records + zero sink files = the build has no patches (stock chrome) or
-    // AFEYE_SINK is off. WARN loudly, mark it in the manifest at the end.
-    {
-        let st = collector.stats_handle();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            let dead = st
-                .lock()
-                .map(|s| s.records == 0 && s.files == 0)
-                .unwrap_or(true);
-            if dead {
-                eprintln!(
-                    "[afeye] WARN sink layer DEAD after 30s: 0 records in the raw dir (chrome build not patched or AFEYE_SINK off)"
-                );
-            }
-        });
-    }
+    let chrome = find_chrome().ok_or("chrome binary not found")?;
+    let ua = user_agent_for(&chrome);
     let xv = if local {
         None
     } else {
@@ -290,18 +244,37 @@ async fn run() -> Result<(), String> {
         binding: binding.clone(),
         budget: std::sync::atomic::AtomicU64::new(0),
         chrome: chrome.clone(),
+        ua,
         display: xv.as_ref().map(|x| x.display.clone()).unwrap_or_default(),
         endpoints: dashmap::DashMap::new(),
         gl_spoof: std::env::var("AF_GL_SPOOF").is_ok(),
-        ua,
-        ua_major: ua_major.clone(),
-        ua_full: chrome_ver.clone(),
-        inject_hash,
     });
     for t in &ctx.tunnels {
         ctx.interner.intern(&t.endpoint.replace(':', "_"));
     }
     let writer = writer::spawn(rx, arx, ctx.clone());
+    // afeye: probe the sink layer once, early. A chrome without the afeye
+    // patches (stock upstream) writes zero sink-hello records, and without
+    // this check the run stays silent about the deep layer being dead while
+    // the zip pretends to be a deep capture. Warn once, fact goes into the
+    // manifest at the end (sink_alive).
+    {
+        let probe = collector.hellos_handle();
+        std::thread::Builder::new()
+            .name("afeye-sink-probe".into())
+            .spawn(move || {
+                std::thread::sleep(Duration::from_secs(30));
+                let n = probe();
+                if n == 0 {
+                    eprintln!(
+                        "[afeye] WARN sink layer DEAD: chrome has no afeye sinks (stock build?) - deep v8/blink/net raw records missing, CDP layer only"
+                    );
+                } else {
+                    eprintln!("[afeye] sink layer alive: {n} sink-hello records");
+                }
+            })
+            .ok();
+    }
     let runner_ip = if local {
         "local".into()
     } else {
@@ -396,7 +369,6 @@ async fn run() -> Result<(), String> {
                         tab: i as u32,
                         page,
                         meta: capture::Meta::default(),
-                        own: capture::OwnCtx::default(),
                     };
                     let _ = tokio::time::timeout(TAB_UP, capture::instrument(tb.clone(), &tg.url)).await;
                     Some(tb)
@@ -526,13 +498,19 @@ async fn run() -> Result<(), String> {
         }
     }
     let cstats = collector.stop();
-    if cstats.records == 0 {
-        eprintln!("[afeye] sink_alive=false collect: records=0 (build not patched or AFEYE_SINK off)");
+    let sink_alive = ["v8/sink-hello", "blink/sink-hello", "net/sink-hello"]
+        .iter()
+        .filter_map(|k| cstats.per.get(*k).copied())
+        .sum::<u64>()
+        > 0;
+    if !sink_alive {
+        eprintln!(
+            "[afeye] FINAL sink_alive=false: zero sink-hello records - this zip carries CDP-layer capture only (chrome is not afeye-patched)"
+        );
     }
     eprintln!(
-        "[afeye] collect: records={} bytes={} truncated={} corrupt={} files={} sink_alive={}",
-        cstats.records, cstats.bytes, cstats.truncated, cstats.corrupt, cstats.files,
-        cstats.records > 0
+        "[afeye] collect: records={} bytes={} truncated={} corrupt={} files={}",
+        cstats.records, cstats.bytes, cstats.truncated, cstats.corrupt, cstats.files
     );
     let _ = tx.send(FxEvent {
         t: now_ms(),
@@ -595,7 +573,7 @@ async fn run() -> Result<(), String> {
     if !filtered_name.is_empty() {
         eprintln!("[afeye] FILTERED {filtered_name} bytes={filtered_bytes}");
     }
-    let mt = MRun {
+    let mut mt = MRun {
         started: rid.clone(),
         slot: slot.clone(),
         browse_secs: session.as_secs(),
@@ -645,10 +623,7 @@ async fn run() -> Result<(), String> {
         collect_bytes: cstats.bytes,
         collect_truncated: cstats.truncated,
         collect_corrupt: cstats.corrupt,
-        sink_alive: cstats.records > 0,
-        ua: ctx.ua.clone(),
-        pauses: ctx.cn.pauses.load(Ordering::Relaxed),
-        ownskip: ctx.cn.ownskip.load(Ordering::Relaxed),
+        sink_alive,
         test,
     };
     let mp = stage.join("manifest.json");
@@ -658,6 +633,12 @@ async fn run() -> Result<(), String> {
     if size > 95 * 1024 * 1024 {
         eprintln!("[afeye] WARN zip > 95MB, lower AF_BUDGET_MB");
     }
+    // sidecar manifest with the REAL zip size: the in-zip manifest is written
+    // before packing, so its zip_bytes cannot know the archive size. The
+    // sidecar lands next to the zip in dumps/ and is the observable truth.
+    let ms = out.join(format!("{stem}.manifest.json"));
+    mt.zip_bytes = size;
+    let _ = std::fs::write(&ms, serde_json::to_vec_pretty(&mt).unwrap_or_default());
     eprintln!("[afeye] ZIP {} files={n} bytes={size}", zp.display());
     eprintln!("[afeye] done in {}s", t0.elapsed().as_secs());
     Ok(())
@@ -679,6 +660,32 @@ unsafe fn geteuid() -> u32 {
     {
         1
     }
+}
+
+/// Build a headed Linux Chrome UA from the binary's own --version output.
+/// Headless builds send `HeadlessChrome/x.y` in every request header and
+/// expose it to `navigator.userAgent` - anti-fraud keys on exactly that.
+fn user_agent_for(chrome: &PathBuf) -> String {
+    let out = std::process::Command::new(chrome)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    let ver = out
+        .split_whitespace()
+        .find(|t| {
+            t.split('.').count() >= 3
+                && t.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        })
+        .unwrap_or("")
+        .to_owned();
+    if ver.is_empty() {
+        // keep the token-free shape even when detection fails
+        return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36".into();
+    }
+    eprintln!("[afeye] chrome {ver} -> UA override (no HeadlessChrome token)");
+    format!("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36")
 }
 
 fn find_chrome() -> Option<PathBuf> {

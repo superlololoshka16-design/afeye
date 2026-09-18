@@ -36,7 +36,3 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-
-[[test]]
-name = "sink_roundtrip"
-path = "src/tests/sink_roundtrip.rs"

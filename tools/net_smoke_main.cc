@@ -1,7 +1,7 @@
 // afeye net-layer sink smoke - compiled from 0011-network-wire.patch bytes.
 #include <cstdio>
 
-#include "services/network/public/cpp/afeye_sink.h"
+#include "services/network/afeye_sink.h"
 
 int main() {
   if (!network::afeye::Enabled()) {

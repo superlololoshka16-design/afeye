@@ -1,0 +1,95 @@
+--- a/v8/src/wasm/wasm-engine.cc
++++ b/v8/src/wasm/wasm-engine.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "src/wasm/wasm-engine.h"
++#ifdef V8_AFEYE
++#include "src/afeye/sink.h"
++#endif
+ 
+ #include <optional>
+ 
+@@ -613,6 +616,14 @@
+     base::Vector<const char> source_url) {
+   int compilation_id = next_compilation_id_.fetch_add(1);
+   TRACE_EVENT("v8.wasm", "wasm.SyncCompile", "id", compilation_id);
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled() && bytes.size() > 0) {
++    const uint8_t* p = bytes.begin();
++    uint32_t n = static_cast<uint32_t>(
++        bytes.size() > 0xFFFFF0 ? 0xFFFFF0 : bytes.size());
++    v8::afeye::Emit(v8::afeye::kWasmModule, v8::afeye::NowNs(), p, n);
++  }
++#endif
+   v8::metrics::Recorder::ContextId context_id =
+       isolate->GetOrRegisterRecorderContextId(isolate->native_context());
+   std::shared_ptr<WasmModule> module;
+@@ -730,6 +741,14 @@
+     const char* api_method_name_for_errors) {
+   int compilation_id = next_compilation_id_.fetch_add(1);
+   TRACE_EVENT("v8.wasm", "wasm.AsyncCompile", "id", compilation_id);
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled() && bytes.size() > 0) {
++    const uint8_t* p = bytes.begin();
++    uint32_t n = static_cast<uint32_t>(
++        bytes.size() > 0xFFFFF0 ? 0xFFFFF0 : bytes.size());
++    v8::afeye::Emit(v8::afeye::kWasmModule, v8::afeye::NowNs(), p, n);
++  }
++#endif
+ 
+   if (v8_flags.wasm_jitless) {
+     // Asynchronous compilation disabled; fall back on synchronous compilation.
+
+--- a/v8/src/wasm/wasm-js.cc
++++ b/v8/src/wasm/wasm-js.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "src/wasm/wasm-js.h"
++#ifdef V8_AFEYE
++#include "src/afeye/sink.h"
++#endif
+ 
+ #include <cinttypes>
+ #include <cstring>
+@@ -2490,6 +2493,12 @@
+ // WebAssembly.Table.get(num) -> any
+ void WebAssemblyTableGetImpl(const v8::FunctionCallbackInfo<v8::Value>& info) {
+   WasmJSApiScope js_api_scope{info, "WebAssembly.Table.get()"};
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled()) {
++    v8::afeye::EmitStr(v8::afeye::kWasmTable, v8::afeye::NowNs(),
++                       "wasm-table-get");
++  }
++#endif
+   auto [isolate, i_isolate, thrower] = js_api_scope.isolates_and_thrower();
+   Local<Context> context = isolate->GetCurrentContext();
+   EXTRACT_THIS(receiver, WasmTableObject);
+@@ -2520,6 +2529,12 @@
+ // WebAssembly.Table.set(num, any)
+ void WebAssemblyTableSetImpl(const v8::FunctionCallbackInfo<v8::Value>& info) {
+   WasmJSApiScope js_api_scope{info, "WebAssembly.Table.set()"};
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled()) {
++    v8::afeye::EmitStr(v8::afeye::kWasmTable, v8::afeye::NowNs(),
++                       "wasm-table-set");
++  }
++#endif
+   auto [isolate, i_isolate, thrower] = js_api_scope.isolates_and_thrower();
+   Local<Context> context = isolate->GetCurrentContext();
+   EXTRACT_THIS(table_object, WasmTableObject);
+@@ -2636,6 +2651,13 @@
+       &thrower, context, info[0], "Argument 0", receiver->address_type());
+   if (!maybe_delta_pages) return js_api_scope.AssertException();
+   uint64_t delta_pages = *maybe_delta_pages;
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled()) {
++    uint64_t rec[2] = {delta_pages, receiver->maximum_pages()};
++    v8::afeye::Emit(v8::afeye::kWasmMemory, v8::afeye::NowNs(), rec,
++                    sizeof(rec));
++  }
++#endif
+ 
+   i::CppGCManaged<i::BackingStore>::Ptr backing_store =
+       receiver->backing_store();

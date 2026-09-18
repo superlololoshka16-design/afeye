@@ -4,7 +4,6 @@ use crate::events::*;
 use crate::inject;
 use base64::Engine;
 use bytes::{BufMut, Bytes};
-use chromiumoxide::cdp::browser_protocol::emulation::SetUserAgentOverrideParams;
 use chromiumoxide::cdp::browser_protocol::network::*;
 use chromiumoxide::cdp::browser_protocol::page::*;
 use chromiumoxide::cdp::js_protocol::debugger::*;
@@ -16,26 +15,6 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 pub type Meta = Arc<DashMap<u64, (u8, bool)>>;
-/// Execution-context ids that belong to OUR OWN driver (the chromiumoxide
-/// utility world `__chromiumoxide_utility_world__`). Anything compiled inside
-/// them is our probe, never target content - excluded from the capture.
-pub type OwnCtx = Arc<DashMap<i64, ()>>;
-
-// chromiumoxide 0.9 internal markers (src/handler/frame.rs): the const is
-// "____chromiumoxide_utility_world___n__" but the observed scriptParsed url is
-// "____chromiumoxide_utility_world___evaluation_script__" - match by shape, not
-// by exact string, so any driver-side variant stays excluded.
-const DRIVER_EVAL_URL_TAIL: &str = "___evaluation_script__";
-const DRIVER_WORLD: &str = "__chromiumoxide_utility_world__";
-
-/// Browser-internal pages (net error pages, devtools, chrome://) compile
-/// Chromium's own JS - never target content.
-fn browser_internal(url: &str) -> bool {
-    url.starts_with("chrome-error://")
-        || url.starts_with("chrome://")
-        || url.starts_with("devtools://")
-        || url.starts_with("edge://")
-}
 
 #[derive(Clone)]
 pub struct Tab {
@@ -53,7 +32,6 @@ pub struct Tb {
     pub tab: u32,
     pub page: Page,
     pub meta: Meta,
-    pub own: OwnCtx,
 }
 
 impl Tb {
@@ -199,52 +177,6 @@ fn hdrs(j: &mut J, k: &str, h: &Headers) {
 }
 
 pub async fn instrument(tb: Tb, url: &str) {
-    // afeye v123: pin the identity BEFORE anything navigates. This kills the
-    // HeadlessChrome leak in three places at once - UA header, navigator.userAgent,
-    // and every Sec-CH-UA brand - and keeps them consistent with the engine
-    // version actually running. Anti-fraud that fingerprints UA-vs-CH
-    // consistency sees a coherent stock Linux Chrome.
-    {
-        use chromiumoxide::cdp::browser_protocol::emulation::{
-            UserAgentBrandVersion, UserAgentMetadata,
-        };
-        let major = tb.ctx.ua_major.clone();
-        let full = tb.ctx.ua_full.clone();
-        let brands = vec![
-            UserAgentBrandVersion::new("Chromium", major.clone()),
-            UserAgentBrandVersion::new("Google Chrome", major.clone()),
-            UserAgentBrandVersion::new("Not A;Brand", "99"),
-        ];
-        let fulls = vec![
-            UserAgentBrandVersion::new("Chromium", full.clone()),
-            UserAgentBrandVersion::new("Google Chrome", full.clone()),
-            UserAgentBrandVersion::new("Not A;Brand", "99"),
-        ];
-        if let Ok(md) = UserAgentMetadata::builder()
-            .brands(brands)
-            .full_version_lists(fulls)
-            .platform("Linux")
-            .platform_version("6.8.0")
-            .architecture("x86")
-            .model("")
-            .mobile(false)
-            .bitness("64")
-            .wow64(false)
-            .build()
-        {
-            if let Ok(p) = SetUserAgentOverrideParams::builder()
-                .user_agent(tb.ctx.ua.clone())
-                .accept_language("en-US,en;q=0.9")
-                .platform("Linux x86_64")
-                .user_agent_metadata(md)
-                .build()
-            {
-                if let Err(e) = tb.page.execute(p).await {
-                    eprintln!("[afeye] ua override: {e}");
-                }
-            }
-        }
-    }
     if let Err(e) = tb
         .page
         .execute(AddBindingParams::new(tb.ctx.binding.clone()))
@@ -262,28 +194,6 @@ pub async fn instrument(tb: Tb, url: &str) {
     {
         eprintln!("[afeye] addscript: {e}");
     }
-    // afeye v123: listeners attach BEFORE the domains are enabled - otherwise
-    // executionContextCreated events replayed by Runtime.enable (which is how
-    // pre-existing utility worlds announce themselves) are missed and our own
-    // driver scripts leak into the capture again.
-    spawn_ev(&tb, on_req).await;
-    spawn_ev(&tb, on_resp).await;
-    spawn_ev(&tb, on_rhdr).await;
-    spawn_ev(&tb, on_qhdr).await;
-    spawn_ev(&tb, on_fin).await;
-    spawn_ev(&tb, on_fail).await;
-    spawn_ev(&tb, on_wsc).await;
-    spawn_ev(&tb, on_wsf).await;
-    spawn_ev(&tb, on_wsr).await;
-    spawn_ev(&tb, on_script).await;
-    spawn_ev(&tb, on_pause).await;
-    spawn_ev(&tb, on_bind).await;
-    spawn_ev(&tb, on_console).await;
-    spawn_ev(&tb, on_exc).await;
-    spawn_ev(&tb, on_ctxt).await;
-    spawn_ev(&tb, on_nav).await;
-    spawn_ev(&tb, on_dcl).await;
-    spawn_ev(&tb, on_load).await;
     {
         use chromiumoxide::cdp::browser_protocol::network::EnableParams as NEnable;
         use chromiumoxide::cdp::browser_protocol::page::EnableParams as PEnable;
@@ -300,15 +210,26 @@ pub async fn instrument(tb: Tb, url: &str) {
         }
         let _ = tb.page.execute(NEnable::default()).await;
         let _ = tb.page.execute(DEnable::default()).await;
-        // afeye v123: `debugger;` traps are the classic anti-debugging hang.
-        // With the Debugger agent enabled they would pause the page on every
-        // statement; skipping all pauses makes them a no-op while the
-        // scriptParsed stream (the executing-source capture) keeps flowing.
-        // EventPaused below is the second line of defense.
-        let _ = tb.page.execute(SetSkipAllPausesParams::new(true)).await;
         let _ = tb.page.execute(REnable::default()).await;
         let _ = tb.page.execute(PEnable::default()).await;
     }
+    spawn_ev(&tb, on_req).await;
+    spawn_ev(&tb, on_resp).await;
+    spawn_ev(&tb, on_rhdr).await;
+    spawn_ev(&tb, on_qhdr).await;
+    spawn_ev(&tb, on_fin).await;
+    spawn_ev(&tb, on_fail).await;
+    spawn_ev(&tb, on_wsc).await;
+    spawn_ev(&tb, on_wsf).await;
+    spawn_ev(&tb, on_wsr).await;
+    spawn_ev(&tb, on_script).await;
+    spawn_ev(&tb, on_bind).await;
+    spawn_ev(&tb, on_console).await;
+    spawn_ev(&tb, on_exc).await;
+    spawn_ev(&tb, on_ctxt).await;
+    spawn_ev(&tb, on_nav).await;
+    spawn_ev(&tb, on_dcl).await;
+    spawn_ev(&tb, on_load).await;
     match tokio::time::timeout(std::time::Duration::from_secs(60), tb.page.goto(url.to_owned())).await
     {
         Ok(Ok(_)) => {}
@@ -620,24 +541,6 @@ fn ws_line(tb: &Tb, rid: &RequestId, dir: &str, op: f64, payload: &str) {
 }
 
 fn on_script(tb: &Tb, e: Arc<EventScriptParsed>) {
-    // our own driver footprint never enters the capture:
-    // 1. chromiumoxide evaluates every high-level call through a marker script
-    //    in its utility world - the exact "evaluation_script" junk the runs
-    //    used to be polluted with (matched by shape, both known spellings);
-    // 2. anything compiled inside the utility world context itself;
-    // 3. our injected boot script (main world, matched by hash/prefix);
-    // 4. Chromium's own internal pages (net-error page scripts etc).
-    if e.url.contains("chromiumoxide")
-        || e.url.ends_with(DRIVER_EVAL_URL_TAIL)
-        || browser_internal(&e.url)
-    {
-        let _ = Cn::inc(&tb.ctx.cn.ownskip);
-        return;
-    }
-    if tb.own.contains_key(&*e.execution_context_id.inner()) {
-        let _ = Cn::inc(&tb.ctx.cn.ownskip);
-        return;
-    }
     let _ = Cn::inc(&tb.ctx.cn.scripts);
     let vendor = match vendor_of_url(&e.url) {
         Some(v) => tb.ctx.interner.intern(v),
@@ -663,24 +566,11 @@ fn on_script(tb: &Tb, e: Arc<EventScriptParsed>) {
     let tb2 = tb.clone();
     let sid = e.script_id.clone();
     let url = e.url[..char_floor(&e.url, 300)].to_owned();
-    let inject_hash = tb.ctx.inject_hash;
-    let binding = tb.ctx.binding.clone();
     tokio::spawn(async move {
         let src = match tb2.page.execute(GetScriptSourceParams::new(sid.clone())).await {
             Ok(x) => x.result.script_source,
             Err(_) => return,
         };
-        // injected boot script: blake3 of the source equals the hash of what
-        // we passed to AddScriptToEvaluateOnNewDocument, or the cheap prefix
-        // heuristic (marker + per-run binding name) if V8 normalized the tail.
-        let own_boot = blake3::hash(src.as_bytes()).as_bytes() == &inject_hash[..]
-            || (src.starts_with("(function(){")
-                && src.contains(&binding)
-                && src.len() < 12_288);
-        if own_boot {
-            let _ = Cn::inc(&tb2.ctx.cn.ownskip);
-            return;
-        }
         let wasm = url.starts_with("wasm://");
         let code = if wasm { E_WASM } else { E_JS };
         let raw: Vec<u8> = if wasm {
@@ -791,11 +681,6 @@ fn on_exc(tb: &Tb, e: Arc<EventExceptionThrown>) {
 
 fn on_ctxt(tb: &Tb, e: Arc<EventExecutionContextCreated>) {
     let c = &e.context;
-    if c.name.contains(DRIVER_WORLD) {
-        // our utility world - remember the id so every script compiled inside
-        // it can be excluded from the capture
-        tb.own.insert(*c.id.inner(), ());
-    }
     let mut j = J::new(192);
     j.open();
     j.fkey("id");
@@ -805,21 +690,6 @@ fn on_ctxt(tb: &Tb, e: Arc<EventExecutionContextCreated>) {
     j.key("n");
     j.s(&c.name);
     tb.emit(K_CTX, j.fin());
-}
-
-/// `debugger;` statements with the Debugger agent on pause the page. We resume
-/// instantly; SetSkipAllPauses makes this a fallback, but a resume storm is
-/// still better than a hung tab while the anti-fraud keeps executing.
-fn on_pause(tb: &Tb, _e: Arc<EventPaused>) {
-    let _ = Cn::inc(&tb.ctx.cn.pauses);
-    let tb2 = tb.clone();
-    tokio::spawn(async move {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(900),
-            tb2.page.execute(ResumeParams::default()),
-        )
-        .await;
-    });
 }
 
 fn on_nav(tb: &Tb, e: Arc<EventFrameNavigated>) {

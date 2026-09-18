@@ -2,7 +2,7 @@ use crate::ctx::{Ctx, Tunnel};
 use chromiumoxide::Browser;
 use futures::StreamExt;
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
@@ -72,17 +72,18 @@ fn chrome_flags(f: &Flags) -> Vec<String> {
         "--password-store=basic".into(),
         "--use-mock-keychain".into(),
         "--no-sandbox".into(),
-        // afeye v123: the UA header is pinned at process level too, so even
-        // requests that race ahead of the per-page CDP override can never say
-        // HeadlessChrome. The per-page Emulation.setUserAgentOverride carries
-        // the matching Sec-CH-UA brand list (capture.rs).
-        format!("--user-agent={}", f.ua),
         format!("--remote-debugging-address={}", f.bind),
         format!("--remote-debugging-port={}", f.port),
         format!("--user-data-dir={}", profile),
         "--window-size=1280,832".into(),
         format!("--window-position={},{}", (idx % 4) * 320, (idx / 4) * 250),
     ];
+    // afeye: UA override built from the chrome binary's real version - the
+    // headless token (HeadlessChrome/x.y) leaks into request headers and
+    // navigator.userAgent otherwise and anti-fraud keys on it.
+    if !f.ua.is_empty() {
+        a.push(format!("--user-agent={}", f.ua));
+    }
     // afeye: per-bytecode V8 instruction trace (extreme volume) - explicit
     // opt-in; the sinks themselves activate through the AFEYE_SINK env var,
     // not through chrome flags.
@@ -229,50 +230,4 @@ pub async fn run_tunnel(ctx: &Ctx, t: &Tunnel) -> Result<(Child, Browser), Strin
     let c = launch_chrome(ctx, t).await?;
     let b = connect(ctx, &t.ns_ip, t.port).await?;
     Ok((c, b))
-}
-
-/// Read the real version of the chrome binary so the pinned UA and the
-/// Sec-CH-UA brand list always match the engine actually running - a UA/CH
-/// mismatch is itself a fingerprint.
-pub fn chrome_version(bin: &Path) -> Option<String> {
-    let out = std::process::Command::new(bin)
-        .arg("--version")
-        .output()
-        .ok()?;
-    let s = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    s.split_whitespace()
-        .find(|w| {
-            let mut dots = 0;
-            let mut digits = 0;
-            let b = w.as_bytes();
-            if b.is_empty() || !b[0].is_ascii_digit() {
-                return false;
-            }
-            for &c in b {
-                if c == b'.' {
-                    dots += 1;
-                } else if c.is_ascii_digit() {
-                    digits += 1;
-                } else {
-                    return false;
-                }
-            }
-            digits >= 2 && dots >= 2
-        })
-        .map(|w| w.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn version_parse() {
-        let s = "Google Chrome 153.0.8010.52 \n";
-        let v = super::chrome_version(std::path::Path::new("/nonexistent"));
-        assert!(v.is_none());
-        assert!(s.contains("153.0.8010.52"));
-    }
 }

@@ -1,0 +1,51 @@
+--- a/v8/src/api/api.cc
++++ b/v8/src/api/api.cc
+@@ -128,6 +128,10 @@
+ #include "src/objects/string.h"
+ #include "src/objects/synthetic-module-inl.h"
+ #include "src/objects/templates.h"
++#ifdef V8_AFEYE
++#include <string>
++#include "src/afeye/sink.h"
++#endif
+ #include "src/objects/value-serializer.h"
+ #include "src/parsing/parse-info.h"
+ #include "src/parsing/parser.h"
+@@ -2647,11 +2651,37 @@
+ 
+ }  // namespace
+ 
++#ifdef V8_AFEYE
++static void AfeyeDumpApiSource(const char* origin_kind, Isolate* v8_isolate,
++                                Source* source) {
++  if (!v8::afeye::Enabled() || !v8_flags.afeye_source) return;
++  if (source->source_string.IsEmpty()) return;
++  v8::String::Utf8Value utf8(v8_isolate, source->source_string);
++  if (!*utf8 || **utf8 == '\0') return;
++  const char* name = origin_kind;
++  std::string name_buf;
++  if (!source->resource_name.IsEmpty() &&
++      source->resource_name->IsString()) {
++    v8::Local<v8::String> rn = source->resource_name.As<v8::String>();
++    v8::String::Utf8Value name8(v8_isolate, rn);
++    if (*name8 && **name8 != '\0') {
++      name_buf.assign(*name8);
++      name = name_buf.c_str();
++    }
++  }
++  v8::afeye::EmitTwoStr(v8::afeye::kScriptSource, v8::afeye::NowNs(), name,
++                        *utf8);
++}
++#endif
++
+ MaybeLocal<UnboundScript> ScriptCompiler::CompileUnboundInternal(
+     Isolate* v8_isolate, Source* source, CompileOptions options,
+     NoCacheReason no_cache_reason) {
+   auto i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
+   TRACE_EVENT_CALL_STATS_SCOPED(i_isolate, "v8", "V8.ScriptCompiler");
++#ifdef V8_AFEYE
++  AfeyeDumpApiSource("script", v8_isolate, source);
++#endif
+   EnterV8NoScriptScope<InternalEscapableScope> api_scope{
+       i_isolate, v8_isolate->GetCurrentContext(),
+       RCCId::kAPI_ScriptCompiler_CompileUnbound};

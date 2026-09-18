@@ -1,0 +1,72 @@
+--- a/v8/src/codegen/compiler.cc
++++ b/v8/src/codegen/compiler.cc
+@@ -3,6 +3,11 @@
+ // found in the LICENSE file.
+ 
+ #include "src/codegen/compiler.h"
++#ifdef V8_AFEYE
++#include <string>
++#include "src/afeye/sink.h"
++#include "src/objects/casting.h"
++#endif
+ 
+ #include <memory>
+ #include <optional>
+@@ -3304,6 +3309,9 @@
+     LanguageMode language_mode, ParseRestriction restriction,
+     int parameters_end_pos, int eval_position,
+     ParsingWhileDebugging parsing_while_debugging) {
++#ifdef V8_AFEYE
++  AfeyeDumpScriptSource(isolate, source, "eval", MaybeHandle<Object>());
++#endif
+   // The cache lookup key needs to be aware of the separation between the
+   // parameters and the body to prevent this valid invocation:
+   //   Function("", "function anonymous(\n/**/) {\n}");
+@@ -3944,6 +3952,36 @@
+ }
+ }  // namespace
+ 
++#ifdef V8_AFEYE
++static void AfeyeDumpScriptSource(Isolate* isolate, Handle<String> source,
++                                  const char* fallback_name,
++                                  MaybeHandle<Object> maybe_name) {
++  if (!v8::afeye::Enabled() || !v8_flags.afeye_source) return;
++  if (source.is_null()) return;
++  v8::Isolate* api_isolate = reinterpret_cast<v8::Isolate*>(isolate);
++  v8::Local<v8::String> local_source = v8::Utils::ToLocal(source);
++  if (local_source.IsEmpty()) return;
++  v8::String::Utf8Value utf8(api_isolate, local_source);
++  if (!*utf8 || **utf8 == '\0') return;
++  const char* name = fallback_name;
++  std::string name_buf;
++  Handle<Object> name_obj;
++  if (maybe_name.ToHandle(&name_obj) && IsString(*name_obj)) {
++    v8::Local<v8::String> local_name =
++        v8::Utils::ToLocal(Cast<String>(name_obj));
++    if (!local_name.IsEmpty()) {
++      v8::String::Utf8Value name8(api_isolate, local_name);
++      if (*name8 && **name8 != '\0') {
++        name_buf.assign(*name8);
++        name = name_buf.c_str();
++      }
++    }
++  }
++  v8::afeye::EmitTwoStr(v8::afeye::kScriptSource, v8::afeye::NowNs(), name,
++                        *utf8);
++}
++#endif
++
+ MaybeDirectHandle<SharedFunctionInfo> GetSharedFunctionInfoForScriptImpl(
+     Isolate* isolate, Handle<String> source,
+     const ScriptDetails& script_details, v8::Extension* extension,
+@@ -3953,6 +3991,10 @@
+     ScriptCompiler::CompileOptions compile_options,
+     ScriptCompiler::NoCacheReason no_cache_reason, NativesFlag natives,
+     ScriptCompiler::CompilationDetails* compilation_details) {
++#ifdef V8_AFEYE
++  AfeyeDumpScriptSource(isolate, source, "script",
++                        script_details.name_obj);
++#endif
+   ScriptCompileTimerScope compile_timer(isolate, no_cache_reason,
+                                         compilation_details);
+ 
