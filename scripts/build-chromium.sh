@@ -55,9 +55,13 @@ sudo ./build/install-build-deps.sh --no-arm >/dev/null 2>&1 || \
 # ---- 4. patches (the series applies cumulatively - a failure here is a
 # patch/anchor bug and must abort loudly, not silently produce stock chrome)
 REPO_ROOT="${REPO_ROOT:-$GITHUB_WORKSPACE}"
+# plain git apply, NOT --3way: v8/ is a nested git repo in a gclient checkout,
+# its blobs are not in chromium/src's index, and --3way dies on that. The
+# series contexts are exact (generated from the real 153.0.8010.52 tree), so
+# direct application is the correct mode.
 for p in "$REPO_ROOT"/patches/*.patch; do
   echo "applying $(basename "$p")"
-  git apply --3way "$p"
+  git apply "$p" || patch -p1 --fuzz=0 --no-backup-if-mismatch < "$p"
 done
 
 # ---- 5. ccache
