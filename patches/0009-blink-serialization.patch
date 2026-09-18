@@ -10,10 +10,12 @@
  
  #include <algorithm>
  #include <memory>
-@@ -240,6 +243,17 @@
+@@ -239,7 +242,19 @@
+ 
  SerializedScriptValue::SerializedScriptValue(DataBufferPtr data)
      : data_buffer_(std::move(data)),
-       has_registered_external_allocation_(false) {}
+-      has_registered_external_allocation_(false) {}
++      has_registered_external_allocation_(false) {
 +#ifdef BLINK_AFEYE
 +  if (blink::afeye::Enabled()) {
 +    auto afeye_span = data_buffer_.as_span();
@@ -25,6 +27,7 @@
 +    }
 +  }
 +#endif
++      }
  
  void SerializedScriptValue::SetImageBitmapContentsArray(
      ImageBitmapContentsArray contents) {
