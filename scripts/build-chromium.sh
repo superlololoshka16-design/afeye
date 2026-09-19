@@ -16,7 +16,7 @@ set -euo pipefail
 CHROMIUM_REF="${CHROMIUM_REF:-153.0.8010.52}"
 WORK="${WORK:-/mnt/chromium}"
 OUT_REL="${OUT_REL:-out/afeye}"
-BUILD_WINDOW_SECS="${BUILD_WINDOW_SECS:-14700}"   # 4h05m of ninja
+BUILD_WINDOW_SECS="${BUILD_WINDOW_SECS:-16200}"   # 4h30m of ninja
 CCACHE_DIR="${CCACHE_DIR:-/mnt/ccache}"
 
 echo "== afeye build: chromium $CHROMIUM_REF, window ${BUILD_WINDOW_SECS}s =="
@@ -80,6 +80,11 @@ dcheck_always_on = false
 treat_warnings_as_errors = false
 use_remoteexec = false
 cc_wrapper = "ccache"
+# libc++ clang modules make compiles uncachable by ccache (module-using
+# compilations are skipped) - the chained-run architecture depends on the
+# cache carrying compiled objects between 4h windows, so modules go off.
+# Per-file compiles get slightly slower; cross-run rebuilds get fast.
+use_clang_modules = false
 v8_enable_afeye = true
 blink_enable_afeye = true
 network_enable_afeye = true

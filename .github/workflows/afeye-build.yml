@@ -40,7 +40,7 @@ env:
   CHROMIUM_REF: ${{ github.event.inputs.chromium_ref || '153.0.8010.52' }}
   WORK: /mnt/chromium
   OUT: out/afeye
-  BUILD_WINDOW_SECS: '14700'
+  BUILD_WINDOW_SECS: '16200'
   CCACHE_DIR: /mnt/ccache
 
 jobs:
@@ -71,7 +71,11 @@ jobs:
 
       - name: build
         id: build
-        run: bash scripts/build-chromium.sh
+        run: |
+          rc=0
+          bash scripts/build-chromium.sh || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
         continue-on-error: true
 
       - name: ccache-save
@@ -88,6 +92,9 @@ jobs:
         run: |
           if [ -x "$WORK/src/$OUT/chrome" ]; then
             echo "status=built" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.build.outputs.rc }}" = "42" ]; then
+            # 42 = build window exhausted mid-compile, cache carries progress
+            echo "status=window" >> "$GITHUB_OUTPUT"
           elif [ "${{ steps.build.outcome }}" = "failure" ]; then
             echo "status=failed" >> "$GITHUB_OUTPUT"
           else
