@@ -31,6 +31,22 @@
 //!     and integrity checks in the 5 s before the send (what fed the
 //!     payload), all in ms relative to nav-start (v6: kind 36 anchors
 //!     the page timeline in the sink clock domain).
+//!  5. dead-end classification (v7) - every chain is split into
+//!     TOKEN-FORMING vs DEAD-END. A chain feeds the challenge token
+//!     when any of these signals fires:
+//!       - sink-call: its own code carries a collector/network sink call
+//!         (fetch/XHR/beacon/WebSocket/canvas/audio/webrtc...), or
+//!       - handler-born: it materialized right after an event/timer
+//!         (compiled inside that handler - the v5 trigger window), or
+//!       - fp-probes: >=2 distinct fingerprint reads while its fragments
+//!         materialized (the eval-chunk-then-probe pattern), or
+//!       - integrity-check: Function.prototype.toString self-checks fired
+//!         in its window, or
+//!       - net-window: it materialized inside a network request's
+//!         payload-formation window (backward slice from the send).
+//!     The filtered zip keeps ONLY token-forming chains ("what actually
+//!     builds the token"); dead ends are dropped there but survive
+//!     untouched in the raw run zip - no byte is lost, only sorted.
 //!
 //! Attribution honesty: the C++ dom-api thunk cannot know its JS caller
 //! without a stack walk, so kind-29 reads are attributed BY TIME - to a
@@ -64,6 +80,10 @@ pub struct SinkFilterStats {
     pub integrity_checks: u64,
     pub integrity_chains: u64,
     pub wasm_instantiated: u64,
+    // v7 dead-end classification
+    pub token_chains: u64,
+    pub dead_end_chains: u64,
+    pub net_adjacent_chains: u64,
 }
 
 /// sink calls that mark a chain as reaching the collector / the network
@@ -236,6 +256,44 @@ fn is_hot(name: &str, body: &[u8]) -> bool {
     HOT_PATTERNS.iter().any(|p| s.contains(p))
 }
 
+/// v7 dead-end classification: does this chain's materialization window
+/// overlap any network request's payload-formation window?
+/// Chain window: [first_ts, last_ts + FP_GRACE_NS]; request window:
+/// [t - NET_FP_WINDOW_NS, t]. Overlap = the classic interval overlap.
+fn overlaps_net_window(net_ts: &[u64], first_ts: u64, last_ts: u64) -> bool {
+    let lo = first_ts;
+    let hi = last_ts
+        .saturating_add(FP_GRACE_NS)
+        .saturating_add(NET_FP_WINDOW_NS);
+    // any net ts in [lo, hi]
+    let a = net_ts.partition_point(|t| *t < lo);
+    a < net_ts.len() && net_ts[a] <= hi
+}
+
+/// v7: the token-forming signals of a chain (why it is NOT a dead end).
+/// Empty result = dead end: the code executed, but nothing it produced is
+/// observable in any challenge-token-feeding position.
+fn chain_signals(c: &Chain, net_ts: &[u64]) -> (Vec<String>, bool) {
+    let mut signals: Vec<String> = Vec::new();
+    if c.hot_pattern {
+        signals.push("sink-call".into());
+    }
+    if c.trigger.is_some() {
+        signals.push("handler-born".into());
+    }
+    if c.fp_reads.len() >= 2 {
+        signals.push("fp-probes".into());
+    }
+    if c.integrity > 0 {
+        signals.push("integrity-check".into());
+    }
+    let net_adjacent = overlaps_net_window(net_ts, c.first_ts, c.last_ts);
+    if net_adjacent {
+        signals.push("net-window".into());
+    }
+    (signals, net_adjacent)
+}
+
 // ---------------------------------------------------------------------------
 // wasm section walk (offline, no execution)
 // ---------------------------------------------------------------------------
@@ -380,6 +438,8 @@ struct Chain {
     frags: u64,
     bytes: u64,
     hot: bool,
+    /// v7: is_hot() matched the chain's own code (sink-call signal)
+    hot_pattern: bool,
     first_ts: u64,
     last_ts: u64,
     path: String,
@@ -393,6 +453,10 @@ struct Chain {
     integrity: u64,
     integrity_samples: Vec<String>,
     clock_reads: u64,
+    // v7 dead-end classification
+    token_forming: bool,
+    signals: Vec<String>,
+    net_adjacent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -566,6 +630,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                         frags: 0,
                         bytes: 0,
                         hot: false,
+                        hot_pattern: false,
                         first_ts: r.ts,
                         last_ts: r.ts,
                         path: format!("filtered/scripts/{}", fname),
@@ -576,6 +641,9 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                         integrity: 0,
                         integrity_samples: Vec::new(),
                         clock_reads: 0,
+                        token_forming: false,
+                        signals: Vec::new(),
+                        net_adjacent: false,
                     };
                     chain_list.push(c);
                     chains.insert(key, idx);
@@ -606,6 +674,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             c.last_ts = r.ts;
             if is_hot(&name, &body) {
                 c.hot = true;
+                c.hot_pattern = true;
             }
         } else if r.kind == "wasm-module" {
             if wasm_seen.contains_key(&r.h) {
@@ -728,12 +797,44 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         c.clock_reads = (cb - ca) as u64;
     }
 
+    // ---- v7 dead-end classification ----------------------------------------
+    // net-request timestamps (ts-sorted like recs) for the backward slice
+    let net_ts: Vec<u64> = recs
+        .iter()
+        .filter(|r| r.kind == "net-request")
+        .map(|r| r.ts)
+        .collect();
+    for c in &mut chain_list {
+        let (signals, net_adjacent) = chain_signals(c, &net_ts);
+        if net_adjacent {
+            stats.net_adjacent_chains += 1;
+        }
+        if !signals.is_empty() {
+            c.token_forming = true;
+            stats.token_chains += 1;
+        } else {
+            stats.dead_end_chains += 1;
+        }
+        c.signals = signals;
+        c.net_adjacent = net_adjacent;
+    }
+
     let mut hot = 0usize;
     let mut cold = 0usize;
     let mut chain_report = Vec::new();
     let big_keep = 96 * 1024usize;
+    // v7 keep rule (the RUN zip - "almost untouched, as now"):
+    //   hot (v6 rule: sink-call/trigger/fp) OR token-forming (v7 signals)
+    //   OR keep_cold OR AF_KEEP_BIG=1 + big. The raw .bin payloads are
+    //   pruned after this pass, so the kept chain files are the only copy
+    //   of the executed code - the run zip must stay at least as complete
+    //   as v6 (no downgrade).
+    // The FILTERED zip (main.rs) is cut down further, to token-forming
+    // chains ONLY, on its own copy of this directory (report.json carries
+    // the token_forming flag per chain).
+    let keep_big = std::env::var("AF_KEEP_BIG").map(|v| v == "1").unwrap_or(false);
     for c in &mut chain_list {
-        let keep = c.hot || stats.keep_cold || c.bytes as usize >= big_keep;
+        let keep = c.hot || c.token_forming || stats.keep_cold || (keep_big && c.bytes as usize >= big_keep);
         if keep {
             hot += 1;
             if let Some(f) = c.file.as_mut() {
@@ -759,10 +860,14 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "frags": c.frags,
             "bytes": c.bytes,
             "hot": c.hot,
+            "token_forming": c.token_forming,
             "ts0": c.first_ts,
             "ts1": c.last_ts,
             "path": c.path,
         });
+        if !c.signals.is_empty() {
+            entry["signals"] = json!(c.signals);
+        }
         if let Some(t) = &c.trigger {
             entry["trigger"] = json!({
                 "kind": t.kind,
@@ -879,6 +984,12 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "cold_dropped": stats.cold_chains,
             "keep_cold": stats.keep_cold,
             "chain_bytes": stats.chain_bytes,
+        },
+        "dead_end": {
+            "token_forming": stats.token_chains,
+            "dead_end": stats.dead_end_chains,
+            "net_adjacent": stats.net_adjacent_chains,
+            "rule": "token-forming = sink-call | handler-born | fp-probes>=2 | integrity-check | net-window; dead ends stay whole in the raw run zip",
         },
         "taint": {
             "fp_reads": stats.fp_reads,
@@ -1055,5 +1166,95 @@ mod tests {
         assert!(latest_trigger_before(&recs, 100_410_000_000, 250_000_000).is_none());
         // before anything -> nothing
         assert!(latest_trigger_before(&recs, 10, 250_000_000).is_none());
+    }
+
+    #[test]
+    fn net_window_overlap() {
+        // net sends at t=100s (ns domain)
+        let net_ts = vec![100_000_000_000u64];
+        // chain materialized 1s before the send -> inside the 5s window
+        assert!(overlaps_net_window(&net_ts, 99_000_000_000, 99_900_000_000));
+        // chain materialized 10s before the send -> outside
+        assert!(!overlaps_net_window(&net_ts, 89_000_000_000, 89_900_000_000));
+        // chain started long ago but still materializing (last frag) 2s
+        // before the send -> overlaps
+        assert!(overlaps_net_window(&net_ts, 10_000_000_000, 98_000_000_000));
+        // chain entirely AFTER the send -> outside
+        assert!(!overlaps_net_window(&net_ts, 101_000_000_000, 102_000_000_000));
+        // empty net stream -> nothing is adjacent
+        assert!(!overlaps_net_window(&[], 1, 2));
+    }
+
+    fn chain_with(
+        hot_pattern: bool,
+        trigger: bool,
+        fp: usize,
+        integrity: u64,
+    ) -> Chain {
+        Chain {
+            file: None,
+            name: "x.js".into(),
+            frags: 1,
+            bytes: 10,
+            hot: hot_pattern,
+            hot_pattern,
+            first_ts: 1_000,
+            last_ts: 2_000,
+            path: String::new(),
+            trigger: if trigger {
+                Some(TriggerRef { kind: "timer".into(), ts: 900, what: "w".into() })
+            } else {
+                None
+            },
+            iso: None,
+            worker: None,
+            fp_reads: vec!["a".to_string(); fp],
+            integrity,
+            integrity_samples: Vec::new(),
+            clock_reads: 0,
+            token_forming: false,
+            signals: Vec::new(),
+            net_adjacent: false,
+        }
+    }
+
+    #[test]
+    fn dead_end_classification() {
+        // no signals anywhere: dead end
+        let c = chain_with(false, false, 0, 0);
+        let (s, net) = chain_signals(&c, &[]);
+        assert!(s.is_empty());
+        assert!(!net);
+
+        // sink-call in the chain's own code
+        let c = chain_with(true, false, 0, 0);
+        let (s, _) = chain_signals(&c, &[]);
+        assert_eq!(s, vec!["sink-call".to_string()]);
+
+        // handler-born (compiled inside an event/timer)
+        let c = chain_with(false, true, 0, 0);
+        let (s, _) = chain_signals(&c, &[]);
+        assert_eq!(s, vec!["handler-born".to_string()]);
+
+        // two distinct fingerprint probes during materialization
+        let c = chain_with(false, false, 2, 0);
+        let (s, _) = chain_signals(&c, &[]);
+        assert_eq!(s, vec!["fp-probes".to_string()]);
+        // ONE probe alone is not enough (analytics reads one field too)
+        let c = chain_with(false, false, 1, 0);
+        let (s, _) = chain_signals(&c, &[]);
+        assert!(s.is_empty());
+
+        // integrity self-checks in the window
+        let c = chain_with(false, false, 0, 3);
+        let (s, _) = chain_signals(&c, &[]);
+        assert_eq!(s, vec!["integrity-check".to_string()]);
+
+        // net-window: chain materialized right before a send
+        let c = chain_with(false, false, 0, 0);
+        let net_ts = vec![100_000]; // FP_GRACE_NS + NET_FP_WINDOW_NS spans it
+        let (s, net) = chain_signals(&c, &net_ts);
+        assert_eq!(s, vec!["net-window".to_string()]);
+        assert!(net);
     }
 }

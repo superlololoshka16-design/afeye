@@ -92,11 +92,14 @@ fn chrome_flags(f: &Flags) -> Vec<String> {
         a.push("--js-flags=--afeye-trace".into());
     }
     if std::env::var("AF_TEST_HEADLESS").is_ok() {
-        a.push("--headless=new".into());
+        a.push("--headless".into());
         a.push("--disable-gpu".into());
     }
-    // the fast CI build target is `headless_shell` (half the browser cut
-    // out): it is headless-only and accepts no --headless=new switch.
+    // v7: the CI build target is the REAL `chrome` (full platform - the
+    // antifraud self-checks stay alive). It runs headed under the crawl's
+    // Xvfb display, or --headless when AF_TEST_HEADLESS is set (since 132
+    // --headless IS the full new headless - the old stripped one is gone).
+    // Only a legacy headless_shell build takes the old path.
     if f.headless_shell {
         a.push("--headless".into());
         a.push("--disable-gpu".into());

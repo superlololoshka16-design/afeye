@@ -349,24 +349,24 @@ index 0000000000..1111111111
  
    # Enable DWARF line info for Torque files.
    # TODO(olivf): Find out how this works on other platforms.
-@@ -2662,6 +2665,9 @@
-     ":v8_tracing",
-   ]
-   if (v8_enable_experimental_tq_to_tsa) {
-+  if (v8_enable_afeye) {
-+    sources += [ "src/afeye/sink.h" ]
-+  }
-     deps += [ ":run_torque_to_tsa" ]
-   }
- 
-@@ -7040,6 +7046,10 @@
+@@ -7040,5 +7043,19 @@
        "src/extensions/vtunedomain-support-extension.h",
      ]
      deps += [ "third_party/vtune:v8_vtune_trace_mark" ]
-+  if (v8_enable_afeye) {
-+    sources += [ "src/afeye/sink.cc" ]
-+    defines = [ "V8_AFEYE" ]
-+  }
    }
++
++  # afeye: env-activated record sink compiled into v8 (patches/SERIES.md).
++  # SIBLING of the vtune block, NOT nested inside it. v6 had this nested
++  # under `if (v8_enable_vtunetracemark && ...)` which is false by default:
++  # sink.cc never compiled and every `#ifdef V8_AFEYE` hook in api.cc /
++  # compiler.cc / wasm / execution silently compiled to nothing. The
++  # args.gn extra_cflags define is the belt to this suspenders.
++  if (v8_enable_afeye) {
++    sources += [
++      "src/afeye/sink.cc",
++      "src/afeye/sink.h",
++    ]
++    defines += [ "V8_AFEYE" ]
++  }
  }
  

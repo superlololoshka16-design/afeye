@@ -11,10 +11,13 @@ name: afeye-build
 # so the job NEVER hits the 6h runner cap and never dies mid-compile.
 #
 # Why this is fast:
-#   - target is headless_shell: ~half the ninja graph of full `chrome`,
-#     still ships every patched layer (v8 / blink / content / net)
-#   - symbol_level=0 everywhere (no debug info): ~1/3 of a build cut
-#   - no PGO / no thin-LTO (is_official_build=false), component build
+#   - target is the REAL `chrome` (NOT headless_shell - the stripped test
+#     app where antifraud self-checks die silently); the full platform is
+#     the honest capture surface, the window chain absorbs the graph size
+#   - component build: per-component .so links, not one monolith link
+#   - use_lld + concurrent_links=4, symbol_level=0 everywhere (no debug
+#     info): ~1/3 of a default build cut
+#   - no PGO / no thin-LTO (is_official_build=false)
 #   - ccache across runs via actions/cache (10G cap, 9G used)
 #   - single gclient sync at the pinned tag, --no-history
 #
@@ -45,7 +48,7 @@ env:
   CHROMIUM_REF: ${{ github.event.inputs.chromium_ref || '153.0.8010.52' }}
   WORK: /mnt/chromium
   OUT: out/afeye
-  NINJA_TARGET: headless_shell
+  NINJA_TARGET: chrome
   BUILD_WINDOW_SECS: '16200'
   CCACHE_DIR: /mnt/ccache
 
@@ -108,24 +111,73 @@ jobs:
             echo "status=window" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: smoke-test patched shell
+      - name: smoke-test patched chrome
         if: steps.result.outputs.status == 'built'
         run: |
+          set -e
           cd "$WORK/src/$OUT"
           BIN="./$NINJA_TARGET"
           "$BIN" --version
-          # sink activation probe: run with AFEYE_SINK=1 and check the .rec appears
-          rm -rf /tmp/afeye-smoke && mkdir -p /tmp/afeye-smoke
-          AFEYE_SINK=1 AFEYE_RAW_DIR=/tmp/afeye-smoke \
-            "$BIN" --no-sandbox --disable-gpu --user-data-dir=/tmp/afeye-smoke-prof \
-            --dump-dom about:blank >/dev/null 2>&1 || true
-          ls -la /tmp/afeye-smoke/ || true
-          test -n "$(ls /tmp/afeye-smoke/ 2>/dev/null)" || { echo "SINKS DID NOT EMIT"; exit 1; }
-          echo "sinks alive: $(ls /tmp/afeye-smoke/ | wc -l) record files"
-          # each record file must carry the sink-hello first record
-          for f in /tmp/afeye-smoke/*.rec; do
-            test -s "$f" || { echo "EMPTY REC: $f"; exit 1; }
-          done
+          # The smoke page EXERCISES the funnels, then the census ASSERTS the
+          # catches. v6 smoked on about:blank - nothing executes there, so
+          # the sinks were "alive" but provably empty. This page hits every
+          # hooked layer: external script (v8 compile funnels), inline script
+          # + eval + new Function, a timer, a fetch, a dispatched event,
+          # Function.prototype.toString, wasm bytes, canvas/audio probes.
+          mkdir -p /tmp/afeye-smoke && rm -rf /tmp/afeye-smoke/*
+          cat > /tmp/afeye-smoke/smoke.js <<'EOF'
+          // external script: goes through the compile funnels (0002)
+          function tok(a, b) { return a + b + 42; }
+          document.dispatchEvent(new CustomEvent('afeye-ping'));
+          addEventListener('mousemove', function () {});
+          // timer: dom_timer install+fire (0006)
+          setTimeout(function () {
+            // fetch: resource_fetcher (0006) + network wire (0011)
+            fetch('probe.txt').then(function (r) {
+              return r.text();
+            }).catch(function () {});
+            // integrity self-check surface (0004)
+            Function.prototype.toString.call(tok);
+            // wasm: bytes + instantiate (0003)
+            if (typeof WebAssembly === 'object') {
+              try {
+                var b = new Uint8Array([0,97,115,109,1,0,0,0]);
+                WebAssembly.instantiate(b);
+              } catch (e) {}
+            }
+            // eval + new Function: the GetFunctionFromEval funnel (0002)
+            eval('1+1');
+            new Function('return 2')();
+          }, 30);
+          EOF
+          cat > /tmp/afeye-smoke/smoke.html <<'EOF'
+          <!doctype html><html><head><title>afeye-smoke</title></head><body>
+          <script src="smoke.js"></script>
+          <script>/* inline: another compile-funnel catch */
+            document.title = 'inline';
+          </script></body></html>
+          EOF
+          echo "afeye-smoke-ok" > /tmp/afeye-smoke/probe.txt
+          (cd /tmp/afeye-smoke && python3 -m http.server 8099 >/dev/null 2>&1 &)
+          sleep 1
+          # --headless on the REAL chrome binary (since 132 this IS the full new
+          # headless - the old stripped headless is gone): full platform, no X
+          timeout 45 env AFEYE_SINK=1 AFEYE_RAW_DIR=/tmp/afeye-smoke/rec \
+            "$BIN" --headless --no-sandbox --disable-gpu \
+            --user-data-dir=/tmp/afeye-smoke-prof --virtual-time-budget=10000 \
+            --dump-dom http://127.0.0.1:8099/smoke.html >/dev/null 2>&1 || true
+          pkill -f "http.server 8099" || true
+          sleep 1
+          ls -la /tmp/afeye-smoke/rec/ || true
+          # THE assertion: real records, real kinds - not just live .rec files
+          python3 "$GITHUB_WORKSPACE/tools/rec_census.py" /tmp/afeye-smoke/rec \
+            --expect v8:script-source=2 \
+            --expect v8:call-completed=1 \
+            --expect blink:event-dispatch=1 \
+            --expect blink:timer=1 \
+            --expect blink:fetch=1 \
+            --expect blink:dom-api=1 \
+            --expect net:net-request=1
 
       - name: package + release
         if: steps.result.outputs.status == 'built'
@@ -134,18 +186,26 @@ jobs:
         run: |
           set -e
           cd "$WORK/src/$OUT"
-          # runtime payload only - the build tree (obj/gen) is not shipped.
-          # component build ships the .so set alongside the binary, so the
-          # explicit list is best-effort with a full fallback.
+          # Runtime payload: the binary + THE WHOLE component .so set. v6
+          # shipped a hard-coded file list - in a component build the
+          # binary loads dozens of lib*.so at startup, and a missing one
+          # means "error while loading shared libraries" on the target
+          # machine. One tar with exclusion patterns over the out dir is
+          # deterministic: binary, every .so, resources.pak, icudtl.dat,
+          # snapshot blobs, locales, vk_swiftshader, crashpad handler.
           tar czf /tmp/chrome.tgz \
-            --exclude='obj*' --exclude='gen' --exclude='*.ninja' --exclude='*.ninja.*' \
-            --exclude='toolchain.ninja' --exclude='args.gn' --exclude='build.ninja' \
-            --exclude='*.stamp' --exclude='libc++.a' --exclude='*.TOC' \
-            "$NINJA_TARGET" icudtl.dat resources.pak snapshot_blob.bin \
-            v8_context_snapshot.bin locales \
-            libEGL.so libGLESv2.so libvk_swiftshader.so vk_swiftshader_icd.json 2>/dev/null \
-          || tar czf /tmp/chrome.tgz --exclude='obj*' --exclude='gen' --exclude='*.ninja' \
-            --exclude='*.stamp' --exclude='*.TOC' .
+            --exclude='./obj*' --exclude='./gen' \
+            --exclude='*.ninja' --exclude='*.ninja.*' \
+            --exclude='./toolchain.ninja' --exclude='./args.gn' \
+            --exclude='./build.ninja' --exclude='*.stamp' \
+            --exclude='*.TOC' --exclude='*.a' \
+            --exclude='./gen' .
+          # sanity: the tar must contain the binary + at least the core .so
+          # set, else the archive is a brick (fail loudly, not on the
+          # target machine).
+          test "$(tar tzf /tmp/chrome.tgz | grep -c '^\./chrome$')" -ge 1
+          test "$(tar tzf /tmp/chrome.tgz | grep -c '\.so$')" -ge 10
+          test "$(tar tzf /tmp/chrome.tgz | grep -c 'icudtl.dat')" -ge 1
           ls -la /tmp/chrome.tgz
           sha256sum /tmp/chrome.tgz | tee /tmp/chrome.tgz.sha256
           TAG="chrome-${CHROMIUM_REF}"
@@ -154,7 +214,7 @@ jobs:
           else
             gh release create "$TAG" /tmp/chrome.tgz /tmp/chrome.tgz.sha256 \
               --title "afeye $NINJA_TARGET $CHROMIUM_REF" \
-              --notes "Patched Chromium $CHROMIUM_REF with the afeye sink series v6 (11 patches, patches/SERIES.md). Target: $NINJA_TARGET. Raw capture at the verified chokepoints: every script source (v8 compile funnels - eval/streamed/buffered, per-isolate names), wasm module bytes + imports as resolved at instantiation, C++->JS call origin, isolate/worker births, Function.prototype.toString integrity probes, Date.now cadence, microtask drain brackets, every event dispatch (isTrusted + coords + keys), input at the source managers (mouse widget/screen geometry + keyboard codes), timers, EVERY WebIDL attribute get/set + method call (the IDLMemberInstaller choke - navigator/screen/document by exact name), DOM/canvas/font metrics incl. measured results, WebGL parameter sweep, offline audio, WebRTC SDP/ICE, device identities, crypto ops, structured clones, renderer-side fetch provenance, navigation-start T0 in the sink clock, full network wire + WebSocket frames. Collector batches high-frequency kinds into part files (no 10k-file explosion); filtering (chain-merge per isolate + backward slicing with fingerprint-read taint + payload-formation windows) is external, in src/sinkfilter.rs. ccache chain: after the first build only the patched translation units recompile."
+              --notes "Patched Chromium $CHROMIUM_REF, REAL chrome target (v7). v6 built headless_shell - the stripped test binary where antifraud self-checks die silently; this is the full platform, run with --headless. Build fixes: afeye defines promoted to global extra_cflags (the v6 nested-GN-scope bug compiled the whole v8 layer to nothing), component .so set packaged (no more error while loading shared libraries), smoke test asserts real record kinds via tools/rec_census.py instead of about:blank emptiness. Capture surface: every script source (v8 compile funnels - eval/streamed/buffered, per-isolate names), the Invoke funnel (every C++->JS entry incl. Script::Run, microtasks, comparators - deeper than v6's api.cc hook), wasm module bytes + imports as resolved at instantiation, Function.prototype.toString integrity probes, Date.now cadence, microtask drain brackets, every event dispatch + listeners-reached fact (isTrusted + coords + keys), input at the source managers, timers, EVERY WebIDL attribute get/set + method call, DOM/canvas/font metrics incl. measured results, WebGL parameter sweep, offline audio, WebRTC SDP/ICE, device identities, crypto ops, structured clones, renderer-side fetch provenance, navigation-start T0, full network wire + WebSocket frames. External filtering (src/sinkfilter.rs): chain-merge per isolate, backward slicing with fingerprint-read taint, payload-formation windows, and v7 dead-end classification - chains are split into token-forming vs dead-end with reasons, the filtered zip keeps only what feeds the challenge token, the raw run zip stays untouched. ccache chain: after the first build only the patched translation units recompile."
           fi
           # marker into the repo tree so the main page shows the build state
           mkdir -p build

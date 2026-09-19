@@ -1,85 +1,28 @@
 --- a/v8/src/api/api.cc
 +++ b/v8/src/api/api.cc
-@@ -128,6 +128,14 @@
+@@ -128,6 +128,10 @@
  #include "src/objects/string.h"
  #include "src/objects/synthetic-module-inl.h"
  #include "src/objects/templates.h"
 +#ifdef V8_AFEYE
-+#include <atomic>
 +#include <cstdio>
-+#include <cstdlib>
-+#include <cstring>
-+#include <string>
 +#include "src/afeye/sink.h"
 +#endif
  #include "src/objects/value-serializer.h"
  #include "src/parsing/parse-info.h"
  #include "src/parsing/parser.h"
-@@ -5718,6 +5726,51 @@
+@@ -5718,6 +5722,10 @@
        Utils::ToMaybeLocal(i::Execution::New(i_isolate, self, self, args)));
  }
  
-+#ifdef V8_AFEYE
-+// Every C++ -> JS entry goes through Function::Call below: event listener
-+// callbacks, promise continuations, blink-invoked scripting. Recording the
-+// callee's script origin + line is the "who got invoked" linkage that the
-+// Rust filter joins with input events and network sends on the timeline.
-+static void AfeyeLogCall(v8::Isolate* isolate, const v8::Function* fn,
-+                         int argc) {
-+  static std::atomic<uint64_t> g_afeye_calls{0};
-+  static bool g_afeye_calls_off = []() {
-+    const char* v = ::getenv("AFEYE_TRACE_CALLS");
-+    return v != nullptr && *v != '\0' && v[0] == '0';
-+  }();
-+  if (g_afeye_calls_off) return;
-+  // hard cap: the call stream must never starve the script-source stream
-+  if (g_afeye_calls.fetch_add(1, std::memory_order_relaxed) >= 4000000) {
-+    return;
-+  }
-+  char afeye_buf[320];
-+  int afeye_n = std::snprintf(afeye_buf, sizeof(afeye_buf), "call argc=%d",
-+                              argc);
-+  if (afeye_n > 0 && fn != nullptr) {
-+    v8::ScriptOrigin afeye_origin = fn->GetScriptOrigin();
-+    v8::Local<v8::Value> afeye_rn = afeye_origin.ResourceName();
-+    int afeye_line = fn->GetScriptLineNumber();
-+    if (afeye_line < 0) afeye_line = 0;
-+    std::string afeye_script;
-+    if (!afeye_rn.IsEmpty() && afeye_rn->IsString()) {
-+      v8::Local<v8::String> afeye_s = afeye_rn.As<v8::String>();
-+      v8::String::Utf8Value afeye_uv(isolate, afeye_s);
-+      if (*afeye_uv) {
-+        size_t afeye_len = std::strlen(*afeye_uv);
-+        if (afeye_len > 200) afeye_len = 200;
-+        afeye_script.assign(*afeye_uv, afeye_len);
-+      }
-+    }
-+    std::snprintf(afeye_buf + afeye_n, sizeof(afeye_buf) - afeye_n,
-+                  " script=%s:%d",
-+                  afeye_script.empty() ? "native" : afeye_script.c_str(),
-+                  afeye_line);
-+  }
-+  v8::afeye::EmitStr(v8::afeye::kCallCompleted, v8::afeye::NowNs(),
-+                     afeye_buf);
-+}
-+#endif
++// afeye (v7): the C++ -> JS call-origin hook moved DEEPER - into the single
++// funnel every entry passes through (execution.cc Invoke). See
++// 0003-v8-calls-wasm.patch, v8/src/execution/execution.cc section.
 +
  MaybeLocal<v8::Value> Function::Call(v8::Isolate* isolate,
                                       Local<Context> context,
                                       v8::Local<v8::Value> recv, int argc,
-@@ -5732,6 +5785,11 @@
-   auto self = Utils::OpenDirectHandle(this);
-   Utils::ApiCheck(!self.is_null(), "v8::Function::Call",
-                   "Function to be called is a null pointer");
-+#ifdef V8_AFEYE
-+  if (v8::afeye::Enabled()) {
-+    AfeyeLogCall(isolate, this, argc);
-+  }
-+#endif
-   auto recv_obj = Utils::OpenDirectHandle(*recv);
-   auto args = PrepareArguments(argc, argv);
-   return api_scope.EscapeMaybe(
-@@ -10363,6 +10421,15 @@
+@@ -10363,6 +10371,15 @@
                        const Isolate::CreateParams& params) {
    Isolate* v8_isolate = Allocate(group);
    Initialize(v8_isolate, params);
@@ -177,3 +120,89 @@
  
      DirectHandle<Object> value = sanitized_imports_[index];
  
+--- a/v8/src/execution/execution.cc
++++ b/v8/src/execution/execution.cc
+@@ -4,6 +4,15 @@
+ 
+ #include "src/execution/execution.h"
+ 
++#ifdef V8_AFEYE
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include "src/afeye/sink.h"
++#endif
++
+ #include "include/cppgc/macros.h"
+ #include "src/api/api-inl.h"
+ #include "src/debug/debug.h"
+@@ -302,9 +311,67 @@
+   return result;
+ }
+ 
++#ifdef V8_AFEYE
++// afeye (v7): THE C++ -> JS funnel. Every entry passes through Invoke:
++// v8::Function::Call, Script::Run / RunModule, Execution::New, microtask
++// callbacks (TryRunMicrotasks), JSON revivers, sort comparators, v8's own
++// internal callers. This replaces the v6 api.cc Function::Call hook that
++// only saw the public API surface - nothing C++-initiated slips past this
++// point. The callee's script:line is the "who got invoked" linkage the Rust
++// filter joins with input events and network sends on the timeline.
++static void AfeyeLogInvoke(Isolate* isolate, const InvokeParams& params) {
++  static std::atomic<uint64_t> g_afeye_calls{0};
++  static bool g_afeye_calls_off = []() {
++    const char* v = ::getenv("AFEYE_TRACE_CALLS");
++    return v != nullptr && *v != '\0' && v[0] == '0';
++  }();
++  if (g_afeye_calls_off) return;
++  // hard cap: the call stream must never starve the script-source stream
++  if (g_afeye_calls.fetch_add(1, std::memory_order_relaxed) >= 4000000) {
++    return;
++  }
++  char afeye_buf[320];
++  int afeye_n = std::snprintf(afeye_buf, sizeof(afeye_buf), "call argc=%u%s",
++                              static_cast<unsigned>(params.args.size()),
++                              params.is_construct ? " c=1" : "");
++  if (afeye_n > 0 && IsJSFunction(*params.target)) {
++    v8::Local<v8::Value> afeye_rv = v8::Utils::ToLocal(params.target);
++    if (!afeye_rv.IsEmpty() && afeye_rv->IsFunction()) {
++      v8::Local<v8::Function> afeye_fn = afeye_rv.As<v8::Function>();
++      v8::ScriptOrigin afeye_origin = afeye_fn->GetScriptOrigin();
++      v8::Local<v8::Value> afeye_rn = afeye_origin.ResourceName();
++      int afeye_line = afeye_fn->GetScriptLineNumber();
++      if (afeye_line < 0) afeye_line = 0;
++      std::string afeye_script;
++      if (!afeye_rn.IsEmpty() && afeye_rn->IsString()) {
++        v8::Local<v8::String> afeye_s = afeye_rn.As<v8::String>();
++        v8::Isolate* afeye_api = reinterpret_cast<v8::Isolate*>(isolate);
++        v8::String::Utf8Value afeye_uv(afeye_api, afeye_s);
++        if (*afeye_uv) {
++          size_t afeye_len = std::strlen(*afeye_uv);
++          if (afeye_len > 200) afeye_len = 200;
++          afeye_script.assign(*afeye_uv, afeye_len);
++        }
++      }
++      std::snprintf(afeye_buf + afeye_n, sizeof(afeye_buf) - afeye_n,
++                    " script=%s:%d",
++                    afeye_script.empty() ? "native" : afeye_script.c_str(),
++                    afeye_line);
++    }
++  }
++  v8::afeye::EmitStr(v8::afeye::kCallCompleted, v8::afeye::NowNs(),
++                     afeye_buf);
++}
++#endif
++
+ V8_WARN_UNUSED_RESULT MaybeHandle<Object> Invoke(Isolate* isolate,
+                                                  const InvokeParams& params) {
+   RCS_SCOPE(isolate, RuntimeCallCounterId::kInvoke);
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled()) {
++    AfeyeLogInvoke(isolate, params);
++  }
++#endif
+   DCHECK(!IsJSGlobalObject(*params.receiver));
+   DCHECK_LE(params.args.size(), FixedArray::kMaxLength);
+   DCHECK(!isolate->has_exception());

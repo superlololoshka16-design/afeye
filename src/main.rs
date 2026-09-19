@@ -525,8 +525,13 @@ async fn run() -> Result<(), String> {
     match sinkfilter::run(&stage_run.join("collect")) {
         Ok(sf) => {
             eprintln!(
-                "[afeye] sinkfilter: fragments={} chains={} hot={} cold={} wasm={} net_chains={}",
-                sf.fragments, sf.chains, sf.hot_chains, sf.cold_chains, sf.wasm_modules, sf.net_chains
+                "[afeye] sinkfilter: fragments={} chains={} hot={} cold={} wasm={} net_chains={} token={} dead_end={} net_adjacent={}",
+                sf.fragments, sf.chains, sf.hot_chains, sf.cold_chains, sf.wasm_modules, sf.net_chains,
+                sf.token_chains, sf.dead_end_chains, sf.net_adjacent_chains
+            );
+            eprintln!(
+                "[afeye] dead-end split: filtered zip carries the {} token-forming chains; all {} chains stay whole in the raw run zip",
+                sf.token_chains, sf.chains
             );
             let raw_dir = stage_run.join("collect/raw");
             if sf.records > 0 {
@@ -575,6 +580,27 @@ async fn run() -> Result<(), String> {
             eprintln!("[afeye] filtered copy failed: {e}");
         } else {
             classify::strict(&fdir);
+            // v7 dead-end cut: this FILTERED zip keeps ONLY the chains that
+            // feed the challenge token (token_forming in report.json). The
+            // run zip above stays untouched - it still carries every kept
+            // chain, token or not; nothing is lost, the two zips just sort
+            // the same capture by different rules.
+            let mut dropped = 0usize;
+            if let Ok(rep) = std::fs::read(fdir.join("collect/filtered/report.json")) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&rep) {
+                    if let Some(chains) = v.get("chains").and_then(|c| c.as_array()) {
+                        for ch in chains {
+                            let token = ch.get("token_forming").and_then(|t| t.as_bool()).unwrap_or(false);
+                            let path = ch.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                            if !token && !path.is_empty() {
+                                let _ = std::fs::remove_file(fdir.join("collect").join(path));
+                                dropped += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!("[afeye] filtered zip: {dropped} dead-end chains removed (token-only)");
             let f7z = out.join(format!("{stem}-filtered.7z"));
             if arch::have_7z() {
                 match arch::sz_pack(&fdir, &f7z, 0).await {
@@ -729,8 +755,8 @@ fn find_chrome() -> Option<PathBuf> {
         "/tmp/cft/chrome-linux64/chrome",
         "chromium-browser",
         "chromium",
-        "/opt/afeye-chrome/headless_shell",
         "/opt/afeye-chrome/chrome",
+        "/opt/afeye-chrome/headless_shell",
     ] {
         if c.starts_with('/') {
             let pb = PathBuf::from(c);

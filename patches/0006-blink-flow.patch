@@ -156,3 +156,44 @@
    absl::Cleanup record_times = [start = base::TimeTicks::Now(), &params] {
      base::TimeDelta elapsed = base::TimeTicks::Now() - start;
      base::UmaHistogramMicrosecondsTimes("Blink.Fetch.RequestResourceTime2",
+--- a/third_party/blink/renderer/core/dom/events/event_target.cc
++++ b/third_party/blink/renderer/core/dom/events/event_target.cc
+@@ -31,6 +31,11 @@
+ 
+ #include "third_party/blink/renderer/core/dom/events/event_target.h"
+ 
++#ifdef BLINK_AFEYE
++#include <cstdio>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
++
+ #include <memory>
+ #include <optional>
+ 
+@@ -975,6 +980,26 @@
+   EventListenerVector* listeners_vector =
+       d->event_listener_map.Find(event.type());
+ 
++#ifdef BLINK_AFEYE
++  // afeye (v7): the event DISPATCH funnel (0006, event_dispatcher.cc) already
++  // logs every dispatch; this is the "did it actually reach listeners" fact -
++  // how many listeners exist for the type on this target, legacy or not,
++  // trusted or synthetic. Combined with the v8 Invoke funnel (0003) the
++  // filter joins: event -> N listeners -> each listener's script:line entry.
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[256];
++    int afeye_n = std::snprintf(
++        afeye_buf, sizeof(afeye_buf),
++        "lis evt=%s n=%u legacy=%d trusted=%d", event.type().Utf8().c_str(),
++        listeners_vector ? static_cast<unsigned>(listeners_vector->size()) : 0u,
++        legacy_listeners_vector ? 1 : 0, event.isTrusted() ? 1 : 0);
++    if (afeye_n > 0) {
++      blink::afeye::EmitStr(blink::afeye::kEventDispatch,
++                            blink::afeye::NowNs(), afeye_buf);
++    }
++  }
++#endif
++
+   bool fired_event_listeners = false;
+   if (listeners_vector) {
+     // Calling `FireEventListener` causes a clone of `listeners_vector`.

@@ -1,30 +1,41 @@
 #!/usr/bin/env bash
 # afeye: build the patched Chromium 153 on a GitHub Actions runner.
 #
-# Target: headless_shell (NOT the full `chrome`) - the headless app links
-# roughly half the browser (no browser UI / chrome/ layer) while keeping ALL
-# the layers we patch: v8, blink, content, net. That is the "we don't patch
-# everything so not everything compiles" lever.
+# Target: the REAL `chrome` binary (NOT headless_shell). v6 built
+# headless_shell - the stripped test app with half the WebPlatform
+# pipeline missing; antifraud scripts (Cloudflare / DataDome) probe for
+# the missing interfaces and bail out before doing real work, so the
+# sinks stayed silent not because the hooks were broken but because the
+# antifraud JS never ran its real path. The full chrome binary runs
+# headless via --headless=new with the ENTIRE platform intact - that is
+# the honest capture surface. It costs ~2x the ninja graph of
+# headless_shell; the chained-window + ccache architecture below absorbs
+# it (first run(s) exhaust the window, cache carries progress, the chain
+# re-triggers itself until the binary exists).
 #
 # Speed levers (the whole point - hours, not a day):
-#   - headless_shell target only: ~half the ninja graph of `chrome`
+#   - `chrome` target but component build: per-component .so links, a
+#     patched Blink/V8 re-link is seconds, not a 15-minute monolith link
+#   - use_lld + concurrent_links=4: LLD links in parallel
 #   - symbol_level=0 / v8_symbol_level=0 / blink_symbol_level=0: no debug
 #     info anywhere (~1/3 of a default build's time)
 #   - is_official_build=false: skips PGO and thin-LTO
-#   - is_component_build=true: per-component .so links instead of one giant
-#     binary link (the runtime tar simply ships the .so files)
-#   - enable_nacl=false, dcheck_always_on=false
+#   - dcheck_always_on=false, enable_nacl=false
 #   - ccache (GN cc_wrapper) + actions/cache: chained runs resume; a warm
 #     re-run relinks in well under an hour
 #   - gclient sync at the tag, --no-history, single pass
 #   - use_clang_modules=false: module-using compiles are uncachable by
 #     ccache, and the chained-run architecture depends on the cache
+#   - extra_cflags GLOBAL defines: -DV8_AFEYE=1 -DBLINK_AFEYE=1
+#     -DNET_AFEYE=1 reach EVERY translation unit in EVERY toolchain, so
+#     no #ifdef-guarded hook can ever compile to nothing again (the v6
+#     gn-scope nesting bug was exactly this class of failure)
 set -euo pipefail
 
 CHROMIUM_REF="${CHROMIUM_REF:-153.0.8010.52}"
 WORK="${WORK:-/mnt/chromium}"
 OUT_REL="${OUT_REL:-out/afeye}"
-NINJA_TARGET="${NINJA_TARGET:-headless_shell}"
+NINJA_TARGET="${NINJA_TARGET:-chrome}"
 BUILD_WINDOW_SECS="${BUILD_WINDOW_SECS:-16200}"   # 4h30m of ninja
 CCACHE_DIR="${CCACHE_DIR:-/mnt/ccache}"
 
@@ -86,7 +97,12 @@ ccache -M 9G >/dev/null 2>&1 || ccache --max-size=9G >/dev/null || true
 # in numbers, every run.
 ccache -z >/dev/null 2>&1 || true
 
-# ---- 6. gn gen - fast args
+# ---- 6. gn gen - fast args. extra_cflags carries the afeye defines to
+# EVERY translation unit (v8, blink, net, content) - the GN-side
+# target defines stay as a second belt (see 0001 BUILD.gn note), but the
+# global flag is the one that makes "hook compiled to nothing"
+# structurally impossible: no propagation rule, no scope nesting, no
+# public_deps chain can hide from a command-line define.
 gn gen "$OUT_REL" --args="$(cat <<'EOF'
 is_debug = false
 is_official_build = false
@@ -97,6 +113,8 @@ blink_symbol_level = 0
 dcheck_always_on = false
 treat_warnings_as_errors = false
 use_remoteexec = false
+use_lld = true
+concurrent_links = 4
 cc_wrapper = "ccache"
 # libc++ clang modules make compiles uncachable by ccache (module-using
 # compilations are skipped) - the chained-run architecture depends on the
@@ -106,6 +124,11 @@ enable_nacl = false
 v8_enable_afeye = true
 blink_enable_afeye = true
 network_enable_afeye = true
+extra_cflags = [
+  "-DV8_AFEYE=1",
+  "-DBLINK_AFEYE=1",
+  "-DNET_AFEYE=1",
+]
 EOF
 )"
 
