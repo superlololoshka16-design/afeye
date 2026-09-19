@@ -73,12 +73,12 @@ fn sink_patch_roundtrip_is_byte_exact() {
     std::fs::create_dir_all(&src).unwrap();
     for p in [
         "0001-v8-sink.patch",
-        "0006-blink-sink.patch",
-        "0012-network-wire.patch",
+        "0005-blink-sink.patch",
+        "0011-net-wire.patch",
     ] {
         extract_new_files(&manifest.join("patches").join(p), &src);
     }
-    let v8_sink = src.join("src/afeye/sink.cc");
+    let v8_sink = src.join("v8/src/afeye/sink.cc");
     let blink_sink = src.join("third_party/blink/renderer/platform/afeye/sink.cc");
     let net_sink = src.join("services/network/afeye_sink.cc");
     assert!(v8_sink.exists(), "v8 sink not extracted");
@@ -86,6 +86,9 @@ fn sink_patch_roundtrip_is_byte_exact() {
     assert!(net_sink.exists(), "net sink not extracted");
 
     let inc = format!("-I{}", src.display());
+    // v8 sink includes are v8-rooted ("src/afeye/sink.h"), blink/net are
+    // chromium-rooted - two include dirs cover both trees
+    let inc_v8 = format!("-I{}", src.join("v8").display());
     let compile = |args: &[&str], bin: &str| {
         let out = Command::new("g++")
             .args(args)
@@ -104,7 +107,7 @@ fn sink_patch_roundtrip_is_byte_exact() {
             "-std=c++17",
             "-O2",
             "-DV8_AFEYE",
-            &inc,
+            &inc_v8,
             v8_sink.to_str().unwrap(),
             manifest.join("tools/sink_test_main.cc").to_str().unwrap(),
         ],

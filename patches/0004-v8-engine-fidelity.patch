@@ -1,0 +1,173 @@
+--- a/v8/src/builtins/builtins-function.cc
++++ b/v8/src/builtins/builtins-function.cc
+@@ -3,6 +3,14 @@
+ // found in the LICENSE file.
+ 
+ #include "src/builtins/builtins-utils-inl.h"
++#ifdef V8_AFEYE
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include "src/api/api-inl.h"
++#include "src/afeye/sink.h"
++#endif
+ #include "src/builtins/builtins.h"
+ #include "src/codegen/code-factory.h"
+ #include "src/codegen/compiler.h"
+@@ -245,10 +253,69 @@
+   return DoFunctionBind(isolate, args, ProtoSource::kUseTargetPrototype);
+ }
+ 
++#ifdef V8_AFEYE
++// afeye (v6): Function.prototype.toString is THE antifraud integrity-check
++// surface (native-code probes, eval'd-source diffs). We record WHO was
++// inspected (receiver's script:line, name) before the original runs - no
++// result tampering, pure observation. The receiver identity uses the same
++// v8::Function introspection the 0003 call-origin hook proved against this
++// tree.
++static void AfeyeLogToString(Isolate* isolate, DirectHandle<Object> recv) {
++  static std::atomic<uint64_t> g_afeye_fnts{0};
++  if (g_afeye_fnts.fetch_add(1, std::memory_order_relaxed) >= 2000000) {
++    return;
++  }
++  char afeye_buf[320];
++  v8::Isolate* afeye_api = reinterpret_cast<v8::Isolate*>(isolate);
++  v8::Local<v8::Value> afeye_rv;
++  if (!recv.is_null()) afeye_rv = v8::Utils::ToLocal(recv);
++  if (!afeye_rv.IsEmpty() && afeye_rv->IsFunction()) {
++    v8::Local<v8::Function> afeye_fn = afeye_rv.As<v8::Function>();
++    std::string afeye_name = "?";
++    std::string afeye_script = "native";
++    int afeye_line = 0;
++    v8::Local<v8::Value> afeye_nm = afeye_fn->GetName();
++    if (!afeye_nm.IsEmpty() && afeye_nm->IsString()) {
++      v8::String::Utf8Value afeye_nv(afeye_api,
++                                     afeye_nm.As<v8::String>());
++      if (*afeye_nv) {
++        size_t afeye_l = std::strlen(*afeye_nv);
++        if (afeye_l > 80) afeye_l = 80;
++        afeye_name.assign(*afeye_nv, afeye_l);
++      }
++    }
++    v8::ScriptOrigin afeye_o = afeye_fn->GetScriptOrigin();
++    v8::Local<v8::Value> afeye_rn = afeye_o.ResourceName();
++    if (!afeye_rn.IsEmpty() && afeye_rn->IsString()) {
++      v8::String::Utf8Value afeye_uv(afeye_api,
++                                     afeye_rn.As<v8::String>());
++      if (*afeye_uv) {
++        size_t afeye_l = std::strlen(*afeye_uv);
++        if (afeye_l > 200) afeye_l = 200;
++        afeye_script.assign(*afeye_uv, afeye_l);
++      }
++    }
++    afeye_line = afeye_fn->GetScriptLineNumber();
++    if (afeye_line < 0) afeye_line = 0;
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "fnts name=%.80s script=%.200s:%d",
++                  afeye_name.c_str(), afeye_script.c_str(), afeye_line);
++  } else {
++    std::snprintf(afeye_buf, sizeof(afeye_buf), "fnts receiver=non-function");
++  }
++  v8::afeye::EmitStr(v8::afeye::kFnToString, v8::afeye::NowNs(), afeye_buf);
++}
++#endif
++
+ // https://tc39.es/ecma262/#sec-function.prototype.tostring
+ BUILTIN(FunctionPrototypeToString) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> receiver = args.receiver();
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled()) {
++    AfeyeLogToString(isolate, receiver);
++  }
++#endif
+   if (IsJSBoundFunction(*receiver)) {
+     return *JSBoundFunction::ToString(isolate, Cast<JSBoundFunction>(receiver));
+   }
+--- a/v8/src/builtins/builtins-date.cc
++++ b/v8/src/builtins/builtins-date.cc
+@@ -3,6 +3,11 @@
+ // found in the LICENSE file.
+ 
+ #include "src/builtins/builtins-utils-inl.h"
++#ifdef V8_AFEYE
++#include <atomic>
++#include <cstdlib>
++#include "src/afeye/sink.h"
++#endif
+ #include "src/builtins/builtins.h"
+ #include "src/codegen/code-factory.h"
+ #include "src/date/date.h"
+@@ -149,6 +154,22 @@
+ // ES6 section 20.3.3.1 Date.now ( )
+ BUILTIN(DateNow) {
+   HandleScope scope(isolate);
++#ifdef V8_AFEYE
++  // afeye (v6): Date.now() is the clock every antifraud timing check reads.
++  // One record per call (capped) - the filter reads cadence from this.
++  if (v8::afeye::Enabled()) {
++    static std::atomic<uint64_t> g_afeye_clock{0};
++    static bool g_afeye_clock_off = []() {
++      const char* v = ::getenv("AFEYE_TRACE_CLOCK");
++      return v != nullptr && *v != '\0' && v[0] == '0';
++    }();
++    if (!g_afeye_clock_off &&
++        g_afeye_clock.fetch_add(1, std::memory_order_relaxed) < 2000000) {
++      v8::afeye::EmitStr(v8::afeye::kClock, v8::afeye::NowNs(),
++                         "clock date-now");
++    }
++  }
++#endif
+   return *isolate->factory()->NewNumberFromInt64(
+       JSDate::CurrentTimeValue(isolate));
+ }
+--- a/v8/src/execution/microtask-queue.cc
++++ b/v8/src/execution/microtask-queue.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include "src/execution/microtask-queue.h"
++#ifdef V8_AFEYE
++#include <cstdio>
++#include "src/afeye/sink.h"
++#endif
+ 
+ #ifdef V8_CPPGC_MICROTASK_QUEUE
+ #include "include/cppgc/allocation.h"
+@@ -217,6 +221,18 @@
+     return 0;
+   }
+ 
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled()) {
++    char afeye_buf[96];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "microtask-start pending=%u iso=%p",
++                  static_cast<unsigned>(size()),
++                  static_cast<void*>(isolate));
++    v8::afeye::EmitStr(v8::afeye::kMicrotaskDrain, v8::afeye::NowNs(),
++                       afeye_buf);
++  }
++#endif
++
+   // We should not enter V8 if it's marked for termination.
+   DCHECK_IMPLIES(v8_flags.strict_termination_checks,
+                  !isolate->is_execution_terminating());
+@@ -268,6 +284,16 @@
+   DCHECK_EQ(0, size());
+   OnCompleted(isolate);
+ 
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled()) {
++    char afeye_buf[96];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "microtask-end ran=%d iso=%p", processed_microtask_count,
++                  static_cast<void*>(isolate));
++    v8::afeye::EmitStr(v8::afeye::kMicrotaskDrain, v8::afeye::NowNs(),
++                       afeye_buf);
++  }
++#endif
+   return processed_microtask_count;
+ }
+ 

@@ -1,0 +1,217 @@
+--- a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
++++ b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
+@@ -3,6 +3,13 @@
+ // found in the LICENSE file.
+ 
+ #include "third_party/blink/renderer/platform/bindings/idl_member_installer.h"
++#ifdef BLINK_AFEYE
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include "third_party/blink/renderer/platform/bindings/dom_wrapper_world.h"
+ #include "third_party/blink/renderer/platform/bindings/v8_binding.h"
+@@ -15,6 +22,80 @@
+ 
+ namespace {
+ 
++#ifdef BLINK_AFEYE
++// afeye (v6): THE dom-api choke. In 153 every WebIDL attribute and operation
++// of every interface installs through this file (bindings codegen emits
++// IDLMemberInstaller::{InstallAttributes,InstallOperations} calls; the old
++// V8DOMConfiguration is gone). Each getter/setter/method callback is wrapped
++// in a thunk that logs "dom <Interface>.<get|set|call> <member>" and calls
++// the original. The identity rides in the FunctionTemplate data slot, which
++// blink leaves EMPTY for these installs (CreateFunctionTemplate passes
++// v8::Local<v8::Value>()), so no existing generated callback can observe
++// the swap - they never read info.Data() because it was always empty.
++// navigator.*, screen.*, document.*, window.*: every fingerprint read and
++// every DOM method call now lands in the stream with its exact name.
++// Fast-API overloads (NoAllocDirectCall) still take the CFunction fast path
++// when argument types match - the thunk only sees the slow path. Honest
++// limit, documented in SERIES.md.
++struct AfeyeApiCell {
++  v8::FunctionCallback orig;
++  const char* prop;
++  char what[104];
++};
++constexpr size_t kAfeyeApiCells = 1u << 16;
++AfeyeApiCell g_afeye_api_cells[kAfeyeApiCells] = {};
++std::mutex g_afeye_api_mu;
++std::atomic<uint64_t> g_afeye_api_calls{0};
++
++void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
++  AfeyeApiCell* cell = nullptr;
++  v8::Local<v8::Value> data = info.Data();
++  if (data->IsExternal()) {
++    cell = static_cast<AfeyeApiCell*>(data.As<v8::External>()->Value());
++  }
++  if (cell) {
++    // hard cap keeps the dom-api stream from starving the script stream
++    if (g_afeye_api_calls.fetch_add(1, std::memory_order_relaxed) <
++        8000000) {
++      blink::afeye::EmitStr(blink::afeye::kDomApi,
++                            blink::afeye::NowNs(), cell->what);
++    }
++    if (cell->orig) {
++      cell->orig(info);
++    }
++  }
++}
++
++v8::Local<v8::Value> AfeyeWrapDomApi(v8::Isolate* isolate,
++                                     v8::FunctionCallback orig,
++                                     const char* interface_name,
++                                     const char* accessor,
++                                     const char* property_name) {
++  if (!orig || !blink::afeye::Enabled()) {
++    return v8::Local<v8::Value>();
++  }
++  const size_t slot = (reinterpret_cast<uintptr_t>(orig) >> 4) &
++                      (kAfeyeApiCells - 1);
++  std::lock_guard<std::mutex> lock(g_afeye_api_mu);
++  for (size_t i = 0; i < kAfeyeApiCells; ++i) {
++    AfeyeApiCell& c = g_afeye_api_cells[(slot + i) & (kAfeyeApiCells - 1)];
++    if (c.orig == nullptr) {
++      c.orig = orig;
++      c.prop = property_name;
++      std::snprintf(c.what, sizeof(c.what), "dom %s.%s %s", interface_name,
++                    accessor, property_name);
++      return v8::External::New(isolate, &c);
++    }
++    if (c.orig == orig && c.prop == property_name) {
++      // already wrapped (another world re-installing the same member):
++      // reuse the cell, do not consume another one
++      return v8::External::New(isolate, &c);
++    }
++  }
++  return v8::Local<v8::Value>();  // table full: member stays unwrapped
++}
++#endif
++
+ template <typename Config>
+ bool DoesWorldMatch(const Config& config, const DOMWrapperWorld& world) {
+   const unsigned world_bit = static_cast<unsigned>(
+@@ -134,12 +215,33 @@
+     v8::Local<v8::String> interface_name,
+     v8::ExceptionContext exception_context,
+     const Config& config,
++    const char* afeye_interface_name = nullptr,
+     const v8::CFunction* v8_cfunction_table_data = nullptr,
+     uint32_t v8_cfunction_table_size = 0) {
+   v8::FunctionCallback callback = GetConfigCallback<kind>(config);
+   if (!callback)
+     return v8::Local<v8::FunctionTemplate>();
+ 
++  // afeye (v6): wrap the callback + carry the identity in the data slot.
++  // With the sink off (or cells exhausted) afeye_data stays empty and this
++  // is bit-for-bit the stock call below.
++  v8::Local<v8::Value> afeye_data;
++#ifdef BLINK_AFEYE
++  {
++    const char* afeye_access = "call";
++    if constexpr (kind == v8::ExceptionContext::kAttributeGet) {
++      afeye_access = "get";
++    } else if constexpr (kind == v8::ExceptionContext::kAttributeSet) {
++      afeye_access = "set";
++    }
++    afeye_data = AfeyeWrapDomApi(isolate, callback, afeye_interface_name,
++                                  afeye_access, config.property_name);
++    if (!afeye_data.IsEmpty()) {
++      callback = &AfeyeDomApiThunk;
++    }
++  }
++#endif
++
+   int length = GetConfigLength<kind>(config);
+   v8::SideEffectType v8_side_effect = GetConfigSideEffect<kind>(config);
+   V8PrivateProperty::CachedAccessor v8_cached_accessor =
+@@ -151,7 +253,7 @@
+            V8PrivateProperty::CachedAccessor::kWindowDocument &&
+        !world.IsMainWorld())) {
+     function_template = v8::FunctionTemplate::NewWithCFunctionOverloads(
+-        isolate, callback, v8::Local<v8::Value>(), signature, length,
++        isolate, callback, afeye_data, signature, length,
+         v8::ConstructorBehavior::kThrow, v8_side_effect,
+         {v8_cfunction_table_data, v8_cfunction_table_size});
+   } else {
+@@ -161,7 +263,7 @@
+         isolate, callback,
+         V8PrivateProperty::GetCachedAccessor(isolate, v8_cached_accessor)
+             .GetPrivate(),
+-        v8::Local<v8::Value>(), signature, length, v8_side_effect);
++        afeye_data, signature, length, v8_side_effect);
+     function_template->RemovePrototype();
+   }
+ 
+@@ -186,6 +288,7 @@
+     v8::Local<v8::String> interface_name,
+     v8::ExceptionContext exception_context,
+     const Config& config,
++    const char* afeye_interface_name = nullptr,
+     const v8::CFunction* v8_cfunction_table_data = nullptr,
+     uint32_t v8_cfunction_table_size = 0) {
+   if (!GetConfigCallback<kind>(config))
+@@ -193,6 +296,7 @@
+ 
+   return CreateFunctionTemplate<kind>(isolate, world, signature, property_name,
+                                       interface_name, exception_context, config,
++                                      afeye_interface_name,
+                                       v8_cfunction_table_data,
+                                       v8_cfunction_table_size)
+       ->GetFunction(context)
+@@ -233,11 +337,12 @@
+   v8::Local<v8::FunctionTemplate> get_func =
+       CreateFunctionTemplate<v8::ExceptionContext::kAttributeGet>(
+           isolate, world, signature, get_name, interface_name,
+-          v8::ExceptionContext::kAttributeGet, config);
++          v8::ExceptionContext::kAttributeGet, config, interface_name_ptr);
+   v8::Local<v8::FunctionTemplate> set_func =
+       CreateFunctionTemplate<v8::ExceptionContext::kAttributeSet>(
+           isolate, world, signature, set_name, interface_name,
+-          v8::ExceptionContext::kAttributeSet, config, v8_cfunction_for_set,
++          v8::ExceptionContext::kAttributeSet, config, interface_name_ptr,
++          v8_cfunction_for_set,
+           v8_cfunction_for_set == nullptr ? 0 : 1);
+ 
+   v8::Local<v8::Template> target_template;
+@@ -293,11 +398,12 @@
+   v8::Local<v8::Function> get_func =
+       CreateFunction<v8::ExceptionContext::kAttributeGet>(
+           isolate, context, world, signature, get_name, interface_name,
+-          v8::ExceptionContext::kAttributeGet, config);
++          v8::ExceptionContext::kAttributeGet, config, interface_name_ptr);
+   v8::Local<v8::Function> set_func =
+       CreateFunction<v8::ExceptionContext::kAttributeSet>(
+           isolate, context, world, signature, set_name, interface_name,
+-          v8::ExceptionContext::kAttributeSet, config, v8_cfunction_for_set,
++          v8::ExceptionContext::kAttributeSet, config, interface_name_ptr,
++          v8_cfunction_for_set,
+           v8_cfunction_for_set == nullptr ? 0 : 1);
+ 
+   v8::Local<v8::Object> target_object;
+@@ -347,8 +453,8 @@
+   v8::Local<v8::FunctionTemplate> func =
+       CreateFunctionTemplate<v8::ExceptionContext::kOperation>(
+           isolate, world, signature, property_name, interface_name,
+-          v8::ExceptionContext::kOperation, config, v8_cfunction_table_data,
+-          v8_cfunction_table_size);
++          v8::ExceptionContext::kOperation, config, interface_name_ptr,
++          v8_cfunction_table_data, v8_cfunction_table_size);
+ 
+   v8::Local<v8::Template> target_template;
+   switch (location) {
+@@ -398,8 +504,8 @@
+   v8::Local<v8::Function> func =
+       CreateFunction<v8::ExceptionContext::kOperation>(
+           isolate, context, world, signature, property_name, interface_name,
+-          v8::ExceptionContext::kOperation, config, v8_cfunction_table_data,
+-          v8_cfunction_table_size);
++          v8::ExceptionContext::kOperation, config, interface_name_ptr,
++          v8_cfunction_table_data, v8_cfunction_table_size);
+ 
+   v8::Local<v8::Object> target_object;
+   switch (location) {

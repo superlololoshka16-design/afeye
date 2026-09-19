@@ -79,7 +79,22 @@
    auto recv_obj = Utils::OpenDirectHandle(*recv);
    auto args = PrepareArguments(argc, argv);
    return api_scope.EscapeMaybe(
-
+@@ -10363,6 +10421,15 @@
+                       const Isolate::CreateParams& params) {
+   Isolate* v8_isolate = Allocate(group);
+   Initialize(v8_isolate, params);
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled()) {
++    char afeye_buf[80];
++    std::snprintf(afeye_buf, sizeof(afeye_buf), "isolate-new iso=%p",
++                  static_cast<void*>(v8_isolate));
++    v8::afeye::EmitStr(v8::afeye::kIsolateBirth, v8::afeye::NowNs(),
++                       afeye_buf);
++  }
++#endif
+   return v8_isolate;
+ }
+ 
 --- a/v8/src/wasm/wasm-engine.cc
 +++ b/v8/src/wasm/wasm-engine.cc
 @@ -3,6 +3,9 @@
@@ -122,3 +137,43 @@
  
    if (v8_flags.wasm_jitless) {
      // Asynchronous compilation disabled; fall back on synchronous compilation.
+--- a/v8/src/wasm/module-instantiate.cc
++++ b/v8/src/wasm/module-instantiate.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include "src/wasm/module-instantiate.h"
++#ifdef V8_AFEYE
++#include <cstdio>
++#include "src/afeye/sink.h"
++#endif
+ 
+ #include <inttypes.h>
+ #include <stdint.h>
+@@ -2003,8 +2007,26 @@
+   const WellKnownImportsList& preknown_imports =
+       module_->type_feedback.well_known_imports;
+   int num_imports = static_cast<int>(module_->import_table.size());
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled()) {
++    char afeye_buf[96];
++    std::snprintf(afeye_buf, sizeof(afeye_buf), "wasm-instantiate imports=%d",
++                  num_imports);
++    v8::afeye::EmitStr(v8::afeye::kWasmInstance, v8::afeye::NowNs(),
++                       afeye_buf);
++  }
++#endif
+   for (int index = 0; index < num_imports; ++index) {
+     const WasmImport& import = module_->import_table[index];
++#ifdef V8_AFEYE
++    if (v8::afeye::Enabled()) {
++      char afeye_ib[160];
++      std::snprintf(afeye_ib, sizeof(afeye_ib), "wasm-import %s kind=%d",
++                    ImportName(index).c_str(), static_cast<int>(import.kind));
++      v8::afeye::EmitStr(v8::afeye::kWasmInstance, v8::afeye::NowNs(),
++                         afeye_ib);
++    }
++#endif
+ 
+     DirectHandle<Object> value = sanitized_imports_[index];
+ 

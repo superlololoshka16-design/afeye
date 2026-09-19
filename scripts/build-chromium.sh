@@ -63,9 +63,10 @@ sudo ./build/install-build-deps.sh --no-arm >/dev/null 2>&1 || \
 
 # ---- 4. patches (the series applies cumulatively - a failure here is a
 # patch/anchor bug and must abort loudly, not silently produce stock chrome)
-# v5: seven patches, grouped by layer (v8 scripts / v8 calls+wasm / blink
-# sink / blink flow / blink probes / net wire). Only these files ever
-# recompile after a warm ccache - the rest of the graph is cache hits.
+# v6: eleven patches, grouped by layer (v8 sink / v8 scripts / v8 calls+wasm /
+# v8 engine fidelity / blink sink / blink flow / blink probes / blink dom-api
+# choke / blink input / blink context anchors / net wire). Only these files
+# ever recompile after a warm ccache - the rest of the graph is cache hits.
 REPO_ROOT="${REPO_ROOT:-$GITHUB_WORKSPACE}"
 # plain git apply, NOT --3way: v8/ is a nested git repo in a gclient checkout,
 # its blobs are not in chromium/src's index, and --3way dies on that. The

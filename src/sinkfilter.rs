@@ -1,33 +1,43 @@
-//! afeye sink deep-filter (v5).
+//! afeye sink deep-filter (v6).
 //!
 //! Post-run pass over `collect/index.jsonl` + `collect/raw/*.bin` (what the
-//! patched C++ sinks streamed). The raw collector materializes EVERY record
-//! as its own file - correct for capture, unusable for humans (a self
-//! unpacking loader easily produces 10k one-kilo fragments). This module
-//! turns that into analysis-ready output without losing the wire:
+//! patched C++ sinks streamed). The collector (v6) materializes
+//! high-frequency kinds as per-(layer,kind) PART files and references them
+//! by (path, offset, len) - batching is storage packing, never filtering,
+//! and this module unpacks by (p, o, len) so no byte is lost or decided
+//! here.
 //!
-//!  1. script chains - all script-source fragments of the same origin
-//!     (same pid + same script name) merge into ONE file. An antifraud
-//!     unpacker eval-ing itself in thousands of micro-chunks lands as one
-//!     reconstructable stream with `/* ==== [ts] name ==== */` separators.
-//!  2. wasm modules - dumped as real `.wasm` files plus an offline walk of
-//!     their import/export sections (`wasm-index.json`), so what the module
-//!     reaches for is visible without executing anything.
-//!  3. backward slicing (taint) - a chain is HOT when its code carries a
-//!     network/collector sink call (fetch/XHR/beacon/WebSocket/canvas/audio/
-//!     webrtc probes) OR when it was compiled inside a handler / timer:
-//!     v5 links that by TIME (closest preceding event/timer record within
-//!     AF_SCRIPT_TRIGGER_MS, default 250 ms - the v4 blink-layer ambient
-//!     tag is gone with the blink duplicate, and the correlation lives
-//!     here, in the external filter, where it belongs).
-//!     Cold chains are counted and dropped - dead branches that never reach
-//!     the token do not waste disk.
-//!  4. timing chains - for every network request the closest preceding
-//!     input/event/timer/dom record links into `chains.jsonl`: the
-//!     T0 (input) -> T1 (dispatch) -> T2 (network send) timeline.
+//!  1. script chains - all script-source fragments of one origin merge
+//!     into ONE file. v6 script names carry the "iso:<isolate> " prefix
+//!     (compiler.cc sink), so an eval-storm lands per-isolate: a
+//!     dedicated worker's stream never mixes with the main thread even
+//!     inside a shared renderer process. Worker records (kind 35) then
+//!     NAME the isolate - the chain report says which worker it was.
+//!  2. wasm modules - dumped as real `.wasm` plus an offline walk of the
+//!     import/export sections. v6 wasm-instance records (kind 31) carry
+//!     the imports AS RESOLVED at instantiation; the filter attaches
+//!     them to the closest preceding module of the same pid.
+//!  3. backward slicing (taint) - a chain is HOT when:
+//!       - its code carries a collector/network sink call (v5), or
+//!       - it materialized inside a handler/timer window (v5, time
+//!         correlation, AF_SCRIPT_TRIGGER_MS), or
+//!       - fingerprint DOM reads fired while its fragments materialized
+//!         (v6: the idl_member_installer stream, kind 29 - "dom
+//!         Navigator.get userAgent" and friends), or
+//!       - Function.prototype.toString integrity checks fired in its
+//!         window (v6: kind 32 - the antifraud self-check), or
+//!  4. timing chains - for every network request: the closest preceding
+//!     input/event/timer record (T0 -> T1 -> T2), the fingerprint reads
+//!     and integrity checks in the 5 s before the send (what fed the
+//!     payload), all in ms relative to nav-start (v6: kind 36 anchors
+//!     the page timeline in the sink clock domain).
 //!
-//! On success `collect/raw/` is pruned by the caller (the 10k-file problem);
-//! `index.jsonl` keeps every hash and ts, so nothing is untraceable.
+//! Attribution honesty: the C++ dom-api thunk cannot know its JS caller
+//! without a stack walk, so kind-29 reads are attributed BY TIME - to a
+//! chain while its fragments materialize (the eval-chunk-then-probe
+//! antifraud pattern), and to every network request in the preceding
+//! 5 s window (payload formation). Both are recomputable from the raw
+//! stream; the index keeps every ts.
 
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -48,6 +58,12 @@ pub struct SinkFilterStats {
     pub wasm_exports: u64,
     pub net_chains: u64,
     pub keep_cold: bool,
+    // v6 taint counters
+    pub fp_reads: u64,
+    pub fp_chains: u64,
+    pub integrity_checks: u64,
+    pub integrity_chains: u64,
+    pub wasm_instantiated: u64,
 }
 
 /// sink calls that mark a chain as reaching the collector / the network
@@ -70,6 +86,7 @@ const HOT_PATTERNS: &[&str] = &[
     "postMessage",
     "Worker(",
     "ServiceWorker",
+    "WebAssembly",
 ];
 
 const TRIGGER_KINDS: &[&str] = &[
@@ -83,6 +100,71 @@ const TRIGGER_KINDS: &[&str] = &[
     "audio",
 ];
 
+/// fingerprint-relevant dom-api reads. The kind-29 "what" strings look
+/// like "dom Navigator.get userAgent" / "dom WebGLRenderingContext.call
+/// getParameter" - matched by substring, on the interface.member level.
+const FP_API_NEEDLES: &[&str] = &[
+    // identity
+    "Navigator.get userAgent",
+    "Navigator.get appVersion",
+    "Navigator.get platform",
+    "Navigator.get vendor",
+    "Navigator.get oscpu",
+    "Navigator.get languages",
+    "Navigator.get hardwareConcurrency",
+    "Navigator.get deviceMemory",
+    "Navigator.get plugins",
+    "Navigator.get mimeTypes",
+    "Navigator.get connection",
+    "Navigator.get userAgent",
+    // screen geometry
+    "Screen.get width",
+    "Screen.get height",
+    "Screen.get colorDepth",
+    "Screen.get pixelDepth",
+    "Screen.get availLeft",
+    "Screen.get availTop",
+    "Screen.get availWidth",
+    "Screen.get availHeight",
+    // storage / cookies
+    "Document.get cookie",
+    // webgl
+    "getParameter",
+    "getExtension",
+    "getShaderPrecisionFormat",
+    // canvas
+    "toDataURL",
+    "toBlob",
+    "getImageData",
+    "measureText",
+    // element geometry (font probing)
+    "getBoundingClientRect",
+    "getClientRects",
+    // audio
+    "getChannelData",
+    // webrtc / devices
+    "createOffer",
+    "createDataChannel",
+    "enumerateDevices",
+    "getGamepads",
+    "getBattery",
+];
+
+/// a kind-29 read matched against FP_API_NEEDLES
+struct FpRead {
+    ts: u64,
+    needle: &'static str,
+}
+
+/// grace after a chain's last fragment within which a fingerprint read
+/// still counts as "while it materialized" (eval-chunk -> immediate probe)
+const FP_GRACE_NS: u64 = 50_000_000;
+/// lookback before a network send that counts fingerprint activity as
+/// payload formation for that request
+const NET_FP_WINDOW_NS: u64 = 5_000_000_000;
+/// lookback for a wasm-instantiate to still belong to a module
+const WASM_INST_WINDOW_NS: u64 = 5_000_000_000;
+
 #[derive(Debug)]
 struct Rec {
     ts: u64,
@@ -92,7 +174,21 @@ struct Rec {
     len: u64,
     h: String,
     path: String,
+    /// v6: offset inside a batched part file ("o" in the index). None for
+    /// per-record files.
+    off: Option<u64>,
     txt: Option<String>,
+}
+
+/// payload of a record, offset-aware for batched kinds
+fn read_payload(raw_dir: &Path, r: &Rec) -> Option<Vec<u8>> {
+    let b = fs::read(raw_dir.join(&r.path)).ok()?;
+    let start = r.off.unwrap_or(0) as usize;
+    if start == 0 && b.len() == r.len as usize {
+        return Some(b);
+    }
+    let end = start.checked_add(r.len as usize)?;
+    Some(b.get(start..end)?.to_vec())
 }
 
 fn txt_head(s: &str, n: usize) -> String {
@@ -107,6 +203,27 @@ fn name_of(payload: &[u8]) -> (String, Vec<u8>) {
         ),
         None => (String::new(), payload.to_vec()),
     }
+}
+
+/// v6 script names are "iso:<isolate> <real name>" (compiler.cc sink).
+fn split_iso(name: &str) -> (Option<String>, String) {
+    if let Some(rest) = name.strip_prefix("iso:") {
+        if let Some(sp) = rest.find(' ') {
+            return (Some(rest[..sp].to_string()), rest[sp + 1..].to_string());
+        }
+    }
+    (None, name.to_string())
+}
+
+/// kind-35 payload: "worker-scope iso=<ptr> name=<n> secure=<0|1>"
+fn worker_of(txt: &str) -> Option<(String, String)> {
+    let rest = txt.strip_prefix("worker-scope iso=")?;
+    let sp = rest.find(' ')?;
+    let iso = rest[..sp].to_string();
+    let tail = &rest[sp + 1..];
+    let name = tail.strip_prefix("name=").unwrap_or(tail);
+    let name = name.split(" secure=").next().unwrap_or(name);
+    Some((iso, name.to_string()))
 }
 
 fn is_hot(name: &str, body: &[u8]) -> bool {
@@ -258,6 +375,7 @@ fn wasm_imports_exports(b: &[u8]) -> (Vec<String>, Vec<String>) {
 
 struct Chain {
     file: Option<std::fs::File>,
+    /// raw chain name (with the "iso:<ptr> " prefix when present)
     name: String,
     frags: u64,
     bytes: u64,
@@ -268,6 +386,13 @@ struct Chain {
     // v5: what was running when this chain first materialized - the closest
     // preceding event/timer/crypto/... record inside the trigger window.
     trigger: Option<TriggerRef>,
+    // v6 taint columns
+    iso: Option<String>,
+    worker: Option<String>,
+    fp_reads: Vec<String>,
+    integrity: u64,
+    integrity_samples: Vec<String>,
+    clock_reads: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +431,11 @@ fn latest_trigger_before(recs: &[Rec], ts: u64, window_ns: u64) -> Option<Trigge
     None
 }
 
+/// first FP_API_NEEDLES substring the kind-29 "what" carries, if any
+fn fp_needle_of(txt: &str) -> Option<&'static str> {
+    FP_API_NEEDLES.iter().copied().find(|n| txt.contains(n))
+}
+
 pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     let index_p = collect_dir.join("index.jsonl");
     let raw_dir = collect_dir.join("raw");
@@ -337,6 +467,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             len: v.get("len").and_then(|x| x.as_u64()).unwrap_or(0),
             h: v.get("h").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             path: v.get("p").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            off: v.get("o").and_then(|x| x.as_u64()),
             txt: v.get("txt").and_then(|x| x.as_str()).map(|s| s.to_string()),
         });
     }
@@ -349,6 +480,48 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
 
     recs.sort_by_key(|r| r.ts);
 
+    // ---- v6 pre-scans (sorted by ts, binary-searched later) ---------------
+    // fingerprint reads, integrity checks, clock cadence, worker names
+    let mut fp_reads: Vec<FpRead> = Vec::new();
+    let mut fnts: Vec<(u64, String)> = Vec::new();
+    let mut clock_ts: Vec<u64> = Vec::new();
+    let mut workers: Vec<(u64, String, String)> = Vec::new(); // (ts, iso, name)
+    let mut wasm_inst: Vec<(u64, u64, bool, String)> = Vec::new(); // (ts, pid, is_imports_header, txt)
+    let mut nav_start: Option<u64> = None;
+    for r in &recs {
+        let txt = r.txt.as_deref().unwrap_or("");
+        match r.kind.as_str() {
+            "dom-api" => {
+                if let Some(n) = fp_needle_of(txt) {
+                    fp_reads.push(FpRead { ts: r.ts, needle: n });
+                }
+            }
+            "fn-tostring" => {
+                if txt.starts_with("fnts") {
+                    fnts.push((r.ts, txt.to_string()));
+                }
+            }
+            "clock" => clock_ts.push(r.ts),
+            "worker" => {
+                if let Some((iso, name)) = worker_of(txt) {
+                    workers.push((r.ts, iso, name));
+                }
+            }
+            "wasm-instance" => {
+                let header = txt.starts_with("wasm-instantiate");
+                wasm_inst.push((r.ts, r.pid, header, txt.to_string()));
+            }
+            "nav-start" => {
+                if nav_start.map(|t| r.ts < t).unwrap_or(true) {
+                    nav_start = Some(r.ts);
+                }
+            }
+            _ => {}
+        }
+    }
+    stats.fp_reads = fp_reads.len() as u64;
+    stats.integrity_checks = fnts.len() as u64;
+
     // ---- 1+2+3: chains + wasm + taint ------------------------------------
     let mut chains: HashMap<(u64, String, String), usize> = HashMap::new();
     let mut chain_list: Vec<Chain> = Vec::new();
@@ -356,11 +529,14 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     let mut wasm_seen: HashMap<String, ()> = HashMap::new();
 
     for r in &recs {
-        let payload = match fs::read(raw_dir.join(&r.path)) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
+        // payloads are read ONLY for the kinds that need the full bytes
+        // (script-source and wasm-module are never batched; the batched
+        // kinds are consumed through their index txt previews above)
         if r.kind == "script-source" {
+            let payload = match read_payload(&raw_dir, r) {
+                Some(p) => p,
+                None => continue,
+            };
             let (name, body) = name_of(&payload);
             if body.is_empty() {
                 continue;
@@ -380,9 +556,13 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                     );
                     let fpath = scripts_dir.join(sanitize(&fname));
                     let file = fs::File::create(&fpath).ok();
+                    let (iso, display) = split_iso(&name);
+                    // join the worker name for this isolate (latest worker
+                    // record at or before this fragment)
+                    let worker = worker_name_for(&workers, r.ts, &iso);
                     let c = Chain {
                         file,
-                        name: name.clone(),
+                        name: display,
                         frags: 0,
                         bytes: 0,
                         hot: false,
@@ -390,6 +570,12 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                         last_ts: r.ts,
                         path: format!("filtered/scripts/{}", fname),
                         trigger: None,
+                        iso,
+                        worker,
+                        fp_reads: Vec::new(),
+                        integrity: 0,
+                        integrity_samples: Vec::new(),
+                        clock_reads: 0,
                     };
                     chain_list.push(c);
                     chains.insert(key, idx);
@@ -426,20 +612,61 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                 continue;
             }
             wasm_seen.insert(r.h.clone(), ());
+            let payload = match read_payload(&raw_dir, r) {
+                Some(p) => p,
+                None => continue,
+            };
             let wp = wasm_dir.join(format!("{}.wasm", &r.h[..16.min(r.h.len())]));
             if fs::write(&wp, &payload).is_ok() {
                 let (im, ex) = wasm_imports_exports(&payload);
                 stats.wasm_modules += 1;
                 stats.wasm_imports += im.len() as u64;
                 stats.wasm_exports += ex.len() as u64;
-                wasm_index.push(json!({
+                // v6: attach the imports AS RESOLVED at instantiation -
+                // the closest following wasm-instantiate of the same pid
+                let mut entry = json!({
                     "hash": r.h,
                     "bytes": payload.len(),
                     "ts": r.ts,
                     "pid": r.pid,
                     "imports": im.iter().take(256).cloned().collect::<Vec<_>>(),
                     "exports": ex.iter().take(256).cloned().collect::<Vec<_>>(),
-                }));
+                });
+                let hdr = wasm_inst
+                    .iter()
+                    .find(|(ts, pid, header, _)| *header && *pid == r.pid && *ts >= r.ts && *ts <= r.ts + WASM_INST_WINDOW_NS);
+                if let Some((hts, _, _, txt)) = hdr {
+                    let n = txt
+                        .split("imports=")
+                        .nth(1)
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(0);
+                    entry["instantiated"] = json!(true);
+                    entry["instantiated_imports"] = json!(n);
+                    // resolved import names: the wasm-import records after
+                    // that header, same pid, until the next header
+                    let mut resolved: Vec<String> = Vec::new();
+                    for (ts, pid, header, txt) in wasm_inst.iter() {
+                        if *pid != r.pid || *ts <= *hts || *ts > *hts + WASM_INST_WINDOW_NS {
+                            continue;
+                        }
+                        if *header {
+                            break; // next instantiate took over
+                        }
+                        if let Some(name) = txt.strip_prefix("wasm-import ") {
+                            let name = name.split(" kind=").next().unwrap_or(name);
+                            if !resolved.contains(&name.to_string()) {
+                                resolved.push(name.to_string());
+                            }
+                            if resolved.len() >= 256 {
+                                break;
+                            }
+                        }
+                    }
+                    entry["resolved_imports"] = json!(resolved);
+                    stats.wasm_instantiated += 1;
+                }
+                wasm_index.push(entry);
             }
         }
     }
@@ -462,6 +689,43 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             c.hot = true;
             c.trigger = Some(t);
         }
+    }
+
+    // v6 taint columns: fingerprint reads / integrity checks / clock
+    // cadence INSIDE each chain's materialization window
+    for c in &mut chain_list {
+        let lo = c.first_ts;
+        let hi = c.last_ts.saturating_add(FP_GRACE_NS);
+        let mut seen: Vec<&'static str> = Vec::new();
+        let a = fp_reads.partition_point(|x| x.ts < lo);
+        let b = fp_reads.partition_point(|x| x.ts <= hi);
+        for fr in &fp_reads[a..b] {
+            if !seen.contains(&fr.needle) {
+                seen.push(fr.needle);
+            }
+        }
+        if !seen.is_empty() {
+            c.fp_reads = seen.iter().map(|s| s.to_string()).take(32).collect();
+            if c.fp_reads.len() >= 2 {
+                // two or more distinct fingerprint probes while this
+                // chain's fragments materialized - the antifraud pattern
+                c.hot = true;
+                stats.fp_chains += 1;
+            }
+        }
+        let fa = fnts.partition_point(|x| x.0 < lo);
+        let fb = fnts.partition_point(|x| x.0 <= hi);
+        c.integrity = (fb - fa) as u64;
+        if c.integrity > 0 {
+            stats.integrity_chains += 1;
+            c.integrity_samples = fnts[fa..fb.min(fa + 8)]
+                .iter()
+                .map(|(_, t)| txt_head(t, 120))
+                .collect();
+        }
+        let ca = clock_ts.partition_point(|x| *x < lo);
+        let cb = clock_ts.partition_point(|x| *x <= hi);
+        c.clock_reads = (cb - ca) as u64;
     }
 
     let mut hot = 0usize;
@@ -507,12 +771,35 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                 "what": t.what,
             });
         }
+        if let Some(iso) = &c.iso {
+            entry["isolate"] = json!(iso);
+        }
+        if let Some(w) = &c.worker {
+            entry["worker"] = json!(w);
+        }
+        if !c.fp_reads.is_empty() {
+            entry["fp_reads"] = json!(c.fp_reads);
+        }
+        if c.integrity > 0 {
+            entry["integrity_checks"] = json!(c.integrity);
+            entry["integrity_samples"] = json!(c.integrity_samples);
+        }
+        if c.clock_reads > 0 {
+            entry["clock_reads"] = json!(c.clock_reads);
+        }
+        if let Some(t0) = nav_start {
+            if c.first_ts >= t0 {
+                entry["ts0_rel_ms"] = json!((c.first_ts - t0) / 1_000_000);
+                entry["ts1_rel_ms"] = json!((c.last_ts - t0) / 1_000_000);
+            }
+        }
         chain_report.push(entry);
     }
 
     // ---- 4: timing chains: trigger -> network ------------------------------
     // recs are ts-sorted; a moving cursor finds, for every network request,
-    // the latest trigger (input/event/timer/dom/fingerprint) before it.
+    // the latest trigger (input/event/timer/dom/fingerprint) before it, and
+    // the v6 taint columns for the payload-formation window before the send.
     let mut net_chains: Vec<serde_json::Value> = Vec::new();
     let mut cursor = 0usize;
     let mut best: Option<usize> = None;
@@ -523,7 +810,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             }
             cursor += 1;
         }
-        let entry = match best.map(|i| &recs[i]) {
+        let mut entry = match best.map(|i| &recs[i]) {
             Some(t) if r.ts.saturating_sub(t.ts) <= 250_000_000 => json!({
                 "t_net": r.ts,
                 "url": r.txt.as_deref().map(|s| txt_head(s, 160)).unwrap_or_default(),
@@ -540,6 +827,35 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                 "trigger": serde_json::Value::Null,
             }),
         };
+        // v6: what fed this request - fingerprint reads, integrity checks
+        // and clock cadence in the NET_FP_WINDOW_NS before the send
+        let lo = r.ts.saturating_sub(NET_FP_WINDOW_NS);
+        let a = fp_reads.partition_point(|x| x.ts < lo);
+        let b = fp_reads.partition_point(|x| x.ts <= r.ts);
+        if b > a {
+            let mut seen: Vec<&'static str> = Vec::new();
+            for fr in &fp_reads[a..b] {
+                if !seen.contains(&fr.needle) {
+                    seen.push(fr.needle);
+                }
+            }
+            entry["fp_reads_5s"] = json!(seen.iter().map(|s| s.to_string()).take(64).collect::<Vec<_>>());
+        }
+        let fa = fnts.partition_point(|x| x.0 < lo);
+        let fb = fnts.partition_point(|x| x.0 <= r.ts);
+        if fb > fa {
+            entry["integrity_5s"] = json!((fb - fa) as u64);
+        }
+        let ca = clock_ts.partition_point(|x| *x < lo);
+        let cb = clock_ts.partition_point(|x| *x <= r.ts);
+        if cb > ca {
+            entry["clock_5s"] = json!((cb - ca) as u64);
+        }
+        if let Some(t0) = nav_start {
+            if r.ts >= t0 {
+                entry["t_net_rel_ms"] = json!((r.ts - t0) / 1_000_000);
+            }
+        }
         if net_chains.len() < 4000 {
             net_chains.push(entry);
         }
@@ -554,6 +870,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     let report = json!({
         "records": stats.records,
         "records_indexed": recs.len(),
+        "nav_start_ts": nav_start,
         "per_kind": per_kind,
         "scripts": {
             "fragments": stats.fragments,
@@ -563,8 +880,16 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "keep_cold": stats.keep_cold,
             "chain_bytes": stats.chain_bytes,
         },
+        "taint": {
+            "fp_reads": stats.fp_reads,
+            "fp_chains": stats.fp_chains,
+            "integrity_checks": stats.integrity_checks,
+            "integrity_chains": stats.integrity_chains,
+            "clock_reads": clock_ts.len(),
+        },
         "wasm": {
             "modules": stats.wasm_modules,
+            "instantiated": stats.wasm_instantiated,
             "imports": stats.wasm_imports,
             "exports": stats.wasm_exports,
             "index": wasm_index,
@@ -578,6 +903,21 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     );
 
     Ok(stats)
+}
+
+/// latest worker record at or before `ts` with this isolate pointer
+fn worker_name_for(workers: &[(u64, String, String)], ts: u64, iso: &Option<String>) -> Option<String> {
+    let iso = iso.as_ref()?;
+    let mut name: Option<&(u64, String, String)> = None;
+    for w in workers {
+        if w.0 <= ts && &w.1 == iso {
+            match name {
+                Some(n) if n.0 >= w.0 => {}
+                _ => name = Some(w),
+            }
+        }
+    }
+    name.map(|w| w.2.clone())
 }
 
 fn sanitize(s: &str) -> String {
@@ -626,6 +966,65 @@ mod tests {
         assert!(!is_hot("cold.js", b"var a=1;"));
     }
 
+    #[test]
+    fn iso_split_and_worker_join() {
+        let (iso, name) = split_iso("iso:0x7f00 https://af.io/main.js");
+        assert_eq!(iso.as_deref(), Some("0x7f00"));
+        assert_eq!(name, "https://af.io/main.js");
+        let (iso, name) = split_iso("plain.js");
+        assert!(iso.is_none());
+        assert_eq!(name, "plain.js");
+
+        let (iso, w) = worker_of("worker-scope iso=0x7f00 name=sw.js secure=1").unwrap();
+        assert_eq!(iso, "0x7f00");
+        assert_eq!(w, "sw.js");
+        let workers = vec![(100u64, "0x7f00".into(), "sw.js".into())];
+        assert_eq!(
+            worker_name_for(&workers, 200, &Some("0x7f00".into())),
+            Some("sw.js".into())
+        );
+        assert_eq!(worker_name_for(&workers, 200, &None), None);
+        assert_eq!(
+            worker_name_for(&workers, 50, &Some("0x7f00".into())),
+            None // before the worker existed
+        );
+    }
+
+    #[test]
+    fn fp_needle_match() {
+        assert_eq!(
+            fp_needle_of("dom Navigator.get userAgent"),
+            Some("Navigator.get userAgent")
+        );
+        assert_eq!(
+            fp_needle_of("dom WebGLRenderingContext.call getParameter"),
+            Some("getParameter")
+        );
+        assert_eq!(fp_needle_of("dom Document.getElementById"), None);
+    }
+
+    #[test]
+    fn batched_payload_slice() {
+        // two records share one part file: [rec0][rec1]
+        let dir = std::env::temp_dir().join("afeye-batched-test");
+        let _ = fs::create_dir_all(&dir);
+        let p = dir.join("blink-dom-api-p0000.bin");
+        let _ = fs::write(&p, b"dom Navigator.get userAgent|dom Screen.get width");
+        let r0 = Rec {
+            ts: 1, pid: 1, layer: "blink".into(), kind: "dom-api".into(),
+            len: 27, h: String::new(), path: p.to_string_lossy().into(),
+            off: Some(0), txt: None,
+        };
+        let r1 = Rec {
+            ts: 2, pid: 1, layer: "blink".into(), kind: "dom-api".into(),
+            len: 20, h: String::new(), path: p.to_string_lossy().into(),
+            off: Some(28), txt: None,
+        };
+        assert_eq!(read_payload(&dir, &r0).unwrap(), b"dom Navigator.get userAgent");
+        assert_eq!(read_payload(&dir, &r1).unwrap(), b"dom Screen.get width");
+        let _ = fs::remove_file(&p);
+    }
+
     fn tr(ts: u64, kind: &str) -> Rec {
         Rec {
             ts,
@@ -635,23 +1034,25 @@ mod tests {
             len: 8,
             h: String::new(),
             path: String::new(),
+            off: None,
             txt: Some("evt mousemove".into()),
         }
     }
 
     #[test]
     fn trigger_correlation_window() {
+        // ns timestamps, 250 ms window = 250_000_000 ns
         let mut recs = vec![
-            tr(1_000_000_000, "script-source"),
-            tr(1_000_010_000, "event-dispatch"),
-            tr(1_000_200_000, "script-source"),
+            tr(100_000_000_000, "script-source"),
+            tr(100_010_000_000, "event-dispatch"), // +10 ms
+            tr(100_200_000_000, "script-source"),   // +200 ms
         ];
         recs.sort_by_key(|r| r.ts);
         // 90ms after the dispatch -> inside the 250ms window
-        let t = latest_trigger_before(&recs, 1_000_100_000, 250_000_000).unwrap();
+        let t = latest_trigger_before(&recs, 100_100_000_000, 250_000_000).unwrap();
         assert_eq!(t.kind, "event-dispatch");
         // 400ms after the dispatch -> outside
-        assert!(latest_trigger_before(&recs, 1_000_410_000, 250_000_000).is_none());
+        assert!(latest_trigger_before(&recs, 100_410_000_000, 250_000_000).is_none());
         // before anything -> nothing
         assert!(latest_trigger_before(&recs, 10, 250_000_000).is_none());
     }

@@ -11,41 +11,304 @@
  
  #include <algorithm>
  #include <bitset>
-@@ -3359,6 +3363,16 @@
+@@ -2527,6 +2531,17 @@
+ }
+ 
+ int Element::clientWidth() {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[128];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "dom/client-w tag=%.48s ctx=%.48s",
++                  tagName().Utf8().c_str(),
++                  blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
+   // When in strict mode, clientWidth for the document element should return the
+   // width of the containing frame.
+   // When in quirks mode, clientWidth for the body element should return the
+@@ -2570,6 +2585,17 @@
+ }
+ 
+ int Element::clientHeight() {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[128];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "dom/client-h tag=%.48s ctx=%.48s",
++                  tagName().Utf8().c_str(),
++                  blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
+   // When in strict mode, clientHeight for the document element should return
+   // the height of the containing frame.
+   // When in quirks mode, clientHeight for the body element should return the
+@@ -2828,6 +2854,17 @@
+ }
+ 
+ int Element::scrollWidth() {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[128];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "dom/scroll-w tag=%.48s ctx=%.48s",
++                  tagName().Utf8().c_str(),
++                  blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
+   if (!InActiveDocument()) {
+     return 0;
+   }
+@@ -2852,6 +2889,17 @@
+ }
+ 
+ int Element::scrollHeight() {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[128];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "dom/scroll-h tag=%.48s ctx=%.48s",
++                  tagName().Utf8().c_str(),
++                  blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
+   if (!InActiveDocument()) {
+     return 0;
+   }
+@@ -3359,6 +3407,17 @@
  }
  
  DOMRectList* Element::getClientRects() {
 +#ifdef BLINK_AFEYE
 +  if (blink::afeye::Enabled()) {
-+    char afeye_buf[160];
++    char afeye_buf[128];
 +    std::snprintf(afeye_buf, sizeof(afeye_buf),
 +                  "dom/client-rects tag=%.48s ctx=%.48s",
-+                  tagName().Utf8().c_str(), blink::afeye::Tag());
-+    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
-+                          afeye_buf);
++                  tagName().Utf8().c_str(),
++                  blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric,
++                          blink::afeye::NowNs(), afeye_buf);
 +  }
 +#endif
    Vector<gfx::RectF> rects = GetClientRectsNoAdjustment();
    if (rects.empty()) {
      return MakeGarbageCollected<DOMRectList>();
-@@ -3462,6 +3476,16 @@
- }
- 
- DOMRect* Element::GetBoundingClientRectForBinding() {
+@@ -3465,7 +3524,31 @@
+   // TODO(crbug.com/1499981): This should be removed once synchronized scrolling
+   // impact is understood.
+   SyncScrollAttemptHeuristic::DidAccessScrollOffset();
+-  return GetBoundingClientRect();
 +#ifdef BLINK_AFEYE
 +  if (blink::afeye::Enabled()) {
 +    char afeye_buf[160];
 +    std::snprintf(afeye_buf, sizeof(afeye_buf),
 +                  "dom/bounding-rect tag=%.48s ctx=%.48s",
 +                  tagName().Utf8().c_str(), blink::afeye::Tag());
-+    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
-+                          afeye_buf);
++    blink::afeye::EmitStr(blink::afeye::kDomMetric,
++                          blink::afeye::NowNs(), afeye_buf);
 +  }
 +#endif
-   // TODO(crbug.com/1499981): This should be removed once synchronized scrolling
-   // impact is understood.
-   SyncScrollAttemptHeuristic::DidAccessScrollOffset();
-
++  DOMRect* afeye_rect = GetBoundingClientRect();
++#ifdef BLINK_AFEYE
++  // the RESULT of the measurement: the font-probe string's geometry lands
++  // here, not just the ask
++  if (blink::afeye::Enabled() && afeye_rect) {
++    char afeye_buf[192];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "dom/bounding-rect-r tag=%.48s x=%.2f y=%.2f w=%.2f h=%.2f",
++                  tagName().Utf8().c_str(), afeye_rect->x(), afeye_rect->y(),
++                  afeye_rect->width(), afeye_rect->height());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
++  return afeye_rect;
+ }
+ 
+ ContainerQueryList* Element::matchContainer(const String& query) {
+--- a/third_party/blink/renderer/core/html/html_element.cc
++++ b/third_party/blink/renderer/core/html/html_element.cc
+@@ -24,6 +24,10 @@
+  */
+ 
+ #include "third_party/blink/renderer/core/html/html_element.h"
++#ifdef BLINK_AFEYE
++#include <cstdio>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <iterator>
+ 
+@@ -4273,11 +4277,35 @@
+ }
+ 
+ int HTMLElement::offsetLeftForBinding() {
+-  return OffsetTopOrLeft(/*top=*/false);
++int afeye_v = OffsetTopOrLeft(/*top=*/false);
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[160];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "dom/offset-left tag=%.48s v=%d ctx=%.48s",
++                  tagName().Utf8().c_str(), afeye_v,
++                  blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
++  return afeye_v;
+ }
+ 
+ int HTMLElement::offsetTopForBinding() {
+-  return OffsetTopOrLeft(/*top=*/true);
++int afeye_v = OffsetTopOrLeft(/*top=*/true);
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[160];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "dom/offset-top tag=%.48s v=%d ctx=%.48s",
++                  tagName().Utf8().c_str(), afeye_v,
++                  blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
++  return afeye_v;
+ }
+ 
+ int HTMLElement::offsetWidthForBinding() {
+@@ -4287,6 +4315,17 @@
+   if (const auto* layout_object = GetLayoutBoxModelObject()) {
+     result = AdjustedOffsetForZoom(layout_object->OffsetWidth());
+   }
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[160];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "dom/offset-w tag=%.48s v=%d ctx=%.48s",
++                  tagName().Utf8().c_str(), result,
++                  blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
+   return result;
+ }
+ 
+@@ -4298,6 +4337,17 @@
+   if (const auto* layout_object = GetLayoutBoxModelObject()) {
+     result = AdjustedOffsetForZoom(layout_object->OffsetHeight());
+   }
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[160];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "dom/offset-h tag=%.48s v=%d ctx=%.48s",
++                  tagName().Utf8().c_str(), result,
++                  blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
+   return result;
+ }
+ 
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -24,6 +24,11 @@
+  */
+ 
+ #include "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h"
++#ifdef BLINK_AFEYE
++#include <cstdio>
++#include <string>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <inttypes.h>
+ 
+@@ -3874,6 +3879,15 @@
+ 
+ ScriptObject WebGLRenderingContextBase::getExtension(ScriptState* script_state,
+                                                      const String& name) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[128];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "webgl/get-extension name=%.64s", name.Utf8().c_str());
++    blink::afeye::EmitStr(blink::afeye::kFingerprint,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
+   ExecutionContext* context = ExecutionContext::From(script_state);
+ 
+   if (name == WebGLDebugRendererInfo::ExtensionName()) {
+@@ -3989,6 +4003,15 @@
+ 
+ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+                                                     GLenum pname) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[96];
++    std::snprintf(afeye_buf, sizeof(afeye_buf), "webgl/get-parameter pname=%u",
++                  static_cast<unsigned>(pname));
++    blink::afeye::EmitStr(blink::afeye::kFingerprint,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
+   if (isContextLost())
+     return ScriptValue::CreateNull(script_state->GetIsolate());
+   const int kIntZero = 0;
+@@ -4487,6 +4510,17 @@
+ WebGLShaderPrecisionFormat* WebGLRenderingContextBase::getShaderPrecisionFormat(
+     GLenum shader_type,
+     GLenum precision_type) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[128];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "webgl/shader-precision sh=%u pr=%u",
++                  static_cast<unsigned>(shader_type),
++                  static_cast<unsigned>(precision_type));
++    blink::afeye::EmitStr(blink::afeye::kFingerprint,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
+   if (isContextLost())
+     return nullptr;
+   if (!ValidateShaderType("getShaderPrecisionFormat", shader_type)) {
+@@ -4533,6 +4567,23 @@
+     }
+   }
+ 
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    // the enumerated extension list IS the fingerprint signal
++    std::string afeye_list;
++    for (const String& afeye_s : result) {
++      if (!afeye_list.empty()) afeye_list.push_back(',');
++      if (afeye_list.size() > 380) break;
++      afeye_list.append(afeye_s.Utf8());
++    }
++    char afeye_buf[448];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "webgl/supported-extensions n=%u list=%.384s",
++                  static_cast<unsigned>(result.size()), afeye_list.c_str());
++    blink::afeye::EmitStr(blink::afeye::kFingerprint,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
+   return result;
+ }
+ 
 --- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 +++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 @@ -3,6 +3,10 @@
@@ -95,7 +358,6 @@
    // The style resolution required for fonts is not available in frame-less
    // documents.
    HTMLCanvasElement* canvas = HostAsHTMLCanvasElement();
-
 --- a/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
 +++ b/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
 @@ -3,6 +3,9 @@
@@ -128,7 +390,6 @@
  
    // The actual rendering has been completed. Notify the context.
    PostCrossThreadTask(
-
 --- a/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc
 +++ b/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc
 @@ -29,6 +29,9 @@
@@ -181,7 +442,6 @@
    if (signaling_state_ ==
        webrtc::PeerConnectionInterface::SignalingState::kClosed) {
      exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
-
 --- a/third_party/blink/renderer/modules/mediastream/media_device_info.cc
 +++ b/third_party/blink/renderer/modules/mediastream/media_device_info.cc
 @@ -24,6 +24,10 @@
@@ -211,7 +471,6 @@
  
  String MediaDeviceInfo::deviceId() const {
    return device_id_;
-
 --- a/third_party/blink/renderer/modules/crypto/crypto.cc
 +++ b/third_party/blink/renderer/modules/crypto/crypto.cc
 @@ -27,6 +27,9 @@
@@ -242,7 +501,6 @@
    return array;
  }
  
-
 --- a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
 +++ b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
 @@ -29,6 +29,10 @@
@@ -346,7 +604,6 @@
    // Method described by:
    // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-deriveBits
  
-
 --- a/third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.cc
 +++ b/third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.cc
 @@ -29,6 +29,9 @@

@@ -2,7 +2,7 @@ diff --git a/third_party/blink/renderer/platform/afeye/sink.h b/third_party/blin
 new file mode 100644
 --- /dev/null
 +++ b/third_party/blink/renderer/platform/afeye/sink.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,58 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
 +#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
 +
@@ -32,6 +32,10 @@ new file mode 100644
 +  kAudio = 26,
 +  kWebrtc = 27,
 +  kFetch = 28,
++  // v6 additions (wire-compatible, new records only)
++  kDomApi = 29,
++  kWorker = 35,
++  kNavStart = 36,
 +};
 +
 +bool Enabled();

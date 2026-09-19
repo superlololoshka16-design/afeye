@@ -27,7 +27,7 @@ pub const DEFAULT_RAW_DIR: &str = "/tmp/afeye-raw";
 const MAX_RECORD: u32 = 16 + (1 << 20);
 const PREVIEW: usize = 4096;
 
-const KINDS: [&str; 29] = [
+const KINDS: [&str; 37] = [
     "sink-hello",
     "script-source",
     "bytecode-entry",
@@ -51,7 +51,7 @@ const KINDS: [&str; 29] = [
     "client-hints",
     "sw-cache",
     // kind 22: reserved. v4 emitted blink-hand-off script sources here (the
-    // 0007 duplicate); v5 captures every script exactly once at the three
+    // 0007 duplicate); v5+ captures every script exactly once at the three
     // v8 compile funnels (eval / streamed / buffered - patches/0002), so this
     // slot stays wire-compatible but silent.
     "script-source",
@@ -65,7 +65,42 @@ const KINDS: [&str; 29] = [
     "audio",
     "webrtc",
     "fetch",
+    // v6 additions (the deep layers of the same wire format):
+    // 29 dom-api     - every WebIDL attribute get/set + method call from JS
+    //                  ("dom Navigator.get userAgent"), via the
+    //                  idl_member_installer callback wrap (0008)
+    // 30 microtask   - drain start/end brackets with ran-count (0004)
+    // 31 wasm-instance - imports as RESOLVED at instantiation (0003)
+    // 32 fn-tostring - Function.prototype.toString receiver identity (0004)
+    // 33 clock       - Date.now() reads (0004)
+    // 34 isolate     - v8 isolate birth record (0003)
+    // 35 worker      - worker/worklet global scope creation (0010)
+    // 36 nav-start   - navigation T0 in the sink clock domain (0010)
+    "dom-api",
+    "microtask",
+    "wasm-instance",
+    "fn-tostring",
+    "clock",
+    "isolate",
+    "worker",
+    "nav-start",
 ];
+
+/// High-frequency small-record kinds are BATCHED: their payloads append to
+/// per-(layer,kind) part files (~8 MiB, rolled) instead of one file per
+/// record. The 10k-one-kilo-file problem dies here at the materialization
+/// layer; the index carries (part, offset, len) for every record and nothing
+/// is dropped or decided - batching is storage packing, not filtering.
+const BATCHED_KINDS: [&str; 7] = [
+    "dom-api",
+    "call-completed",
+    "event-dispatch",
+    "input",
+    "clock",
+    "microtask",
+    "timer",
+];
+const PART_ROLL_BYTES: u64 = 8 << 20;
 
 /// Highest valid kind byte the collector will accept in a record header.
 const MAX_KIND: u8 = (KINDS.len() - 1) as u8;
@@ -104,6 +139,17 @@ struct FileTail {
 pub struct ScanState {
     tails: HashMap<PathBuf, FileTail>,
     seq: u64,
+    parts: HashMap<String, PartWriter>,
+}
+
+/// Append-only part stream for a batched (layer, kind). Records of
+/// high-frequency kinds land here; the index lines carry (p, o, len).
+struct PartWriter {
+    file: std::fs::File,
+    /// part path relative to the collect dir ("raw/<layer>-<kind>-pNN.bin")
+    rel: String,
+    seq: u32,
+    written: u64,
 }
 
 impl ScanState {
@@ -111,8 +157,61 @@ impl ScanState {
         ScanState {
             tails: HashMap::new(),
             seq: 0,
+            parts: HashMap::new(),
         }
     }
+}
+
+impl PartWriter {
+    /// Append `payload`, rolling to a fresh part when the current one is
+    /// past the roll size. Returns (rel_path, offset).
+    fn push(&mut self, raw_out: &Path, layer: &str, kname: &str, payload: &[u8]) -> (String, u64) {
+        if self.written >= PART_ROLL_BYTES {
+            self.seq += 1;
+            let fname = format!("{}-{}-p{:04}.bin", layer, kname, self.seq);
+            let rel = format!("raw/{}", fname);
+            match OpenOptions::new().create(true).append(true).open(raw_out.join(&fname)) {
+                Ok(f) => {
+                    self.file = f;
+                    self.rel = rel;
+                    self.written = 0;
+                }
+                Err(_) => return (self.rel.clone(), self.written),
+            }
+        }
+        let off = self.written;
+        if self.file.write_all(payload).is_ok() {
+            self.written += payload.len() as u64;
+        }
+        (self.rel.clone(), off)
+    }
+}
+
+fn part_writer<'a>(
+    raw_out: &Path,
+    parts: &'a mut HashMap<String, PartWriter>,
+    layer: &str,
+    kname: &str,
+) -> Option<&'a mut PartWriter> {
+    let key = format!("{}/{}", layer, kname);
+    if !parts.contains_key(&key) {
+        let fname = format!("{}-{}-p0000.bin", layer, kname);
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(raw_out.join(&fname))
+            .ok()?;
+        parts.insert(
+            key.clone(),
+            PartWriter {
+                file: f,
+                rel: format!("raw/{}", fname),
+                seq: 0,
+                written: 0,
+            },
+        );
+    }
+    parts.get_mut(&key)
 }
 
 pub struct Collector {
@@ -278,11 +377,6 @@ pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &
             let payload = &rec[16..];
             state.seq += 1;
             let kname = kind_name(kind);
-            let fname = format!("{}-{}-{:06}.bin", layer, kname, state.seq);
-            let fpath = raw_out.join(&fname);
-            let _ = fs::write(&fpath, payload);
-            let hash = blake3::hash(payload);
-            let h16: String = hash.to_hex()[..16].to_string();
             let key = format!("{}/{}", layer, kname);
             *stats.per.entry(key).or_insert(0) += 1;
             stats.records += 1;
@@ -296,7 +390,7 @@ pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &
             if ts > stats.last_ts {
                 stats.last_ts = ts;
             }
-            let mut j = J::new(128 + PREVIEW + fname.len());
+            let mut j = J::new(160 + PREVIEW);
             j.open();
             j.fkey("ts");
             j.u64v(ts);
@@ -312,10 +406,32 @@ pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &
                 j.key("f");
                 j.u64v(flags as u64);
             }
+            let hash = blake3::hash(payload);
+            let h16: String = hash.to_hex()[..16].to_string();
             j.key("h");
             j.s(&h16);
-            j.key("p");
-            j.s(&format!("raw/{}", fname));
+            if BATCHED_KINDS.contains(&kname) && !payload.is_empty() {
+                // batched kinds: append to the (layer,kind) part stream and
+                // reference (part, offset). Storage packing only - the
+                // filter unpacks by (p, o, len) and nothing is lost.
+                if let Some(pw) = part_writer(&raw_out, &mut state.parts, layer, kname) {
+                    let (rel, off) = pw.push(&raw_out, layer, kname, payload);
+                    j.key("p");
+                    j.s(&rel);
+                    j.key("o");
+                    j.u64v(off);
+                } else {
+                    let fname = format!("{}-{}-{:06}.bin", layer, kname, state.seq);
+                    let _ = fs::write(raw_out.join(&fname), payload);
+                    j.key("p");
+                    j.s(&format!("raw/{}", fname));
+                }
+            } else {
+                let fname = format!("{}-{}-{:06}.bin", layer, kname, state.seq);
+                let _ = fs::write(raw_out.join(&fname), payload);
+                j.key("p");
+                j.s(&format!("raw/{}", fname));
+            }
             if let Some(txt) = text_preview(payload) {
                 j.key("txt");
                 j.s(&txt);
