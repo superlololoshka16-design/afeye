@@ -63,6 +63,9 @@ sudo ./build/install-build-deps.sh --no-arm >/dev/null 2>&1 || \
 
 # ---- 4. patches (the series applies cumulatively - a failure here is a
 # patch/anchor bug and must abort loudly, not silently produce stock chrome)
+# v5: seven patches, grouped by layer (v8 scripts / v8 calls+wasm / blink
+# sink / blink flow / blink probes / net wire). Only these files ever
+# recompile after a warm ccache - the rest of the graph is cache hits.
 REPO_ROOT="${REPO_ROOT:-$GITHUB_WORKSPACE}"
 # plain git apply, NOT --3way: v8/ is a nested git repo in a gclient checkout,
 # its blobs are not in chromium/src's index, and --3way dies on that. The
@@ -76,6 +79,11 @@ done
 # ---- 5. ccache
 export CCACHE_DIR
 ccache -M 9G >/dev/null 2>&1 || ccache --max-size=9G >/dev/null || true
+# zero the counters so the stats printed after the build describe THIS run:
+# hits = files that did NOT recompile (unchanged vs the cache), misses = the
+# files we actually changed. "Only the files we patch compile" - here it is
+# in numbers, every run.
+ccache -z >/dev/null 2>&1 || true
 
 # ---- 6. gn gen - fast args
 gn gen "$OUT_REL" --args="$(cat <<'EOF'
@@ -116,7 +124,12 @@ if [ $rc -ne 0 ] && [ $rc -ne 124 ]; then
 fi
 if [ ! -x "$OUT_REL/$NINJA_TARGET" ]; then
   echo "== $NINJA_TARGET not ready yet (rc=$rc) - window exhausted, cache saved, next run resumes =="
+  ccache -s 2>/dev/null | sed 's/^/  ccache: /' || true
   exit 42
 fi
 echo "== built: $OUT_REL/$NINJA_TARGET =="
+# honest per-run compile accounting: cache hits are the translation units that
+# did NOT recompile; misses are (roughly) the files the patch series touches
+# plus cold misses on a fresh runner.
+ccache -s 2>/dev/null | sed 's/^/  ccache: /' || true
 exit 0

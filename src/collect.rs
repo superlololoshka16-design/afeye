@@ -50,12 +50,15 @@ const KINDS: [&str; 29] = [
     "websocket",
     "client-hints",
     "sw-cache",
-    // kind 22: blink-layer script source (patches/0007) - same executing
-    // script as the v8 layer, captured at the blink hand-off with the
-    // document-resolved URL for provenance.
+    // kind 22: reserved. v4 emitted blink-hand-off script sources here (the
+    // 0007 duplicate); v5 captures every script exactly once at the three
+    // v8 compile funnels (eval / streamed / buffered - patches/0002), so this
+    // slot stays wire-compatible but silent.
     "script-source",
     // kinds 23-28 (v4): input / event dispatch / dom+canvas metrics /
     // offline audio render / webrtc sdp-ice / renderer-side fetch origin.
+    // v5 note: kind 23 (pre-dispatch input) is silent too - the single
+    // EventDispatcher funnel already carries coords/keys/isTrusted.
     "input",
     "event-dispatch",
     "dom-metric",

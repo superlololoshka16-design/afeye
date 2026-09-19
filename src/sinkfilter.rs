@@ -1,4 +1,4 @@
-//! afeye sink deep-filter (v4).
+//! afeye sink deep-filter (v5).
 //!
 //! Post-run pass over `collect/index.jsonl` + `collect/raw/*.bin` (what the
 //! patched C++ sinks streamed). The raw collector materializes EVERY record
@@ -15,8 +15,11 @@
 //!     reaches for is visible without executing anything.
 //!  3. backward slicing (taint) - a chain is HOT when its code carries a
 //!     network/collector sink call (fetch/XHR/beacon/WebSocket/canvas/audio/
-//!     webrtc probes) or when it compiled inside an event handler / timer
-//!     (ambient `evt:` / `timer:` provenance baked in by the C++ side).
+//!     webrtc probes) OR when it was compiled inside a handler / timer:
+//!     v5 links that by TIME (closest preceding event/timer record within
+//!     AF_SCRIPT_TRIGGER_MS, default 250 ms - the v4 blink-layer ambient
+//!     tag is gone with the blink duplicate, and the correlation lives
+//!     here, in the external filter, where it belongs).
 //!     Cold chains are counted and dropped - dead branches that never reach
 //!     the token do not waste disk.
 //!  4. timing chains - for every network request the closest preceding
@@ -262,6 +265,45 @@ struct Chain {
     first_ts: u64,
     last_ts: u64,
     path: String,
+    // v5: what was running when this chain first materialized - the closest
+    // preceding event/timer/crypto/... record inside the trigger window.
+    trigger: Option<TriggerRef>,
+}
+
+#[derive(Debug, Clone)]
+struct TriggerRef {
+    kind: String,
+    ts: u64,
+    what: String,
+}
+
+/// The latest trigger record at or before `ts`, within `window_ns`.
+/// recs must be ts-sorted (they are - `recs.sort_by_key` runs before).
+fn latest_trigger_before(recs: &[Rec], ts: u64, window_ns: u64) -> Option<TriggerRef> {
+    // rightmost index with rec.ts <= ts (binary search - this runs per chain)
+    let hi = recs.partition_point(|r| r.ts <= ts);
+    let floor = ts.saturating_sub(window_ns);
+    let mut walked = 0usize;
+    let mut i = hi;
+    while i > 0 {
+        let r = &recs[i - 1];
+        if r.ts < floor {
+            break;
+        }
+        walked += 1;
+        if walked > 4096 {
+            break; // dense noise (mousemove storm) - bounded walk
+        }
+        if TRIGGER_KINDS.contains(&r.kind.as_str()) {
+            return Some(TriggerRef {
+                kind: r.kind.clone(),
+                ts: r.ts,
+                what: r.txt.as_deref().map(|s| txt_head(s, 120)).unwrap_or_default(),
+            });
+        }
+        i -= 1;
+    }
+    None
 }
 
 pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
@@ -347,6 +389,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                         first_ts: r.ts,
                         last_ts: r.ts,
                         path: format!("filtered/scripts/{}", fname),
+                        trigger: None,
                     };
                     chain_list.push(c);
                     chains.insert(key, idx);
@@ -402,6 +445,25 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     }
 
     // drop cold chains from disk (they stay counted in the report)
+    //
+    // v5 trigger correlation: a chain whose FIRST fragment materialized
+    // right after an event/timer/... record was compiled inside that
+    // handler/timer - the exact information the v4 ambient tag carried at
+    // the (now removed) blink hand-off, reconstructed here externally.
+    let trigger_window_ns: u64 = {
+        let ms: u64 = std::env::var("AF_SCRIPT_TRIGGER_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(250);
+        ms.saturating_mul(1_000_000)
+    };
+    for c in &mut chain_list {
+        if let Some(t) = latest_trigger_before(&recs, c.first_ts, trigger_window_ns) {
+            c.hot = true;
+            c.trigger = Some(t);
+        }
+    }
+
     let mut hot = 0usize;
     let mut cold = 0usize;
     let mut chain_report = Vec::new();
@@ -428,7 +490,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     stats.cold_chains = cold as u64;
 
     for c in chain_list.iter().filter(|c| !c.path.is_empty()).take(4000) {
-        chain_report.push(json!({
+        let mut entry = json!({
             "name": printable(&c.name, 200),
             "frags": c.frags,
             "bytes": c.bytes,
@@ -436,7 +498,16 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "ts0": c.first_ts,
             "ts1": c.last_ts,
             "path": c.path,
-        }));
+        });
+        if let Some(t) = &c.trigger {
+            entry["trigger"] = json!({
+                "kind": t.kind,
+                "ts": t.ts,
+                "delta_ms": (c.first_ts - t.ts) / 1_000_000,
+                "what": t.what,
+            });
+        }
+        chain_report.push(entry);
     }
 
     // ---- 4: timing chains: trigger -> network ------------------------------
@@ -553,5 +624,35 @@ mod tests {
         assert_eq!(b, b"fetch('/t')");
         assert!(is_hot(&n, &b));
         assert!(!is_hot("cold.js", b"var a=1;"));
+    }
+
+    fn tr(ts: u64, kind: &str) -> Rec {
+        Rec {
+            ts,
+            pid: 1,
+            layer: "blink".into(),
+            kind: kind.into(),
+            len: 8,
+            h: String::new(),
+            path: String::new(),
+            txt: Some("evt mousemove".into()),
+        }
+    }
+
+    #[test]
+    fn trigger_correlation_window() {
+        let mut recs = vec![
+            tr(1_000_000_000, "script-source"),
+            tr(1_000_010_000, "event-dispatch"),
+            tr(1_000_200_000, "script-source"),
+        ];
+        recs.sort_by_key(|r| r.ts);
+        // 90ms after the dispatch -> inside the 250ms window
+        let t = latest_trigger_before(&recs, 1_000_100_000, 250_000_000).unwrap();
+        assert_eq!(t.kind, "event-dispatch");
+        // 400ms after the dispatch -> outside
+        assert!(latest_trigger_before(&recs, 1_000_410_000, 250_000_000).is_none());
+        // before anything -> nothing
+        assert!(latest_trigger_before(&recs, 10, 250_000_000).is_none());
     }
 }

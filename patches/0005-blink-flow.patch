@@ -1,0 +1,158 @@
+--- a/third_party/blink/renderer/core/dom/events/event_dispatcher.cc
++++ b/third_party/blink/renderer/core/dom/events/event_dispatcher.cc
+@@ -26,6 +26,13 @@
+  */
+ 
+ #include "third_party/blink/renderer/core/dom/events/event_dispatcher.h"
++#ifdef BLINK_AFEYE
++#include <cstdio>
++#include <string>
++#include "third_party/blink/renderer/core/events/keyboard_event.h"
++#include "third_party/blink/renderer/core/events/mouse_event.h"
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <optional>
+ 
+@@ -72,6 +79,49 @@
+ DispatchEventResult EventDispatcher::DispatchEvent(Node& node, Event& event) {
+   TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("blink.debug"),
+                "EventDispatcher::dispatchEvent");
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    const std::string afeye_type = event.type().Utf8();
++    const std::string afeye_node = node.nodeName().Utf8();
++    char afeye_buf[256];
++    int afeye_n = std::snprintf(afeye_buf, sizeof(afeye_buf),
++                                 "evt %s trusted=%d target=%.48s",
++                                 afeye_type.c_str(),
++                                 event.isTrusted() ? 1 : 0,
++                                 afeye_node.c_str());
++    if (afeye_n > 0) {
++      blink::afeye::EmitStr(blink::afeye::kEventDispatch,
++                            blink::afeye::NowNs(), afeye_buf);
++    }
++    if (auto* afeye_me = DynamicTo<MouseEvent>(&event)) {
++      char afeye_m[192];
++      int afeye_mn = std::snprintf(
++          afeye_m, sizeof(afeye_m),
++          "evt-mouse %s x=%.1f y=%.1f sx=%.0f sy=%.0f btn=%d",
++          afeye_type.c_str(), afeye_me->clientX(), afeye_me->clientY(),
++          afeye_me->screenX(), afeye_me->screenY(),
++          static_cast<int>(afeye_me->button()));
++      if (afeye_mn > 0) {
++        blink::afeye::EmitStr(blink::afeye::kEventDispatch,
++                              blink::afeye::NowNs(), afeye_m);
++      }
++    } else if (auto* afeye_ke = DynamicTo<KeyboardEvent>(&event)) {
++      char afeye_k[128];
++      int afeye_kn = std::snprintf(
++          afeye_k, sizeof(afeye_k), "evt-key %s key=%.24s code=%.24s",
++          afeye_type.c_str(), afeye_ke->key().Utf8().c_str(),
++          afeye_ke->code().Utf8().c_str());
++      if (afeye_kn > 0) {
++        blink::afeye::EmitStr(blink::afeye::kEventDispatch,
++                              blink::afeye::NowNs(), afeye_k);
++      }
++    }
++    char afeye_tag[64];
++    std::snprintf(afeye_tag, sizeof(afeye_tag), "evt:%.48s",
++                  afeye_type.c_str());
++    blink::afeye::SetTag(afeye_tag);
++  }
++#endif
+ #if DCHECK_IS_ON()
+   DCHECK(!EventDispatchForbiddenScope::IsEventDispatchForbidden());
+ #endif
+
+--- a/third_party/blink/renderer/core/scheduler/dom_timer.cc
++++ b/third_party/blink/renderer/core/scheduler/dom_timer.cc
+@@ -24,6 +24,10 @@
+  *
+  */
+ #include "third_party/blink/renderer/core/scheduler/dom_timer.h"
++#ifdef BLINK_AFEYE
++#include <cstdio>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <limits>
+ 
+@@ -300,6 +304,18 @@
+       // Step 9:
+       nesting_level_(DOMTimerCoordinator::From(context).TimerNestingLevel()),
+       action_(action) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[128];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "timer-install id=%u timeout_ms=%lld single=%d",
++                  static_cast<unsigned>(timeout_id_),
++                  static_cast<long long>(timeout.InMilliseconds()),
++                  single_shot ? 1 : 0);
++    blink::afeye::EmitStr(blink::afeye::kTimer, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
+   DCHECK_GT(timeout_id_, 0);
+ 
+   // Step 10:
+@@ -400,6 +416,21 @@
+   ExecutionContext* context = GetExecutionContext();
+   DCHECK(context);
+   DOMTimerCoordinator::From(*context).SetTimerNestingLevel(nesting_level_);
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[96];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "timer-fire id=%u nesting=%u",
++                  static_cast<unsigned>(timeout_id_),
++                  static_cast<unsigned>(nesting_level_));
++    blink::afeye::EmitStr(blink::afeye::kTimer, blink::afeye::NowNs(),
++                          afeye_buf);
++    char afeye_tag[24];
++    std::snprintf(afeye_tag, sizeof(afeye_tag), "timer:%u",
++                  static_cast<unsigned>(timeout_id_));
++    blink::afeye::SetTag(afeye_tag);
++  }
++#endif
+   DCHECK(!context->IsContextPaused());
+   // Only the first execution of a multi-shot timer should get an affirmative
+   // user gesture indicator.
+
+--- a/third_party/blink/renderer/platform/loader/fetch/resource_fetcher.cc
++++ b/third_party/blink/renderer/platform/loader/fetch/resource_fetcher.cc
+@@ -26,6 +26,11 @@
+ */
+ 
+ #include "third_party/blink/renderer/platform/loader/fetch/resource_fetcher.h"
++#ifdef BLINK_AFEYE
++#include <cstdio>
++#include <string>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <algorithm>
+ #include <limits>
+@@ -1387,6 +1392,21 @@
+       params.IsFromOriginDirtyStyleSheet());
+   TRACE_EVENT_BEGIN(TRACE_DISABLED_BY_DEFAULT("network"), "ResourceLoad",
+                     perfetto::Track(identifier), "url", resource_request.Url());
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[640];
++    std::string afeye_url = resource_request.Url().GetString().Utf8();
++    int afeye_n = std::snprintf(afeye_buf, sizeof(afeye_buf),
++                                "fetch url=%.440s type=%d ctx=%.60s",
++                                afeye_url.c_str(),
++                                static_cast<int>(factory.GetType()),
++                                blink::afeye::Tag());
++    if (afeye_n > 0) {
++      blink::afeye::EmitStr(blink::afeye::kFetch, blink::afeye::NowNs(),
++                            afeye_buf);
++    }
++  }
++#endif
+   absl::Cleanup record_times = [start = base::TimeTicks::Now(), &params] {
+     base::TimeDelta elapsed = base::TimeTicks::Now() - start;
+     base::UmaHistogramMicrosecondsTimes("Blink.Fetch.RequestResourceTime2",

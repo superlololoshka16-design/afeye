@@ -154,7 +154,7 @@ jobs:
           else
             gh release create "$TAG" /tmp/chrome.tgz /tmp/chrome.tgz.sha256 \
               --title "afeye $NINJA_TARGET $CHROMIUM_REF" \
-              --notes "Patched Chromium $CHROMIUM_REF with the afeye sink series v4 (patches/SERIES.md). Target: $NINJA_TARGET. Deep capture: executing-script chokepoints (v8+blink), raw trusted input, event dispatch, DOM/canvas/font metrics, offline audio, WebRTC SDP/ICE, wasm bytes, C++->JS call origin, renderer-side fetch provenance, full network wire. Restored via ccache; cron crawls download this asset instead of compiling."
+              --notes "Patched Chromium $CHROMIUM_REF with the afeye sink series v5 (7 patches, patches/SERIES.md). Target: $NINJA_TARGET. Raw capture at the verified chokepoints: every script source (v8 compile funnels - eval/streamed/buffered), wasm module bytes, C++->JS call origin, every event dispatch (isTrusted + coords + keys), timers, DOM/canvas/font metrics, offline audio, WebRTC SDP/ICE, device identities, crypto ops, structured clones, renderer-side fetch provenance, full network wire + WebSocket frames. Filtering (chain-merge + backward slicing + timing chains) is external, in src/sinkfilter.rs. ccache chain: after the first build only the patched translation units recompile."
           fi
           # marker into the repo tree so the main page shows the build state
           mkdir -p build

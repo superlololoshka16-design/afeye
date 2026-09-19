@@ -1,33 +1,28 @@
 --- a/v8/src/codegen/compiler.cc
 +++ b/v8/src/codegen/compiler.cc
-@@ -3,6 +3,11 @@
+@@ -3,6 +3,12 @@
  // found in the LICENSE file.
  
  #include "src/codegen/compiler.h"
 +#ifdef V8_AFEYE
 +#include <string>
++#include "include/v8-primitive.h"
 +#include "src/afeye/sink.h"
 +#include "src/objects/casting.h"
 +#endif
  
  #include <memory>
  #include <optional>
-@@ -3304,6 +3309,9 @@
-     LanguageMode language_mode, ParseRestriction restriction,
-     int parameters_end_pos, int eval_position,
-     ParsingWhileDebugging parsing_while_debugging) {
-+#ifdef V8_AFEYE
-+  AfeyeDumpScriptSource(isolate, source, "eval", MaybeHandle<Object>());
-+#endif
-   // The cache lookup key needs to be aware of the separation between the
-   // parameters and the body to prevent this valid invocation:
-   //   Function("", "function anonymous(\n/**/) {\n}");
-@@ -3944,6 +3952,36 @@
- }
- }  // namespace
+@@ -75,6 +81,39 @@
  
-+#ifdef V8_AFEYE
-+static void AfeyeDumpScriptSource(Isolate* isolate, Handle<String> source,
+ namespace {
+ 
++// afeye (v5): raw script-source dumper. ONE definition, placed before every
++// call site - the three compilation funnels below (eval, streamed, buffered)
++// all reach it. DirectHandle<String> accepts both Handle<String> and
++// DirectHandle<String> callers in every build configuration.
++static void AfeyeDumpScriptSource(Isolate* isolate,
++                                  DirectHandle<String> source,
 +                                  const char* fallback_name,
 +                                  MaybeHandle<Object> maybe_name) {
 +  if (!v8::afeye::Enabled() || !v8_flags.afeye_source) return;
@@ -54,12 +49,21 @@
 +  v8::afeye::EmitTwoStr(v8::afeye::kScriptSource, v8::afeye::NowNs(), name,
 +                        *utf8);
 +}
-+#endif
 +
- MaybeDirectHandle<SharedFunctionInfo> GetSharedFunctionInfoForScriptImpl(
-     Isolate* isolate, Handle<String> source,
-     const ScriptDetails& script_details, v8::Extension* extension,
-@@ -3953,6 +3991,10 @@
+ constexpr bool IsOSR(BytecodeOffset osr_offset) { return !osr_offset.IsNone(); }
+ 
+ class CompilerTracer : public AllStatic {
+@@ -3304,6 +3343,9 @@
+     LanguageMode language_mode, ParseRestriction restriction,
+     int parameters_end_pos, int eval_position,
+     ParsingWhileDebugging parsing_while_debugging) {
++#ifdef V8_AFEYE
++  AfeyeDumpScriptSource(isolate, source, "eval", MaybeHandle<Object>());
++#endif
+   // The cache lookup key needs to be aware of the separation between the
+   // parameters and the body to prevent this valid invocation:
+   //   Function("", "function anonymous(\n/**/) {\n}");
+@@ -3953,6 +3995,10 @@
      ScriptCompiler::CompileOptions compile_options,
      ScriptCompiler::NoCacheReason no_cache_reason, NativesFlag natives,
      ScriptCompiler::CompilationDetails* compilation_details) {
@@ -70,3 +74,14 @@
    ScriptCompileTimerScope compile_timer(isolate, no_cache_reason,
                                          compilation_details);
  
+@@ -4297,6 +4343,10 @@
+     const ScriptDetails& script_details, ScriptStreamingData* streaming_data,
+     IsCompiledScope* is_compiled_scope,
+     ScriptCompiler::CompilationDetails* compilation_details) {
++#ifdef V8_AFEYE
++  AfeyeDumpScriptSource(isolate, source, "script",
++                        script_details.name_obj);
++#endif
+   DCHECK(!script_details.origin_options.IsWasm());
+ 
+   ScriptCompileTimerScope compile_timer(
