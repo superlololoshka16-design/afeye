@@ -78,13 +78,24 @@ jobs:
             sudo mkdir -p /opt/afeye-chrome
             sudo tar xzf /tmp/chrome.tgz -C /opt/afeye-chrome
             sudo chmod -R a+rX /opt/afeye-chrome
-            CHROME_BIN=/opt/afeye-chrome/chrome
+            # the build target is headless_shell (half the browser, all the
+            # patched layers); fall back to a full chrome build if present
+            CHROME_BIN=/opt/afeye-chrome/headless_shell
+            if [ ! -x "$CHROME_BIN" ]; then
+              CHROME_BIN=/opt/afeye-chrome/chrome
+            fi
             test -x "$CHROME_BIN"
             # sink liveness probe: the patched build writes a sink-hello .rec
-            # before the first page even loads
+            # before the first page even loads. headless_shell needs no
+            # --headless switch; a full chrome binary does.
+            HEADLESS_FLAGS=""
+            case "$(basename "$CHROME_BIN")" in
+              headless_shell) ;;
+              *) HEADLESS_FLAGS="--headless=new --disable-gpu" ;;
+            esac
             rm -rf /tmp/afeye-smoke && mkdir -p /tmp/afeye-smoke
             AFEYE_SINK=1 AFEYE_RAW_DIR=/tmp/afeye-smoke \
-              "$CHROME_BIN" --headless=new --no-sandbox --disable-gpu \
+              "$CHROME_BIN" $HEADLESS_FLAGS --no-sandbox \
               --user-data-dir=/tmp/afeye-smoke-prof --dump-dom about:blank >/dev/null 2>&1 || true
             N=$(ls /tmp/afeye-smoke/ 2>/dev/null | wc -l)
             echo "sink smoke: $N record files"

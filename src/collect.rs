@@ -27,7 +27,7 @@ pub const DEFAULT_RAW_DIR: &str = "/tmp/afeye-raw";
 const MAX_RECORD: u32 = 16 + (1 << 20);
 const PREVIEW: usize = 4096;
 
-const KINDS: [&str; 23] = [
+const KINDS: [&str; 29] = [
     "sink-hello",
     "script-source",
     "bytecode-entry",
@@ -54,6 +54,14 @@ const KINDS: [&str; 23] = [
     // script as the v8 layer, captured at the blink hand-off with the
     // document-resolved URL for provenance.
     "script-source",
+    // kinds 23-28 (v4): input / event dispatch / dom+canvas metrics /
+    // offline audio render / webrtc sdp-ice / renderer-side fetch origin.
+    "input",
+    "event-dispatch",
+    "dom-metric",
+    "audio",
+    "webrtc",
+    "fetch",
 ];
 
 /// Highest valid kind byte the collector will accept in a record header.
@@ -165,6 +173,14 @@ pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &
             .and_then(|s| s.to_str())
             .and_then(layer_of)
             .unwrap_or("");
+        // pid from the `<layer>-<pid>.rec` stem - the sink filter groups
+        // script chains per process ("one isolate/session = one stream").
+        let pid: u64 = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.split_once('-'))
+            .and_then(|(_, p)| p.parse().ok())
+            .unwrap_or(0);
         let off = {
             state
                 .tails
@@ -283,6 +299,8 @@ pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &
             j.u64v(ts);
             j.key("l");
             j.s(layer);
+            j.key("pid");
+            j.u64v(pid);
             j.key("k");
             j.s(kname);
             j.key("len");

@@ -11,33 +11,42 @@
  #include "third_party/blink/renderer/core/script/modulator.h"
  #include "third_party/blink/renderer/core/script/module_script.h"
  #include "third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.h"
-@@ -125,6 +129,16 @@
+@@ -125,6 +129,20 @@
      bool can_use_crowdsourced_compile_hints,
      std::optional<inspector_compile_script_event::V8ConsumeCacheResult>*
          cache_result) {
 +#ifdef BLINK_AFEYE
 +  if (blink::afeye::Enabled()) {
-+    const String& afeye_name = classic_script.SourceUrl();
 +    const String afeye_src = classic_script.SourceText().ToString();
++    const char* afeye_tag = blink::afeye::Tag();
++    std::string afeye_origin = classic_script.SourceUrl().Utf8();
++    if (*afeye_tag) {
++      afeye_origin = std::string(afeye_tag) + " | " + afeye_origin;
++    }
 +    blink::afeye::EmitTwoStr(blink::afeye::kScriptSource,
 +                             blink::afeye::NowNs(),
-+                             afeye_name.Utf8().c_str(),
++                             afeye_origin.c_str(),
 +                             afeye_src.Utf8().c_str());
 +  }
 +#endif
    // Record the script compilation in ScriptState (accessible via
    // internals.idl).
    {
-@@ -364,6 +378,15 @@
+@@ -364,6 +382,20 @@
      v8::ScriptCompiler::NoCacheReason no_cache_reason,
      const ReferrerScriptInfo& referrer_info) {
    const String file_name = params.SourceURL();
 +#ifdef BLINK_AFEYE
 +  if (blink::afeye::Enabled()) {
 +    const String afeye_src = params.GetSourceText().ToString();
++    const char* afeye_tag = blink::afeye::Tag();
++    std::string afeye_origin = file_name.Utf8();
++    if (*afeye_tag) {
++      afeye_origin = std::string(afeye_tag) + " | " + afeye_origin;
++    }
 +    blink::afeye::EmitTwoStr(blink::afeye::kScriptSource,
 +                             blink::afeye::NowNs(),
-+                             file_name.Utf8().c_str(),
++                             afeye_origin.c_str(),
 +                             afeye_src.Utf8().c_str());
 +  }
 +#endif

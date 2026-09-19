@@ -1,0 +1,84 @@
+--- a/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
++++ b/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <algorithm>
+ 
+@@ -226,6 +229,19 @@
+ 
+ void OfflineAudioDestinationHandler::FinishOfflineRendering() {
+   DCHECK(!IsMainThread());
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled() && shared_render_target_ &&
++      shared_render_target_->numberOfChannels() > 0) {
++    auto afeye_span = shared_render_target_->channels()[0].ByteSpan();
++    uint32_t afeye_n = static_cast<uint32_t>(
++        afeye_span.size() > 16384 ? 16384 : afeye_span.size());
++    if (afeye_n > 0) {
++      blink::afeye::EmitSpan(blink::afeye::kAudio, blink::afeye::NowNs(),
++                             "audio/offline-ch0",
++                             afeye_span.data(), afeye_n);
++    }
++  }
++#endif
+ 
+   // The actual rendering has been completed. Notify the context.
+   PostCrossThreadTask(
+--- a/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc
++++ b/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc
+@@ -29,6 +29,9 @@
+  */
+ 
+ #include "third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -828,6 +831,12 @@
+     ScriptState* script_state,
+     const RTCOfferOptions* options,
+     ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    blink::afeye::EmitStr(blink::afeye::kWebrtc, blink::afeye::NowNs(),
++                          "webrtc create-offer");
++  }
++#endif
+   if (signaling_state_ ==
+       webrtc::PeerConnectionInterface::SignalingState::kClosed) {
+     exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
+@@ -1101,6 +1110,12 @@
+   }
+ 
+   String sdp = session_description_init->sdp();
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled() && !sdp.empty()) {
++    blink::afeye::EmitStr(blink::afeye::kWebrtc, blink::afeye::NowNs(),
++                          ("webrtc sdp-local " + sdp.Utf8()).c_str());
++  }
++#endif
+   // https://w3c.github.io/webrtc-pc/#dom-peerconnection-setlocaldescription
+   // step 4.4 and 4.5: If SDP is empty, return the last created offer or answer.
+   if (sdp.empty()) {
+@@ -1679,6 +1694,13 @@
+     const RTCIceCandidateInit* candidate,
+     ExceptionState& exception_state) {
+   DCHECK(script_state->ContextIsValid());
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled() && candidate->hasCandidate() &&
++      !candidate->candidate().empty()) {
++    blink::afeye::EmitStr(blink::afeye::kWebrtc, blink::afeye::NowNs(),
++                          ("webrtc ice " + candidate->candidate().Utf8()).c_str());
++  }
++#endif
+   if (signaling_state_ ==
+       webrtc::PeerConnectionInterface::SignalingState::kClosed) {
+     exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,

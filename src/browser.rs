@@ -12,6 +12,7 @@ pub struct Flags<'a> {
     pub port: u16,
     pub bind: &'a str,
     pub ua: &'a str,
+    pub headless_shell: bool,
 }
 
 pub struct Xvfb {
@@ -94,12 +95,31 @@ fn chrome_flags(f: &Flags) -> Vec<String> {
         a.push("--headless=new".into());
         a.push("--disable-gpu".into());
     }
+    // the fast CI build target is `headless_shell` (half the browser cut
+    // out): it is headless-only and accepts no --headless=new switch.
+    if f.headless_shell {
+        a.push("--headless".into());
+        a.push("--disable-gpu".into());
+    }
     a.push("about:blank".into());
     a
 }
 
+pub fn is_headless_shell(chrome: &std::path::Path) -> bool {
+    chrome
+        .file_name()
+        .map(|x| x.to_string_lossy().contains("headless_shell"))
+        .unwrap_or(false)
+}
+
 pub async fn launch_chrome(ctx: &Ctx, t: &Tunnel) -> Result<Child, String> {
-    let flags = chrome_flags(&Flags { t: Some(t), port: t.port, bind: &t.ns_ip, ua: &ctx.ua });
+    let flags = chrome_flags(&Flags {
+        t: Some(t),
+        port: t.port,
+        bind: &t.ns_ip,
+        ua: &ctx.ua,
+        headless_shell: is_headless_shell(&ctx.chrome),
+    });
     let mut c = Command::new("ip");
     c.args(["netns", "exec", &t.ns, "runuser", "-u", &t.user, "--"]);
     c.arg("env")
@@ -137,7 +157,13 @@ pub async fn launch_chrome(ctx: &Ctx, t: &Tunnel) -> Result<Child, String> {
 
 pub async fn launch_chrome_local(ctx: &Ctx, port: u16) -> Result<Child, String> {
     let _ = std::fs::remove_dir_all("/tmp/afeye/local");
-    let flags = chrome_flags(&Flags { t: None, port, bind: "127.0.0.1", ua: &ctx.ua });
+    let flags = chrome_flags(&Flags {
+        t: None,
+        port,
+        bind: "127.0.0.1",
+        ua: &ctx.ua,
+        headless_shell: is_headless_shell(&ctx.chrome),
+    });
     let mut c = Command::new(&ctx.chrome);
     for f in &flags {
         c.arg(f);

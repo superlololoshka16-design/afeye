@@ -4,18 +4,26 @@ name: afeye-build
 # GitHub release asset. The crawl workflow (afeye.yml) downloads
 # `releases/latest/download/chrome.tgz` - cron crawls NEVER compile.
 #
+# MANUAL-ONLY (workflow_dispatch): pushing to main does NOT start a build.
+# The build chain is started by a human (or by the crawl workflow when the
+# release is missing); once started it keeps re-triggering ITSELF inside
+# its 4h30m windows until the binary exists (see continue-chain below) -
+# so the job NEVER hits the 6h runner cap and never dies mid-compile.
+#
 # Why this is fast:
-#   - symbol_level=0 everywhere (no debug info): ~1/3 of a default build cut
-#   - no PGO / no thin-LTO (is_official_build=false)
+#   - target is headless_shell: ~half the ninja graph of full `chrome`,
+#     still ships every patched layer (v8 / blink / content / net)
+#   - symbol_level=0 everywhere (no debug info): ~1/3 of a build cut
+#   - no PGO / no thin-LTO (is_official_build=false), component build
 #   - ccache across runs via actions/cache (10G cap, 9G used)
 #   - single gclient sync at the pinned tag, --no-history
-#   - only the `chrome` target
 #
 # Why it never "gets killed": the ninja step runs inside its own timeout
-# window well below the 6h job cap; a window that ends mid-build still saves
-# the ccache (if: always) and re-triggers this same workflow, which resumes
-# from the warm cache. The chain continues automatically until the binary
-# exists, then the release is published and future runs are download-only.
+# window well below the 6h job cap; a window that ends mid-build still
+# saves the ccache (if: always) and re-triggers this same workflow, which
+# resumes from the warm cache. The chain continues automatically until the
+# binary exists, then the release is published and future runs are
+# download-only.
 
 on:
   workflow_dispatch:
@@ -24,9 +32,6 @@ on:
         description: 'chromium tag to build'
         required: false
         default: '153.0.8010.52'
-  push:
-    branches: [main]
-    paths: ['patches/**', 'scripts/build-chromium.sh', '.github/workflows/afeye-build.yml']
 
 permissions:
   contents: write
@@ -40,6 +45,7 @@ env:
   CHROMIUM_REF: ${{ github.event.inputs.chromium_ref || '153.0.8010.52' }}
   WORK: /mnt/chromium
   OUT: out/afeye
+  NINJA_TARGET: headless_shell
   BUILD_WINDOW_SECS: '16200'
   CCACHE_DIR: /mnt/ccache
 
@@ -90,7 +96,8 @@ jobs:
         id: result
         if: always()
         run: |
-          if [ -x "$WORK/src/$OUT/chrome" ]; then
+          BIN="$WORK/src/$OUT/$NINJA_TARGET"
+          if [ -x "$BIN" ]; then
             echo "status=built" >> "$GITHUB_OUTPUT"
           elif [ "${{ steps.build.outputs.rc }}" = "42" ]; then
             # 42 = build window exhausted mid-compile, cache carries progress
@@ -101,19 +108,24 @@ jobs:
             echo "status=window" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: smoke-test patched chrome
+      - name: smoke-test patched shell
         if: steps.result.outputs.status == 'built'
         run: |
           cd "$WORK/src/$OUT"
-          ./chrome --version
+          BIN="./$NINJA_TARGET"
+          "$BIN" --version
           # sink activation probe: run with AFEYE_SINK=1 and check the .rec appears
           rm -rf /tmp/afeye-smoke && mkdir -p /tmp/afeye-smoke
           AFEYE_SINK=1 AFEYE_RAW_DIR=/tmp/afeye-smoke \
-            ./chrome --headless=new --no-sandbox --disable-gpu --user-data-dir=/tmp/afeye-smoke-prof \
+            "$BIN" --no-sandbox --disable-gpu --user-data-dir=/tmp/afeye-smoke-prof \
             --dump-dom about:blank >/dev/null 2>&1 || true
           ls -la /tmp/afeye-smoke/ || true
           test -n "$(ls /tmp/afeye-smoke/ 2>/dev/null)" || { echo "SINKS DID NOT EMIT"; exit 1; }
           echo "sinks alive: $(ls /tmp/afeye-smoke/ | wc -l) record files"
+          # each record file must carry the sink-hello first record
+          for f in /tmp/afeye-smoke/*.rec; do
+            test -s "$f" || { echo "EMPTY REC: $f"; exit 1; }
+          done
 
       - name: package + release
         if: steps.result.outputs.status == 'built'
@@ -122,29 +134,32 @@ jobs:
         run: |
           set -e
           cd "$WORK/src/$OUT"
-          # runtime payload only - the build tree (obj/gen) is not shipped
+          # runtime payload only - the build tree (obj/gen) is not shipped.
+          # component build ships the .so set alongside the binary, so the
+          # explicit list is best-effort with a full fallback.
           tar czf /tmp/chrome.tgz \
             --exclude='obj*' --exclude='gen' --exclude='*.ninja' --exclude='*.ninja.*' \
             --exclude='toolchain.ninja' --exclude='args.gn' --exclude='build.ninja' \
             --exclude='*.stamp' --exclude='libc++.a' --exclude='*.TOC' \
-            chrome chrome_crashpad_handler icudtl.dat resources.pak \
-            snapshot_blob.bin v8_context_snapshot.bin locales \
+            "$NINJA_TARGET" icudtl.dat resources.pak snapshot_blob.bin \
+            v8_context_snapshot.bin locales \
             libEGL.so libGLESv2.so libvk_swiftshader.so vk_swiftshader_icd.json 2>/dev/null \
-          || tar czf /tmp/chrome.tgz --exclude='obj*' --exclude='gen' --exclude='*.ninja' .
+          || tar czf /tmp/chrome.tgz --exclude='obj*' --exclude='gen' --exclude='*.ninja' \
+            --exclude='*.stamp' --exclude='*.TOC' .
           ls -la /tmp/chrome.tgz
           sha256sum /tmp/chrome.tgz | tee /tmp/chrome.tgz.sha256
           TAG="chrome-${CHROMIUM_REF}"
-          gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null || true
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" /tmp/chrome.tgz /tmp/chrome.tgz.sha256 --clobber
           else
             gh release create "$TAG" /tmp/chrome.tgz /tmp/chrome.tgz.sha256 \
-              --title "afeye chrome $CHROMIUM_REF" \
-              --notes "Patched Chromium $CHROMIUM_REF with the afeye sink series (patches/SERIES.md). Restored via actions/cache-built ccache; cron crawls download this asset instead of compiling."
+              --title "afeye $NINJA_TARGET $CHROMIUM_REF" \
+              --notes "Patched Chromium $CHROMIUM_REF with the afeye sink series v4 (patches/SERIES.md). Target: $NINJA_TARGET. Deep capture: executing-script chokepoints (v8+blink), raw trusted input, event dispatch, DOM/canvas/font metrics, offline audio, WebRTC SDP/ICE, wasm bytes, C++->JS call origin, renderer-side fetch provenance, full network wire. Restored via ccache; cron crawls download this asset instead of compiling."
           fi
           # marker into the repo tree so the main page shows the build state
           mkdir -p build
           {
+            echo "target=$NINJA_TARGET"
             echo "tag=$TAG"
             echo "chromium=$CHROMIUM_REF"
             echo "sha256=$(cut -d' ' -f1 /tmp/chrome.tgz.sha256)"
@@ -154,7 +169,7 @@ jobs:
           git config user.name "afeye-build"
           git config user.email "afeye-build@users.noreply.github.com"
           git add build/BUILT.txt
-          git commit -m "chrome build $CHROMIUM_REF $(date -u +%FT%TZ)" || true
+          git commit -m "$NINJA_TARGET build $CHROMIUM_REF $(date -u +%FT%TZ)" || true
           git pull --rebase origin HEAD || true
           git push || true
 

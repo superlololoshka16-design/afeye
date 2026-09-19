@@ -30,7 +30,7 @@
    DCHECK_GT(timeout_id_, 0);
  
    // Step 10:
-@@ -400,6 +416,17 @@
+@@ -400,6 +416,21 @@
    ExecutionContext* context = GetExecutionContext();
    DCHECK(context);
    DOMTimerCoordinator::From(*context).SetTimerNestingLevel(nesting_level_);
@@ -43,12 +43,15 @@
 +                  static_cast<unsigned>(nesting_level_));
 +    blink::afeye::EmitStr(blink::afeye::kTimer, blink::afeye::NowNs(),
 +                          afeye_buf);
++    char afeye_tag[24];
++    std::snprintf(afeye_tag, sizeof(afeye_tag), "timer:%u",
++                  static_cast<unsigned>(timeout_id_));
++    blink::afeye::SetTag(afeye_tag);
 +  }
 +#endif
    DCHECK(!context->IsContextPaused());
    // Only the first execution of a multi-shot timer should get an affirmative
    // user gesture indicator.
-
 --- a/third_party/blink/renderer/core/timing/performance_observer.cc
 +++ b/third_party/blink/renderer/core/timing/performance_observer.cc
 @@ -3,6 +3,9 @@
@@ -74,7 +77,6 @@
    if (!performance_) {
      exception_state.ThrowTypeError(
          "Window/worker may be destroyed? Performance target is invalid.");
-
 --- a/third_party/blink/renderer/core/timing/performance_entry.cc
 +++ b/third_party/blink/renderer/core/timing/performance_entry.cc
 @@ -29,6 +29,9 @@

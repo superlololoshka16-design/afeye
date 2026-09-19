@@ -1,9 +1,8 @@
 diff --git a/third_party/blink/renderer/platform/afeye/sink.h b/third_party/blink/renderer/platform/afeye/sink.h
 new file mode 100644
-index 0000000000..1111111111
 --- /dev/null
 +++ b/third_party/blink/renderer/platform/afeye/sink.h
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,54 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
 +#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
 +
@@ -27,6 +26,12 @@ index 0000000000..1111111111
 +  kClientHints = 20,
 +  kSwCache = 21,
 +  kScriptSource = 22,
++  kInput = 23,
++  kEventDispatch = 24,
++  kDomMetric = 25,
++  kAudio = 26,
++  kWebrtc = 27,
++  kFetch = 28,
 +};
 +
 +bool Enabled();
@@ -40,6 +45,11 @@ index 0000000000..1111111111
 +              const uint8_t* bytes, uint32_t n);
 +uint64_t SinkDropped();
 +bool Flush(uint32_t timeout_ms);
++// Ambient per-thread execution context ("what is running right now"):
++// the input/event/timer hooks set it, the script/fetch hooks read it,
++// so every captured script and request carries its cause.
++void SetTag(const char* s);
++const char* Tag();
 +
 +}
 +}  // namespace blink
@@ -47,14 +57,11 @@ index 0000000000..1111111111
 +#endif
 +
 +#endif
-+
-
 diff --git a/third_party/blink/renderer/platform/afeye/sink.cc b/third_party/blink/renderer/platform/afeye/sink.cc
 new file mode 100644
-index 0000000000..1111111111
 --- /dev/null
 +++ b/third_party/blink/renderer/platform/afeye/sink.cc
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,278 @@
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +
 +#ifdef BLINK_AFEYE
@@ -314,12 +321,25 @@ index 0000000000..1111111111
 +  return false;
 +}
 +
++static thread_local char g_afeye_tag[97] = {0};
++
++void SetTag(const char* s) {
++  if (s == nullptr) {
++    g_afeye_tag[0] = '\0';
++    return;
++  }
++  size_t n = std::strlen(s);
++  if (n > 96) n = 96;
++  std::memcpy(g_afeye_tag, s, n);
++  g_afeye_tag[n] = '\0';
++}
++
++const char* Tag() { return g_afeye_tag; }
++
 +}
 +}  // namespace blink
 +
 +#endif
-+
-
 --- a/third_party/blink/renderer/platform/BUILD.gn
 +++ b/third_party/blink/renderer/platform/BUILD.gn
 @@ -270,7 +270,13 @@

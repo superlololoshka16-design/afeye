@@ -1,0 +1,96 @@
+--- a/third_party/blink/renderer/core/dom/element.cc
++++ b/third_party/blink/renderer/core/dom/element.cc
+@@ -25,6 +25,10 @@
+  */
+ 
+ #include "third_party/blink/renderer/core/dom/element.h"
++#ifdef BLINK_AFEYE
++#include <cstdio>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <algorithm>
+ #include <bitset>
+@@ -3359,6 +3363,16 @@
+ }
+ 
+ DOMRectList* Element::getClientRects() {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[160];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "dom/client-rects tag=%.48s ctx=%.48s",
++                  tagName().Utf8().c_str(), blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
+   Vector<gfx::RectF> rects = GetClientRectsNoAdjustment();
+   if (rects.empty()) {
+     return MakeGarbageCollected<DOMRectList>();
+@@ -3462,6 +3476,16 @@
+ }
+ 
+ DOMRect* Element::GetBoundingClientRectForBinding() {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[160];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "dom/bounding-rect tag=%.48s ctx=%.48s",
++                  tagName().Utf8().c_str(), blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
+   // TODO(crbug.com/1499981): This should be removed once synchronized scrolling
+   // impact is understood.
+   SyncScrollAttemptHeuristic::DidAccessScrollOffset();
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.h"
++#ifdef BLINK_AFEYE
++#include <cstdio>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <cmath>
+ #include <cstdint>
+@@ -360,6 +364,16 @@
+     int sh,
+     ImageDataSettings* image_data_settings,
+     ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[160];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "canvas/get-image-data rect=%d,%d %dx%d ctx=%.48s",
++                  sx, sy, sw, sh, blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
+   if (!base::CheckMul(sw, sh).IsValid<int>()) {
+     exception_state.ThrowRangeError("Out of memory at ImageData creation");
+     return nullptr;
+@@ -1167,6 +1181,18 @@
+ }
+ 
+ TextMetrics* BaseRenderingContext2D::measureText(const String& text) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[224];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "canvas/measure text=%.64s font=%.64s ctx=%.48s",
++                  text.Utf8().c_str(),
++                  GetState().UnparsedFont().Utf8().c_str(),
++                  blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
+   // The style resolution required for fonts is not available in frame-less
+   // documents.
+   HTMLCanvasElement* canvas = HostAsHTMLCanvasElement();

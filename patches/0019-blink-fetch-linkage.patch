@@ -1,0 +1,36 @@
+--- a/third_party/blink/renderer/platform/loader/fetch/resource_fetcher.cc
++++ b/third_party/blink/renderer/platform/loader/fetch/resource_fetcher.cc
+@@ -26,6 +26,11 @@
+ */
+ 
+ #include "third_party/blink/renderer/platform/loader/fetch/resource_fetcher.h"
++#ifdef BLINK_AFEYE
++#include <cstdio>
++#include <string>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <algorithm>
+ #include <limits>
+@@ -1387,6 +1392,21 @@
+       params.IsFromOriginDirtyStyleSheet());
+   TRACE_EVENT_BEGIN(TRACE_DISABLED_BY_DEFAULT("network"), "ResourceLoad",
+                     perfetto::Track(identifier), "url", resource_request.Url());
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[640];
++    std::string afeye_url = resource_request.Url().GetString().Utf8();
++    int afeye_n = std::snprintf(afeye_buf, sizeof(afeye_buf),
++                                "fetch url=%.440s type=%d ctx=%.60s",
++                                afeye_url.c_str(),
++                                static_cast<int>(factory.GetType()),
++                                blink::afeye::Tag());
++    if (afeye_n > 0) {
++      blink::afeye::EmitStr(blink::afeye::kFetch, blink::afeye::NowNs(),
++                            afeye_buf);
++    }
++  }
++#endif
+   absl::Cleanup record_times = [start = base::TimeTicks::Now(), &params] {
+     base::TimeDelta elapsed = base::TimeTicks::Now() - start;
+     base::UmaHistogramMicrosecondsTimes("Blink.Fetch.RequestResourceTime2",

@@ -8,6 +8,7 @@ mod events;
 mod human;
 mod inject;
 mod relay;
+mod sinkfilter;
 mod tg;
 mod timefmt;
 mod wg;
@@ -77,6 +78,10 @@ struct MRun {
     collect_truncated: u64,
     collect_corrupt: u64,
     sink_alive: bool,
+    sink_chains: u64,
+    sink_hot: u64,
+    sink_cold: u64,
+    sink_wasm: u64,
     test: bool,
 }
 
@@ -512,6 +517,25 @@ async fn run() -> Result<(), String> {
         "[afeye] collect: records={} bytes={} truncated={} corrupt={} files={}",
         cstats.records, cstats.bytes, cstats.truncated, cstats.corrupt, cstats.files
     );
+    // deep sink filter: merge script fragments into chains, index wasm
+    // imports/exports, slice cold branches out, link input -> event ->
+    // timer -> network timing chains, then prune the per-record raw files
+    // (the 10k one-kilo-file problem) - index.jsonl keeps every hash/ts.
+    let mut sf_stats = sinkfilter::SinkFilterStats::default();
+    match sinkfilter::run(&stage_run.join("collect")) {
+        Ok(sf) => {
+            eprintln!(
+                "[afeye] sinkfilter: fragments={} chains={} hot={} cold={} wasm={} net_chains={}",
+                sf.fragments, sf.chains, sf.hot_chains, sf.cold_chains, sf.wasm_modules, sf.net_chains
+            );
+            let raw_dir = stage_run.join("collect/raw");
+            if sf.records > 0 {
+                let _ = std::fs::remove_dir_all(&raw_dir);
+            }
+            sf_stats = sf;
+        }
+        Err(e) => eprintln!("[afeye] sinkfilter failed (raw kept for debug): {e}"),
+    }
     let _ = tx.send(FxEvent {
         t: now_ms(),
         site: 0,
@@ -624,6 +648,10 @@ async fn run() -> Result<(), String> {
         collect_truncated: cstats.truncated,
         collect_corrupt: cstats.corrupt,
         sink_alive,
+        sink_chains: sf_stats.chains,
+        sink_hot: sf_stats.hot_chains,
+        sink_cold: sf_stats.cold_chains,
+        sink_wasm: sf_stats.wasm_modules,
         test,
     };
     let mp = stage.join("manifest.json");
@@ -701,6 +729,8 @@ fn find_chrome() -> Option<PathBuf> {
         "/tmp/cft/chrome-linux64/chrome",
         "chromium-browser",
         "chromium",
+        "/opt/afeye-chrome/headless_shell",
+        "/opt/afeye-chrome/chrome",
     ] {
         if c.starts_with('/') {
             let pb = PathBuf::from(c);

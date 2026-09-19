@@ -1,25 +1,34 @@
 #!/usr/bin/env bash
 # afeye: build the patched Chromium 153 on a GitHub Actions runner.
 #
-# Speed levers (the whole point - the user wants hours, not a day):
-#   - symbol_level=0 / v8_symbol_level=0 / blink_symbol_level=0:
-#     no debug info anywhere. Debug info is ~1/3 of a default build's time.
-#   - is_official_build=false: skips PGO and thin-LTO, the two slowest
-#     non-debug stages of a chrome build.
-#   - dcheck_always_on=false: DCHECKs compile out.
-#   - ccache (GN cc_wrapper) + actions/cache: re-runs of this job hit the
-#     cache and only relink, ~40-60 min instead of hours.
-#   - only the `chrome` ninja target is built.
-#   - gclient config + sync directly at the tag (no double fetch), --no-history.
+# Target: headless_shell (NOT the full `chrome`) - the headless app links
+# roughly half the browser (no browser UI / chrome/ layer) while keeping ALL
+# the layers we patch: v8, blink, content, net. That is the "we don't patch
+# everything so not everything compiles" lever.
+#
+# Speed levers (the whole point - hours, not a day):
+#   - headless_shell target only: ~half the ninja graph of `chrome`
+#   - symbol_level=0 / v8_symbol_level=0 / blink_symbol_level=0: no debug
+#     info anywhere (~1/3 of a default build's time)
+#   - is_official_build=false: skips PGO and thin-LTO
+#   - is_component_build=true: per-component .so links instead of one giant
+#     binary link (the runtime tar simply ships the .so files)
+#   - enable_nacl=false, dcheck_always_on=false
+#   - ccache (GN cc_wrapper) + actions/cache: chained runs resume; a warm
+#     re-run relinks in well under an hour
+#   - gclient sync at the tag, --no-history, single pass
+#   - use_clang_modules=false: module-using compiles are uncachable by
+#     ccache, and the chained-run architecture depends on the cache
 set -euo pipefail
 
 CHROMIUM_REF="${CHROMIUM_REF:-153.0.8010.52}"
 WORK="${WORK:-/mnt/chromium}"
 OUT_REL="${OUT_REL:-out/afeye}"
+NINJA_TARGET="${NINJA_TARGET:-headless_shell}"
 BUILD_WINDOW_SECS="${BUILD_WINDOW_SECS:-16200}"   # 4h30m of ninja
 CCACHE_DIR="${CCACHE_DIR:-/mnt/ccache}"
 
-echo "== afeye build: chromium $CHROMIUM_REF, window ${BUILD_WINDOW_SECS}s =="
+echo "== afeye build: chromium $CHROMIUM_REF, target $NINJA_TARGET, window ${BUILD_WINDOW_SECS}s =="
 
 # ---- 0. disk: the runner image ships ~45GB of preinstalled toolchains we
 # never touch. Freeing them is the difference between fits and dies.
@@ -72,7 +81,7 @@ ccache -M 9G >/dev/null 2>&1 || ccache --max-size=9G >/dev/null || true
 gn gen "$OUT_REL" --args="$(cat <<'EOF'
 is_debug = false
 is_official_build = false
-is_component_build = false
+is_component_build = true
 symbol_level = 0
 v8_symbol_level = 0
 blink_symbol_level = 0
@@ -83,8 +92,8 @@ cc_wrapper = "ccache"
 # libc++ clang modules make compiles uncachable by ccache (module-using
 # compilations are skipped) - the chained-run architecture depends on the
 # cache carrying compiled objects between 4h windows, so modules go off.
-# Per-file compiles get slightly slower; cross-run rebuilds get fast.
 use_clang_modules = false
+enable_nacl = false
 v8_enable_afeye = true
 blink_enable_afeye = true
 network_enable_afeye = true
@@ -98,16 +107,16 @@ EOF
 mkdir -p "$CCACHE_DIR"
 set +e
 timeout --signal=TERM "$BUILD_WINDOW_SECS" \
-  ninja -C "$OUT_REL" -j "$(nproc)" chrome
+  ninja -C "$OUT_REL" -j "$(nproc)" "$NINJA_TARGET"
 rc=$?
 set -e
 if [ $rc -ne 0 ] && [ $rc -ne 124 ]; then
   echo "== ninja failed with rc=$rc (real build error) =="
   exit "$rc"
 fi
-if [ ! -x "$OUT_REL/chrome" ]; then
-  echo "== chrome binary not ready yet (rc=$rc) - window exhausted, cache saved, next run resumes =="
+if [ ! -x "$OUT_REL/$NINJA_TARGET" ]; then
+  echo "== $NINJA_TARGET not ready yet (rc=$rc) - window exhausted, cache saved, next run resumes =="
   exit 42
 fi
-echo "== chrome built: $OUT_REL/chrome =="
+echo "== built: $OUT_REL/$NINJA_TARGET =="
 exit 0
