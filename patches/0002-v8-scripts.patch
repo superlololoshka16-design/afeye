@@ -1,11 +1,12 @@
 --- a/v8/src/codegen/compiler.cc
 +++ b/v8/src/codegen/compiler.cc
-@@ -3,6 +3,13 @@
+@@ -3,6 +3,14 @@
  // found in the LICENSE file.
  
  #include "src/codegen/compiler.h"
 +#ifdef V8_AFEYE
 +#include <cstdio>
++#include <cstdlib>
 +#include <string>
 +#include "include/v8-primitive.h"
 +#include "src/afeye/sink.h"
@@ -14,7 +15,7 @@
  
  #include <memory>
  #include <optional>
-@@ -75,6 +82,46 @@
+@@ -75,6 +83,53 @@ namespace internal {
  
  namespace {
  
@@ -29,7 +30,14 @@
 +                                  DirectHandle<String> source,
 +                                  const char* fallback_name,
 +                                  MaybeHandle<Object> maybe_name) {
-+  if (!v8::afeye::Enabled() || !v8_flags.afeye_source) return;
++  // env-gate, not a v8_flag: a DEFINE_BOOL in flag-definitions.h would force
++  // EVERY v8 translation unit to recompile (the header is included tree-wide)
++  // for one knob with one reader. getenv is read once, static-cached.
++  static bool g_afeye_source_off = []() {
++    const char* v = ::getenv("AFEYE_SOURCE");
++    return v != nullptr && *v != '\0' && v[0] == '0';
++  }();
++  if (!v8::afeye::Enabled() || g_afeye_source_off) return;
 +  if (source.is_null()) return;
 +  v8::Isolate* api_isolate = reinterpret_cast<v8::Isolate*>(isolate);
 +  v8::Local<v8::String> local_source = v8::Utils::ToLocal(source);
@@ -61,7 +69,7 @@
  constexpr bool IsOSR(BytecodeOffset osr_offset) { return !osr_offset.IsNone(); }
  
  class CompilerTracer : public AllStatic {
-@@ -3304,6 +3351,9 @@
+@@ -3304,6 +3359,9 @@ MaybeDirectHandle<JSFunction> Compiler::GetFunctionFromEval(
      LanguageMode language_mode, ParseRestriction restriction,
      int parameters_end_pos, int eval_position,
      ParsingWhileDebugging parsing_while_debugging) {
@@ -71,7 +79,7 @@
    // The cache lookup key needs to be aware of the separation between the
    // parameters and the body to prevent this valid invocation:
    //   Function("", "function anonymous(\n/**/) {\n}");
-@@ -3953,6 +4003,10 @@
+@@ -3953,6 +4011,10 @@ MaybeDirectHandle<SharedFunctionInfo> GetSharedFunctionInfoForScriptImpl(
      ScriptCompiler::CompileOptions compile_options,
      ScriptCompiler::NoCacheReason no_cache_reason, NativesFlag natives,
      ScriptCompiler::CompilationDetails* compilation_details) {
@@ -82,7 +90,7 @@
    ScriptCompileTimerScope compile_timer(isolate, no_cache_reason,
                                          compilation_details);
  
-@@ -4297,6 +4351,10 @@
+@@ -4297,6 +4359,10 @@ Compiler::GetSharedFunctionInfoForStreamedScript(
      const ScriptDetails& script_details, ScriptStreamingData* streaming_data,
      IsCompiledScope* is_compiled_scope,
      ScriptCompiler::CompilationDetails* compilation_details) {

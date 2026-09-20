@@ -332,19 +332,6 @@ index 0000000000..1111111111
 +
 +#endif
 +
---- a/v8/src/flags/flag-definitions.h
-+++ b/v8/src/flags/flag-definitions.h
-@@ -3146,6 +3146,10 @@
- // codegen.cc
- DEFINE_BOOL(lazy, true, "use lazy compilation")
- DEFINE_BOOL(lazy_eval, true, "use lazy compilation during eval")
-+
-+// afeye sink control (patches/0001). Unconditional: FlagValues is one
-+// struct shared by every translation unit that includes this header.
-+DEFINE_BOOL(afeye_source, true, "emit raw script sources to the afeye sink")
- DEFINE_BOOL(lazy_streaming, true,
-             "use lazy compilation during streaming compilation")
- DEFINE_BOOL(max_lazy, false, "ignore eager compilation hints")
 --- a/v8/BUILD.gn
 +++ b/v8/BUILD.gn
 @@ -63,6 +63,9 @@

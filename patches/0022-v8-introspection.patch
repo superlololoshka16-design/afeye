@@ -1,19 +1,18 @@
 --- a/v8/src/builtins/builtins-date.cc
 +++ b/v8/src/builtins/builtins-date.cc
-@@ -63,6 +63,30 @@ Tagged<Object> SetDateValue(Isolate* isolate, DirectHandle<JSDate> date,
+@@ -63,6 +63,29 @@ Tagged<Object> SetDateValue(Isolate* isolate, DirectHandle<JSDate> date,
  // https://tc39.es/ecma262/#sec-date-constructor
  BUILTIN(DateConstructor) {
    HandleScope scope(isolate);
 +#ifdef V8_AFEYE
-+  // afeye (0020): the Date CONSTRUCTOR clock read - `Date()` and `new Date()`
-+  // with no args call JSDate::CurrentTimeValue exactly like Date.now() (0004).
-+  // Antifraud timing checks commonly cross-check Date.now() against
++  // afeye (0023, G7): the Date CONSTRUCTOR clock read - `Date()` and
++  // `new Date()` with no args call JSDate::CurrentTimeValue exactly like
++  // Date.now() (0004). Antifraud timing checks cross-check Date.now() against
 +  // new Date().getTime(); a clock hook that moves only one of them is itself a
 +  // detector, and half the clock stream was invisible. Zero-arg reads only:
 +  // Date(2020,1,1) parses an argument, it is not a clock read.
 +  {
-+    const bool afeye_no_args =
-+        (args.length() - 1) == 0;  // args[0] is the receiver/new.target slot
++    const bool afeye_no_args = (args.length() - 1) == 0;
 +    if (afeye_no_args && v8::afeye::Enabled()) {
 +      static std::atomic<uint64_t> g_afeye_date_ctor{0};
 +      static bool g_afeye_date_ctor_off = []() {
@@ -33,13 +32,13 @@
          static_cast<double>(JSDate::CurrentTimeValue(isolate));
 --- a/v8/src/codegen/compiler.cc
 +++ b/v8/src/codegen/compiler.cc
-@@ -4,11 +4,16 @@
+@@ -4,12 +4,16 @@
  
  #include "src/codegen/compiler.h"
  #ifdef V8_AFEYE
 +#include <atomic>
  #include <cstdio>
-+#include <cstdlib>
+ #include <cstdlib>
 +#include <cstring>
  #include <string>
  #include "include/v8-primitive.h"
@@ -50,7 +49,7 @@
  #endif
  
  #include <memory>
-@@ -3045,10 +3050,97 @@ bool Compiler::CollectSourcePositions(
+@@ -3053,10 +3057,97 @@ bool Compiler::CollectSourcePositions(
  }
  
  // static
@@ -148,16 +147,16 @@
    // We should never reach here if the function is already compiled.
    DCHECK(!shared_info->is_compiled());
    DCHECK(!is_compiled_scope->is_compiled());
-@@ -4242,6 +4334,16 @@ MaybeDirectHandle<JSFunction> Compiler::GetWrappedFunction(
+@@ -4250,6 +4341,16 @@ MaybeDirectHandle<JSFunction> Compiler::GetWrappedFunction(
    ScriptCompileTimerScope compile_timer(isolate, no_cache_reason,
                                          &compilation_details);
  
 +#ifdef V8_AFEYE
-+  // afeye (0020, G9): the FOURTH compile funnel - ScriptCompiler::CompileFunction
-+  // (wrapped-function API). It has its own cache lookup / deserialize /
-+  // NewScript / CompileToplevel path and never passes the three funnels 0002
-+  // hooks, so wrapped-function sources were the one gap in the "every line of
-+  // JS exactly once" claim. Same helper, same kind-1 record, same iso: prefix.
++  // afeye (0023, G9): the FOURTH compile funnel - ScriptCompiler::CompileFunction
++  // (wrapped-function API). It has its own cache/deserialize/NewScript/
++  // CompileToplevel path and never passes the three funnels 0002 hooks, so
++  // wrapped-function sources were the one gap in "every line of JS exactly
++  // once". Same helper, same kind-1 record, same iso: prefix.
 +  AfeyeDumpScriptSource(isolate, direct_handle(*source, isolate), "wrapped",
 +                        script_details.name_obj);
 +#endif

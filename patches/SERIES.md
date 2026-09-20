@@ -8,7 +8,19 @@ pristine tree assembled from sources fetched at that tag
 0020/0021/0022/0023).
 
 v11 makes the SELECTION honest and adds the witness that makes honesty
-possible. One new C++ patch:
+possible.
+
+COMPILE-COST FIX (this is what kept the build near the 6h CI window): v10 and
+earlier touched `v8/src/flags/flag-definitions.h` to add one `afeye_source`
+bool with exactly ONE reader (0002's script-source gate). That header is
+included by EVERY v8 translation unit, so one knob forced a full v8
+recompile. v11 deletes that hunk and replaces the flag with an env-gate
+(`AFEYE_SOURCE=0`) cached in a function-local static inside compiler.cc -
+zero header churn, the v8 tree stays cached. The only headers the series
+still touches are the three afeye sink.h files (0001/0005/0011/0023 - new
+files, no tree-wide inclusion) and `messages.h` (0021, one Impl decl).
+
+One new C++ patch:
 
 - **0023 (sink-drop witness, kind 39).** Every sink already counts its ring
   overflows (`SinkDropped()`), but the counter was never emitted - so the
