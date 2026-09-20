@@ -46,6 +46,7 @@ pub struct Interner {
 unsafe impl Send for Interner {}
 unsafe impl Sync for Interner {}
 
+#[cfg(unix)]
 fn mmap_anon(len: usize, huge: bool) -> *mut u8 {
     unsafe {
         let mut f = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
@@ -71,6 +72,18 @@ fn mmap_anon(len: usize, huge: bool) -> *mut u8 {
         }
     }
 }
+
+#[cfg(windows)]
+fn mmap_anon(len: usize, huge: bool) -> *mut u8 {
+    // check/test-build fallback: allocate a leaked aligned Vec (the real
+    // crawler target is Linux; windows builds are for `cargo check`/`test`
+    // on the dev box only). 'huge' is meaningless here.
+    let _ = huge;
+    let mut v: Vec<u8> = Vec::with_capacity(len);
+    v.resize(len, 0);
+    Box::into_raw(v.into_boxed_slice()) as *mut u8
+}
+
 
 impl Interner {
     pub fn new() -> Interner {

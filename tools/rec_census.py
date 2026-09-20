@@ -9,7 +9,7 @@ also carries assertions:
 
     tools/rec_census.py /tmp/afeye-smoke \\
         --expect v8:script-source=1 blink:event-dispatch=1 \\
-        --expect v8:call=1 blink:timer=1 blink:fetch=1 net:net-request=1
+        --expect v8:call-completed=1 blink:timer=1 blink:fetch=1 net:net-request=1
 
 Exit 0 if every expectation is met, exit 1 otherwise (with the census
 printed either way). Used by the CI smoke test to prove the patched
@@ -83,6 +83,16 @@ def census(path: str):
     while off + 16 <= len(buf):
         rec_len, kind, flags, _rsv = HDR.unpack_from(buf, off)
         if rec_len < 16 or off + rec_len > len(buf):
+            # v12.1: a truncated TAIL (a record that overhangs EOF by the
+            # last few bytes) is a torn write - chrome killed by `timeout`
+            # or SIGTERM-mid-drain leaves exactly this. collect.rs treats the
+            # identical condition as starved/wt and keeps counting; only a
+            # complete implausible record AHEAD of the bad offset is real
+            # corruption. Warn on the tail, keep the census green.
+            tail = len(buf) - off
+            if 16 <= rec_len <= 1 << 20 and 0 <= kind <= 39 and flags <= 1 and tail >= 16:
+                print(f"torn tail at {path}:{off} rec_len={rec_len} have={tail}")
+                break
             bad += 1
             break
         layer = parse_layer(os.path.basename(path))

@@ -1,4 +1,104 @@
-# afeye chromium patch series v12
+# afeye chromium patch series v12.1
+
+**v12.1 is the six-agent audit + repair pass.** Six parallel audits (v8
+layer, blink layer, net layer, sink core, Rust filter, driver) walked every
+patch against the pristine tree AND the Rust driver end-to-end. They found
+the deep filter had NEVER run on real data (the collector wrote to
+`stage/collect` while the filter read `stage/<slot>/collect` since v4), the
+CI crawl gate never wrote `$GITHUB_OUTPUT` (the scheduled run never
+crawled), and four patch defects that `git apply` passes but the compiler
+kills. All fixed:
+
+**patch fixes (apply-verified 24/24 against pristine after each edit):**
+
+- **0024 (compile blockers):** `v8::String::NO_NULL_TERMINATION` does not
+  exist at this rev (WriteFlags rework) - the string readback is now
+  `WriteUtf8` (correct pairing: returns UTF-8 BYTES, the old
+  `Utf8Length`+`WriteOneByte` copied CODE UNITS into a bytes-sized buffer -
+  multi-byte strings truncated + stale stack tail leaked into .rec files);
+  include `v8-container.h` (v8-array.h does not exist; Array lives there);
+  size_t math (Utf8Length returns size_t; -Werror would fail the int
+  narrowing); `[array len=%u]` with the uint32 cast.
+- **0015 (compile blockers):** `PositionInWindow()` -> `PositionInWidget()`
+  (does not exist at 153); `unique_pointer_id` -> `id` (int32 PointerId);
+  `pressure` -> `force` (web_pointer_properties.h).
+- **0007 (compile blockers):** the media_device_info emit block sat at
+  NAMESPACE scope after the ctor brace (hard error) - now inside the ctor
+  body; `GetAsArrayBufferView()` returns `NotShared<DOMArrayBufferView>`
+  (raw-pointer assignment does not compile) - now `.Get()` with the null
+  check.
+- **0017 (dead hook):** the reassembly-path guard read `bytes_reassembled_`
+  AFTER the line above zeroed it - always false, so fragmented
+  do_not_fragment outbound WS (the Kasada/HUMAN telemetry shape) never
+  emitted. Now guards on `data_frame->data_length` and reads
+  `message_under_reassembly_->bytes()` (alive; the std::move happens in
+  SendFrame below).
+- **0013 + 0021 (graph admission):** both emitted PROSE (EmitStr) with no
+  NUL tag; the Rust VALUE_TAGS gate splits on NUL, so cookie/storage values
+  and the json-stringify head NEVER joined the content graph - the claimed
+  store-then-send cookie relay and stringify->req-body edge did not exist.
+  Both now emit `EmitSpan(tag, value)` (tag carries the len=/key= metadata,
+  body = the value bytes; 960/800 B caps stay). 0013 also gains the
+  series-standard gate + 2M cap (`AFEYE_TRACE_STORAGE=0`).
+- **0001/0005/0011 (fork safety):** zygote-forked renderers inherited a
+  completed once_flag + ring with NO drain thread (fork keeps only the
+  calling thread): the child filled 8 MiB and dropped everything, its
+  .rec was never created, and the drop witness never fired. All three sink
+  cores now check `getpid() != g_pid` in Enabled() (vDSO, free) and
+  re-init the ring + drain thread after fork.
+- **0016 + 0005 (cap truth):** five per-TU `g_afeye_taint` atomics = 500k
+  records/process, 5x the documented 100k cap. ONE counter now lives in the
+  blink sink (extern in sink.h) and the five funnels share it.
+
+**Rust fixes (driver + filter, tests green):**
+
+- `main.rs`: the collector now writes `stage/<slot>/collect` (was
+  `stage/collect` - the filter read a directory nothing ever wrote; the
+  deep filter never ran on real data in ANY committed artifact);
+  graceful shutdown (SIGTERM + 1.2s grace before SIGKILL so the C++
+  atexit Flush(500) drains the rings; a SIGKILL-only shutdown loses the
+  tail records invisibly to the kind-39 witness - false dead-end-proven);
+  the raw dir is wiped before chrome starts (stale .rec from a previous
+  run would blend timelines and pass the sink-hello probe from a dead
+  run).
+- `sinkfilter.rs`: kind-16 NUL-less PROSE records (legacy) derive their
+  (tag, body) via `value_of_prose` so old .rec files also join the graph;
+  the query-sink seed measures the QUERY STRING (a 90-char path with
+  `?v=` was a hop-0 sink = false PROVEN for page-load chains); the
+  drop-witness refuses dead-end-proven on drops in ANY pid (the graph's
+  sinks live in the network-service pid, not the chain's renderer) and
+  within 500ms after the window end (0023 throttles reports to 10/s);
+  `name_to_chain` is keyed by (pid, canonical name) - two renderers
+  loading the same URL no longer cross-attribute PROVEN verdicts, and
+  >160-char script names (the query-URL scripts this capture carries)
+  now join after canonicalizing the C++ 160/200-char truncation;
+  event-dispatch records get the same ambient-family exclusion as
+  kind-23 (evt mousemove storms re-saturated handler-born - the exact
+  v7 bug v9 closed on the input side); TouchMove/GestureScrollUpdate/
+  PointerHoverMove join the kind-23 ambient list; nav-start parses the
+  payload `mono_ns=` (the true browser T0) instead of the emission ts;
+  the fanout-drop counter lands in report.json; edge-budget exhaustion
+  admits the sink with empty keys (a dropped seed silently deletes every
+  upstream chain's provenness); dead code (content_runs +
+  CONTENT_MAX_TOTAL_RUNS) deleted; `is_hot` excludes the harness's own
+  injected script by the AFXH marker (it embeds literal HOT_PATTERNS and
+  always classified itself token-forming).
+- `collect.rs`: `PartWriter::push` no longer returns a fabricated
+  (rel, off) when the write/roll fails - the index line is skipped
+  (honest absence, not a pointer at bytes that never landed).
+- `inject.rs`: `replacen(__G__, count=1)` left the SECOND `__G__` (the
+  _boot record's spoof flag) literal - always reported spoof=0; now 2.
+  The SRC carries the `afeye-harness` marker line for the filter's
+  self-exclusion.
+- `.github/workflows/afeye.yml`: the gate step now writes
+  `$GITHUB_OUTPUT` (printing `cadence=go` to stdout does nothing; every
+  `steps.gate.outputs.cadence == 'go'` consumer was permanently false and
+  the scheduled crawl never ran); the committed TG token/chat-id
+  fallbacks removed (rotate the leaked token).
+- `tools/rec_census.py`: a torn tail (chrome killed by `timeout` /
+  SIGTERM mid-drain) is a warning, not whole-file corruption - parity
+  with collect.rs's starved-tail logic.
+
 
 **24 patches** against **Chromium 153.0.8010.52** (v8 rev
 `d1fed5cd7e3b114dea70f18b20d26f816322833d`). The whole series is
@@ -731,7 +831,7 @@ still holds every hash + ts + pid.
 
 ```
 cd chromium/src
-git apply patches/0001-*.patch   # ... through 0018, in order
+git apply patches/0001-*.patch   # ... through 0024, in order
 ```
 
 GN args (the CI build uses exactly these - `scripts/build-chromium.sh`):
@@ -794,8 +894,14 @@ disables the call stream, `AFEYE_TRACE_CLOCK=0` the clock stream.
   allocation and the hot trap dispatch are CSA/Torque-generated; the
   C++ fallbacks fire only on slow paths and would give a misleading
   partial picture. Partial real coverage exists: proxy
-  getOwnPropertyDescriptor traps DO cross the 0022 GOPD hook (JS_PROXY
-  is a special receiver).
+  getOwnPropertyDescriptor traps do NOT cross the 0022 GOPD hook (v12.1
+  audit correction: pristine js-objects.cc:1985-1990 - JSProxy holders
+  early-return into JSProxy::GetOwnPropertyDescriptor BEFORE the hook
+  sits; the trap result flows through ToPropertyDescriptor property GETs
+  that never re-enter the hooked slow path). Only NON-proxy special
+  receivers (DOM objects with interceptors) are captured. Proxy coverage
+  would need a second hook inside JSProxy::GetOwnPropertyDescriptor
+  (separate TU) - deliberately not added.
 - **defineProperty/defineOwnProperty is NOT captured** (audit R4,
   deferred): the honest funnel is `JSReceiver::DefineOwnProperty`
   (js-objects.cc, same TU as 0022 - zero marginal cost), but it needs a

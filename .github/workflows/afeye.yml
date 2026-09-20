@@ -16,8 +16,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AFEYE_TG_TOKEN: ${{ secrets.AFEYE_TG_TOKEN || '8476681801:AAGTlr67elYrhlBj_fiMIaBLtxAfG18NZDA' }}
-  AFEYE_TG_CHAT: ${{ secrets.AFEYE_TG_CHAT || '5853929835' }}
+            AFEYE_TG_TOKEN: ${{ secrets.AFEYE_TG_TOKEN }}
+  AFEYE_TG_CHAT: ${{ secrets.AFEYE_TG_CHAT }}
   AFEYE_TG_ON: ${{ vars.AFEYE_TG_ON || '1' }}
   AFEYE_QUEUE_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/queue/pending.json
   AFEYE_QUEUE_TOKEN: ${{ secrets.AFEYE_QUEUE_TOKEN || github.token }}
@@ -44,12 +44,22 @@ jobs:
               st = json.load(open("state/cadence.json"))
           except Exception:
               pass
+          # v12.1: emit through $GITHUB_OUTPUT - printing to stdout does
+          # nothing (Actions parses neither); every `steps.gate.outputs
+          # .cadence == 'go'` consumer was permanently false and the
+          # scheduled crawl never ran.
+          out = os.environ.get("GITHUB_OUTPUT", "")
+          def emit(v):
+              print(v)
+              if out:
+                  with open(out, "a") as f:
+                      f.write(v + "\n")
           last_end = float(st.get("last_end", 0))
           credits = int(st.get("credits", 0))
           deadline = last_end + 3 * 3600 * credits
           eff = credits if now < deadline else 0
           if ev != "repository_dispatch":
-              print(f"cadence=go event={ev} credits={eff}")
+              emit(f"cadence=go event={ev} credits={eff}")
               raise SystemExit
           pend = 0
           try:
@@ -59,12 +69,12 @@ jobs:
               pass
           if eff >= 2:
               wait_s = int(deadline - now)
-              print(f"cadence=skip credits={eff} wait_s={wait_s} pending={pend}")
+              emit(f"cadence=skip credits={eff} wait_s={wait_s} pending={pend}")
               raise SystemExit
           if pend == 0:
-              print("cadence=skip empty-queue")
+              emit("cadence=skip empty-queue")
               raise SystemExit
-          print(f"cadence=go credits={eff} pending={pend}")
+          emit(f"cadence=go credits={eff} pending={pend}")
           PY
       - name: chrome
         id: chrome

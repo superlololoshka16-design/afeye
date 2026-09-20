@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000000..1111111111
 --- /dev/null
 +++ b/v8/src/afeye/sink.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +0,58 @@
 +#ifndef V8_AFEYE_SINK_H_
 +#define V8_AFEYE_SINK_H_
 +
@@ -67,7 +67,7 @@ new file mode 100644
 index 0000000000..1111111111
 --- /dev/null
 +++ b/v8/src/afeye/sink.cc
-@@ -0,0 +1,263 @@
+@@ -0,0 +58,284 @@
 +#include "src/afeye/sink.h"
 +
 +#ifdef V8_AFEYE
@@ -102,6 +102,7 @@ index 0000000000..1111111111
 +std::atomic<bool> g_on{false};
 +std::atomic<uint64_t> g_dropped{0};
 +std::once_flag g_init_once;
++pid_t g_pid = 0;  // v12.1: fork safety - see Enabled()
 +
 +struct Ring {
 +  std::atomic_flag lock = ATOMIC_FLAG_INIT;
@@ -203,11 +204,29 @@ index 0000000000..1111111111
 +  }
 +}
 +
++// v12.1: fork safety. Chrome zygote-forks renderers AFTER InitOnce ran in
++// the parent: the child inherits the once_flag as COMPLETED, the ring, and
++// g_pid - but the drain thread does NOT survive fork (only the calling
++// thread continues). The child would fill the inherited 8 MiB ring, drop
++// everything, and never create its <layer>-<pid>.rec. getpid is vDSO (no
++// syscall) so the check is free in the hot path.
++void ReinitAfterFork() {
++  while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
++  }
++  g_ring.tail = 0;
++  g_ring.head = 0;
++  g_ring.lock.clear(std::memory_order_release);
++  g_dropped.store(0, std::memory_order_relaxed);
++  g_pid = ::getpid();
++  std::thread(DrainLoop).detach();
++}
++
 +void InitOnce() {
 +  if (!EnvOn()) return;
 +  ::mkdir(RawDir(), 0777);
 +  ::chmod(RawDir(), 0777);
 +  g_on.store(true, std::memory_order_release);
++  g_pid = ::getpid();
 +  std::thread(DrainLoop).detach();
 +  std::atexit([] { Flush(500); });
 +}
@@ -216,6 +235,7 @@ index 0000000000..1111111111
 +
 +bool Enabled() {
 +  std::call_once(g_init_once, InitOnce);
++  if (::getpid() != g_pid) ReinitAfterFork();
 +  return g_on.load(std::memory_order_acquire);
 +}
 +
@@ -334,7 +354,7 @@ index 0000000000..1111111111
 +
 --- a/v8/BUILD.gn
 +++ b/v8/BUILD.gn
-@@ -63,6 +63,9 @@
+@@ -63,6 +405,9 @@
  
    # Sets -DVERIFY_PREDICTABLE
    v8_enable_verify_predictable = false
@@ -344,7 +364,7 @@ index 0000000000..1111111111
  
    # Enable DWARF line info for Torque files.
    # TODO(olivf): Find out how this works on other platforms.
-@@ -7040,5 +7043,19 @@
+@@ -7040,6 +7385,20 @@
        "src/extensions/vtunedomain-support-extension.h",
      ]
      deps += [ "third_party/vtune:v8_vtune_trace_mark" ]

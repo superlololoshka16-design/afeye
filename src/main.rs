@@ -226,7 +226,20 @@ async fn run() -> Result<(), String> {
     std::fs::create_dir_all(&stage_run).map_err(|e| e.to_string())?;
     // C++ sink collector: up before any chrome exists, drained after every
     // chrome is dead, so the raw record timeline lands inside the zip.
-    let collector = collect::Collector::spawn(&stage);
+    // The raw dir must start EMPTY: FileTail rescans unseen files from
+    // offset 0, so stale <layer>-<pid>.rec from a previous run would blend
+    // into this timeline and the sink-hello liveness probe could pass from
+    // a PREVIOUS run's records (pid reuse even re-opens them for append).
+    let raw_dir = std::env::var("AF_RAW_DIR").unwrap_or_else(|_| "/tmp/afeye-raw".into());
+    let _ = std::fs::create_dir_all(&raw_dir);
+    if let Ok(rd) = std::fs::read_dir(&raw_dir) {
+        for e in rd.flatten() {
+            if e.path().extension().map(|x| x == "rec").unwrap_or(false) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let collector = collect::Collector::spawn(&stage_run);
     let chrome = find_chrome().ok_or("chrome binary not found")?;
     let ua = user_agent_for(&chrome);
     let xv = if local {
@@ -494,8 +507,30 @@ async fn run() -> Result<(), String> {
     for f in futs {
         let _ = f.await;
     }
+    // graceful first: CDP Browser.close / SIGTERM lets the C++ atexit
+    // Flush(500) drain the 8 MiB rings (a SIGKILL-only shutdown loses the
+    // tail records AND the loss is invisible to the kind-39 witness, which
+    // would turn "ring backlog lost at kill" into a false dead-end-proven).
     for mut c in children {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            let _ = c.start_kill();
+            let _ = c.wait().await;
+            let _ = std::process::Command::new("pkill")
+                .args(["-TERM", "-f", &chrome.to_string_lossy()])
+                .status();
+        }
         let _ = c.kill().await;
+    }
+    // grace window: drain threads write out their rings before the collector
+    // takes its final scan (the drain loop flushes on atexit within 500 ms).
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-KILL", "-f", &chrome.to_string_lossy()])
+            .status();
     }
     if !local {
         for t in &ctx.tunnels {
@@ -528,6 +563,11 @@ async fn run() -> Result<(), String> {
                 "[afeye] sinkfilter: fragments={} chains={} hot={} cold={} wasm={} net_chains={} token={} dead_end={} net_adjacent={}",
                 sf.fragments, sf.chains, sf.hot_chains, sf.cold_chains, sf.wasm_modules, sf.net_chains,
                 sf.token_chains, sf.dead_end_chains, sf.net_adjacent_chains
+            );
+            eprintln!(
+                "[afeye] verdicts: proven={} heuristic={} dead_end_proven={} unresolved={} graph: nodes={} edges={} tainted={} seeds={} fanout_dropped={}",
+                sf.proven_chains, sf.heuristic_chains, sf.dead_end_proven, sf.unresolved_chains,
+                sf.graph_nodes, sf.graph_edges, sf.graph_tainted, sf.graph_sinks, sf.graph_fanout_dropped
             );
             eprintln!(
                 "[afeye] dead-end split: filtered zip carries the {} token-forming chains; all {} chains stay whole in the raw run zip",

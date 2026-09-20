@@ -1,11 +1,14 @@
 --- a/third_party/blink/renderer/core/dom/document.cc
 +++ b/third_party/blink/renderer/core/dom/document.cc
-@@ -29,6 +29,12 @@
+@@ -29,6 +29,15 @@
  
  #include "third_party/blink/renderer/core/dom/document.h"
  
 +#ifdef BLINK_AFEYE
++#include <atomic>
 +#include <cstdio>
++#include <cstdlib>
++#include <string>
 +
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +#endif
@@ -13,7 +16,7 @@
  #include <algorithm>
  #include <memory>
  #include <optional>
-@@ -6844,7 +6850,21 @@ String Document::cookie(ExceptionState& exception_state) const {
+@@ -6844,7 +6853,47 @@ String Document::cookie(ExceptionState& exception_state) const {
      CountUse(WebFeature::kFileAccessedCookies);
    }
  
@@ -24,31 +27,62 @@
 +  // captures the VALUE - the cookie jar the challenge token (cf_clearance,
 +  // DataDome, Kasada) lives in. Capped to the head of the string (the token
 +  // names+values are what matter, not a multi-KB analytics tail).
-+  if (blink::afeye::Enabled() && !afeye_cookies.empty()) {
-+    char afeye_buf[1024];
-+    std::snprintf(afeye_buf, sizeof(afeye_buf), "cookie-get len=%u %.960s",
-+                  afeye_cookies.length(), afeye_cookies.Utf8().c_str());
-+    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
-+                          afeye_buf);
++namespace {
++// v12.1: AFEYE_TRACE_STORAGE=0 + 2M cap - the series-standard per-stream
++// gate the sibling funnels have (0012/0015/0016/0024); document.cookie is
++// read in polling loops by antifraud, so the stream needs a bound.
++std::atomic<uint64_t> g_afeye_storage{0};
++constexpr uint64_t kAfeyeStorageCap = 2ull << 20;
++inline bool AfeyeStorageOn() {
++  static const bool off = []() {
++    const char* v = std::getenv("AFEYE_TRACE_STORAGE");
++    return v && *v && v[0] == '0';
++  }();
++  return !off &&
++         g_afeye_storage.fetch_add(1, std::memory_order_relaxed) <
++             kAfeyeStorageCap;
++}
++}  // namespace
++  if (blink::afeye::Enabled() && AfeyeStorageOn() &&
++      !afeye_cookies.empty()) {
++    // v12.1: EmitSpan tag\0value (was EmitStr prose) - the NUL split is
++    // what admits the VALUE bytes into the Rust content graph (VALUE_TAGS
++    // matches the tag prefix; prose records were skipped entirely, so the
++    // advertised store-then-send cookie relay never existed). Metadata
++    // (len=) rides in the tag; the body IS the value head.
++    char afeye_tag[64];
++    std::snprintf(afeye_tag, sizeof(afeye_tag), "cookie-get len=%u",
++                  afeye_cookies.length());
++    std::string afeye_v = afeye_cookies.Utf8();
++    if (afeye_v.size() > 960) afeye_v.resize(960);
++    blink::afeye::EmitSpan(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                           afeye_tag,
++                           reinterpret_cast<const uint8_t*>(afeye_v.data()),
++                           static_cast<uint32_t>(afeye_v.size()));
 +  }
 +#endif
 +  return afeye_cookies;
  }
  
  void Document::setCookie(const String& value, ExceptionState& exception_state) {
-@@ -6869,6 +6889,17 @@ void Document::setCookie(const String& value, ExceptionState& exception_state) {
+@@ -6869,6 +6918,22 @@ void Document::setCookie(const String& value, ExceptionState& exception_state) {
      UseCounter::Count(*this, WebFeature::kFileAccessedCookies);
    }
  
 +#ifdef BLINK_AFEYE
 +  // afeye (0013): document.cookie WRITE - the set-cookie the page itself
 +  // plants (challenge ack, first-party token). Head-capped like the getter.
-+  if (blink::afeye::Enabled() && !value.empty()) {
-+    char afeye_buf[1024];
-+    std::snprintf(afeye_buf, sizeof(afeye_buf), "cookie-set len=%u %.960s",
-+                  value.length(), value.Utf8().c_str());
-+    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
-+                          afeye_buf);
++  if (blink::afeye::Enabled() && AfeyeStorageOn() &&
++      !value.empty()) {
++    char afeye_tag[64];
++    std::snprintf(afeye_tag, sizeof(afeye_tag), "cookie-set len=%u",
++                  value.length());
++    std::string afeye_v = value.Utf8();
++    if (afeye_v.size() > 960) afeye_v.resize(960);
++    blink::afeye::EmitSpan(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                           afeye_tag,
++                           reinterpret_cast<const uint8_t*>(afeye_v.data()),
++                           static_cast<uint32_t>(afeye_v.size()));
 +  }
 +#endif
    if (cookie_jar_->SetCookie(value)) {
@@ -56,12 +90,15 @@
    }
 --- a/third_party/blink/renderer/modules/storage/storage_area.cc
 +++ b/third_party/blink/renderer/modules/storage/storage_area.cc
-@@ -25,6 +25,12 @@
+@@ -25,6 +90,15 @@
  
  #include "third_party/blink/renderer/modules/storage/storage_area.h"
  
 +#ifdef BLINK_AFEYE
++#include <atomic>
 +#include <cstdio>
++#include <cstdlib>
++#include <string>
 +
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +#endif
@@ -69,7 +106,7 @@
  #include "base/feature_list.h"
  #include "base/memory/scoped_refptr.h"
  #include "base/trace_event/trace_event.h"
-@@ -116,7 +122,22 @@ String StorageArea::getItem(const String& key,
+@@ -116,7 +190,39 @@ String StorageArea::getItem(const String& key,
      exception_state.ThrowSecurityError(StorageArea::kAccessDeniedMessage);
      return String();
    }
@@ -80,20 +117,37 @@
 +  // the base fingerprint, the eval-chunk closure, or the challenge token here
 +  // at init and reads it back at send time (the store-then-send pattern the
 +  // fixed net-window drops). kind-29 names the call; this captures key+value.
-+  if (blink::afeye::Enabled() && !key.empty()) {
-+    char afeye_buf[1024];
-+    std::snprintf(afeye_buf, sizeof(afeye_buf), "storage-get key=%.128s vlen=%u %.800s",
-+                  key.Utf8().c_str(), afeye_item.length(),
-+                  afeye_item.Utf8().c_str());
-+    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
-+                          afeye_buf);
++namespace {
++std::atomic<uint64_t> g_afeye_storage{0};
++constexpr uint64_t kAfeyeStorageCap = 2ull << 20;
++inline bool AfeyeStorageOn() {
++  static const bool off = []() {
++    const char* v = std::getenv("AFEYE_TRACE_STORAGE");
++    return v && *v && v[0] == '0';
++  }();
++  return !off &&
++         g_afeye_storage.fetch_add(1, std::memory_order_relaxed) <
++             kAfeyeStorageCap;
++}
++}  // namespace
++  if (blink::afeye::Enabled() && AfeyeStorageOn() && !key.empty()) {
++    char afeye_tag[192];
++    std::snprintf(afeye_tag, sizeof(afeye_tag),
++                  "storage-get key=%.128s vlen=%u", key.Utf8().c_str(),
++                  afeye_item.length());
++    std::string afeye_v = afeye_item.Utf8();
++    if (afeye_v.size() > 800) afeye_v.resize(800);
++    blink::afeye::EmitSpan(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                           afeye_tag,
++                           reinterpret_cast<const uint8_t*>(afeye_v.data()),
++                           static_cast<uint32_t>(afeye_v.size()));
 +  }
 +#endif
 +  return afeye_item;
  }
  
  NamedPropertySetterResult StorageArea::setItem(
-@@ -127,6 +148,19 @@ NamedPropertySetterResult StorageArea::setItem(
+@@ -127,6 +233,24 @@ NamedPropertySetterResult StorageArea::setItem(
      exception_state.ThrowSecurityError(StorageArea::kAccessDeniedMessage);
      return NamedPropertySetterResult::kIntercepted;
    }
@@ -102,12 +156,17 @@
 +  // of store-then-send. Captures key + value head so the content-slice
 +  // backward pass can link this stored blob to the later crypto/send that
 +  // consumed it.
-+  if (blink::afeye::Enabled() && !key.empty()) {
-+    char afeye_buf[1024];
-+    std::snprintf(afeye_buf, sizeof(afeye_buf), "storage-set key=%.128s vlen=%u %.800s",
-+                  key.Utf8().c_str(), value.length(), value.Utf8().c_str());
-+    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
-+                          afeye_buf);
++  if (blink::afeye::Enabled() && AfeyeStorageOn() && !key.empty()) {
++    char afeye_tag[192];
++    std::snprintf(afeye_tag, sizeof(afeye_tag),
++                  "storage-set key=%.128s vlen=%u", key.Utf8().c_str(),
++                  value.length());
++    std::string afeye_v = value.Utf8();
++    if (afeye_v.size() > 800) afeye_v.resize(800);
++    blink::afeye::EmitSpan(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                           afeye_tag,
++                           reinterpret_cast<const uint8_t*>(afeye_v.data()),
++                           static_cast<uint32_t>(afeye_v.size()));
 +  }
 +#endif
    if (!cached_area_->SetItem(key, value, this)) {

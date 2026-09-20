@@ -14,14 +14,15 @@
  #include "base/containers/span.h"
  #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
  #include "third_party/blink/renderer/bindings/core/v8/serialization/post_message_helper.h"
-@@ -20,6 +27,21 @@
+@@ -20,6 +27,22 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
++// v12.1: g_afeye_taint is shared via the blink sink (0005) - five
++// per-TU atomics were 500k/process, 5x the documented cap.
 +constexpr uint64_t kAfeyeTaintCap = 100000;
-+std::atomic<uint64_t> g_afeye_taint{0};
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
 +  return v != nullptr && *v != '\0' && v[0] == '0';
@@ -36,7 +37,7 @@
  String UniversalGlobalScope::btoa(const String& string_to_encode,
                                    ExceptionState& exception_state) {
    if (string_to_encode.IsNull()) {
-@@ -34,6 +56,20 @@ String UniversalGlobalScope::btoa(const String& string_to_encode,
+@@ -34,6 +57,20 @@ String UniversalGlobalScope::btoa(const String& string_to_encode,
      return String();
    }
  
@@ -57,7 +58,7 @@
    return Base64Encode(base::as_byte_span(string_to_encode.Latin1()));
  }
  
-@@ -58,6 +94,15 @@ String UniversalGlobalScope::atob(const String& encoded_string,
+@@ -58,6 +95,15 @@ String UniversalGlobalScope::atob(const String& encoded_string,
      return String();
    }
  
@@ -75,7 +76,7 @@
  
 --- a/third_party/blink/renderer/core/html/forms/form_data.cc
 +++ b/third_party/blink/renderer/core/html/forms/form_data.cc
-@@ -30,6 +30,16 @@
+@@ -30,6 +76,16 @@
  
  #include "third_party/blink/renderer/core/html/forms/form_data.h"
  
@@ -92,14 +93,15 @@
  #include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
  #include "third_party/blink/renderer/bindings/core/v8/v8_union_file_usvstring.h"
  #include "third_party/blink/renderer/core/execution_context/execution_context.h"
-@@ -48,6 +58,21 @@
+@@ -48,6 +104,22 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
++// v12.1: g_afeye_taint is shared via the blink sink (0005) - five
++// per-TU atomics were 500k/process, 5x the documented cap.
 +constexpr uint64_t kAfeyeTaintCap = 100000;
-+std::atomic<uint64_t> g_afeye_taint{0};
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
 +  return v != nullptr && *v != '\0' && v[0] == '0';
@@ -114,7 +116,7 @@
  namespace {
  
  class FormDataIterationSource final
-@@ -364,12 +389,55 @@ FormData::Entry::Entry(const String& name, const String& value)
+@@ -364,12 +436,55 @@ FormData::Entry::Entry(const String& name, const String& value)
        << "'name' should be a USVString.";
    DCHECK_EQ(value, ReplaceUnmatchedSurrogates(value))
        << "'value' should be a USVString.";
@@ -172,7 +174,7 @@
  void FormData::Entry::Trace(Visitor* visitor) const {
 --- a/third_party/blink/renderer/core/url/url_search_params.cc
 +++ b/third_party/blink/renderer/core/url/url_search_params.cc
-@@ -4,6 +4,13 @@
+@@ -4,6 +119,13 @@
  
  #include "third_party/blink/renderer/core/url/url_search_params.h"
  
@@ -186,14 +188,15 @@
  #include <algorithm>
  #include <utility>
  
-@@ -19,6 +26,21 @@
+@@ -19,6 +141,22 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
++// v12.1: g_afeye_taint is shared via the blink sink (0005) - five
++// per-TU atomics were 500k/process, 5x the documented cap.
 +constexpr uint64_t kAfeyeTaintCap = 100000;
-+std::atomic<uint64_t> g_afeye_taint{0};
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
 +  return v != nullptr && *v != '\0' && v[0] == '0';
@@ -208,7 +211,7 @@
  namespace {
  
  class URLSearchParamsIterationSource final
-@@ -171,6 +193,17 @@ void URLSearchParams::SetInputWithoutUpdate(const String& query_string) {
+@@ -171,6 +309,17 @@ void URLSearchParams::SetInputWithoutUpdate(const String& query_string) {
  String URLSearchParams::toString() const {
    Vector<char> encoded_data;
    EncodeAsFormData(encoded_data);
@@ -228,7 +231,7 @@
  
 --- a/third_party/blink/renderer/modules/encoding/text_decoder.cc
 +++ b/third_party/blink/renderer/modules/encoding/text_decoder.cc
-@@ -30,6 +30,13 @@
+@@ -30,6 +179,13 @@
  
  #include "third_party/blink/renderer/modules/encoding/text_decoder.h"
  
@@ -242,14 +245,15 @@
  #include "third_party/blink/renderer/bindings/core/v8/v8_union_arraybuffer_arraybufferview.h"
  #include "third_party/blink/renderer/core/typed_arrays/dom_array_buffer.h"
  #include "third_party/blink/renderer/core/typed_arrays/dom_array_buffer_view.h"
-@@ -41,6 +48,21 @@
+@@ -41,6 +197,22 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
++// v12.1: g_afeye_taint is shared via the blink sink (0005) - five
++// per-TU atomics were 500k/process, 5x the documented cap.
 +constexpr uint64_t kAfeyeTaintCap = 100000;
-+std::atomic<uint64_t> g_afeye_taint{0};
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
 +  return v != nullptr && *v != '\0' && v[0] == '0';
@@ -264,7 +268,7 @@
  TextDecoder* TextDecoder::Create(const String& label,
                                   const TextDecoderOptions* options,
                                   ExceptionState& exception_state) {
-@@ -118,6 +140,17 @@ String TextDecoder::Decode(base::span<const uint8_t> input,
+@@ -118,6 +290,17 @@ String TextDecoder::Decode(base::span<const uint8_t> input,
  
    bool saw_error = false;
    String s = codec_->Decode(input, flush, fatal_, saw_error);
@@ -284,7 +288,7 @@
      if (!do_not_flush_) {
 --- a/third_party/blink/renderer/modules/encoding/text_encoder.cc
 +++ b/third_party/blink/renderer/modules/encoding/text_encoder.cc
-@@ -30,6 +30,13 @@
+@@ -30,6 +213,13 @@
  
  #include "third_party/blink/renderer/modules/encoding/text_encoder.h"
  
@@ -298,14 +302,15 @@
  #include "base/feature_list.h"
  #include "third_party/blink/renderer/bindings/modules/v8/v8_text_encoder_encode_into_result.h"
  #include "third_party/blink/renderer/core/execution_context/execution_context.h"
-@@ -40,6 +47,21 @@
+@@ -40,6 +230,22 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
++// v12.1: g_afeye_taint is shared via the blink sink (0005) - five
++// per-TU atomics were 500k/process, 5x the documented cap.
 +constexpr uint64_t kAfeyeTaintCap = 100000;
-+std::atomic<uint64_t> g_afeye_taint{0};
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
 +  return v != nullptr && *v != '\0' && v[0] == '0';
@@ -320,7 +325,7 @@
  // Controls if TextEncode will throw an exception when failed to allocate
  // buffer.
  BASE_FEATURE(kThrowExceptionWhenTextEncodeOOM,
-@@ -74,6 +96,20 @@ NotShared<DOMUint8Array> TextEncoder::encode(const String& input,
+@@ -74,6 +280,20 @@ NotShared<DOMUint8Array> TextEncoder::encode(const String& input,
    std::string result = VisitCharacters(input, [this](auto chars) {
      return codec_->Encode(chars, UnencodableHandling::kNone);
    });
@@ -341,7 +346,7 @@
    if (base::FeatureList::IsEnabled(kThrowExceptionWhenTextEncodeOOM)) {
      NotShared<DOMUint8Array> result_array(
          DOMUint8Array::CreateOrNull(base::as_byte_span(result)));
-@@ -99,6 +135,18 @@ TextEncoderEncodeIntoResult* TextEncoder::encodeInto(
+@@ -99,6 +319,18 @@ TextEncoderEncodeIntoResult* TextEncoder::encodeInto(
        });
    encode_into_result->setRead(encode_into_result_data.code_units_read);
    encode_into_result->setWritten(encode_into_result_data.bytes_written);

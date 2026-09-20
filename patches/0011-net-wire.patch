@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000000..1111111111
 --- /dev/null
 +++ b/services/network/afeye_sink.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +0,37 @@
 +#ifndef SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
 +#define SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
 +
@@ -47,7 +47,7 @@ new file mode 100644
 index 0000000000..1111111111
 --- /dev/null
 +++ b/services/network/afeye_sink.cc
-@@ -0,0 +1,263 @@
+@@ -0,0 +37,280 @@
 +#include "services/network/afeye_sink.h"
 +
 +#ifdef NET_AFEYE
@@ -82,6 +82,7 @@ index 0000000000..1111111111
 +std::atomic<bool> g_on{false};
 +std::atomic<uint64_t> g_dropped{0};
 +std::once_flag g_init_once;
++pid_t g_pid = 0;  // v12.1: fork safety - see Enabled()
 +
 +struct Ring {
 +  std::atomic_flag lock = ATOMIC_FLAG_INIT;
@@ -183,11 +184,25 @@ index 0000000000..1111111111
 +  }
 +}
 +
++// v12.1: fork safety (see 0001 for the rationale). The network service
++// utility process also forks (e.g. crashpad helpers); same re-init rule.
++void ReinitAfterFork() {
++  while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
++  }
++  g_ring.tail = 0;
++  g_ring.head = 0;
++  g_ring.lock.clear(std::memory_order_release);
++  g_dropped.store(0, std::memory_order_relaxed);
++  g_pid = ::getpid();
++  std::thread(DrainLoop).detach();
++}
++
 +void InitOnce() {
 +  if (!EnvOn()) return;
 +  ::mkdir(RawDir(), 0777);
 +  ::chmod(RawDir(), 0777);
 +  g_on.store(true, std::memory_order_release);
++  g_pid = ::getpid();
 +  std::thread(DrainLoop).detach();
 +  std::atexit([] { Flush(500); });
 +}
@@ -196,6 +211,7 @@ index 0000000000..1111111111
 +
 +bool Enabled() {
 +  std::call_once(g_init_once, InitOnce);
++  if (::getpid() != g_pid) ReinitAfterFork();
 +  return g_on.load(std::memory_order_acquire);
 +}
 +
@@ -315,7 +331,7 @@ index 0000000000..1111111111
 
 --- a/services/network/BUILD.gn
 +++ b/services/network/BUILD.gn
-@@ -8,6 +8,11 @@
+@@ -8,6 +325,11 @@
  import("//net/features.gni")
  import("//services/network/public/cpp/features.gni")
  import("//testing/libfuzzer/fuzzer_test.gni")
@@ -327,7 +343,7 @@ index 0000000000..1111111111
  
  component("network_service") {
    sources = [
-@@ -447,6 +452,13 @@
+@@ -447,6 +769,13 @@
    }
  
    defines = [ "IS_NETWORK_SERVICE_IMPL" ]
@@ -344,7 +360,7 @@ index 0000000000..1111111111
 
 --- a/services/network/url_loader.cc
 +++ b/services/network/url_loader.cc
-@@ -3,6 +3,10 @@
+@@ -3,6 +332,10 @@
  // found in the LICENSE file.
  
  #include "services/network/url_loader.h"
@@ -355,7 +371,7 @@ index 0000000000..1111111111
  
  #include <algorithm>
  #include <limits>
-@@ -633,6 +637,31 @@
+@@ -633,6 +966,31 @@
  void URLLoader::SetUpUpload(
      const ResourceRequest& request,
      base::expected<std::vector<base::File>, net::Error> file_open_result) {
@@ -387,7 +403,7 @@ index 0000000000..1111111111
    if (file_opener_for_upload_) {
      file_opener_for_upload_.reset();
      // This corresponds to the LogBlockedBy call made just before creating
-@@ -739,6 +768,20 @@
+@@ -739,6 +1097,20 @@
  }
  
  void URLLoader::ScheduleStart() {
@@ -408,7 +424,7 @@ index 0000000000..1111111111
    TRACE_EVENT("loading", "URLLoader::ScheduleStart",
                net::NetLogWithSourceToFlow(url_request_->net_log()));
    bool defer = false;
-@@ -1195,6 +1238,28 @@
+@@ -1195,6 +1567,28 @@
  }
  
  void URLLoader::ContinueOnResponseStarted() {
@@ -437,7 +453,7 @@ index 0000000000..1111111111
    // Do not account header bytes when reporting received body bytes to client.
    reported_total_encoded_bytes_ =
        url_request_->GetTotalReceivedBytes().InBytes();
-@@ -1647,6 +1712,18 @@
+@@ -1647,6 +2041,18 @@
    url_read_state_ = URLReadState::kWaitMojoPipeWritable;
  
    size_t new_data_offset = pending_write_buffer_offset_;
@@ -456,7 +472,7 @@ index 0000000000..1111111111
    MaybeCollectDurableMessage(new_data_offset, num_bytes);
  
    if (num_bytes > 0) {
-@@ -1941,6 +2018,21 @@
+@@ -1941,6 +2347,21 @@
  }
  
  void URLLoader::NotifyCompleted(int error_code) {
@@ -481,7 +497,7 @@ index 0000000000..1111111111
 
 --- a/services/network/websocket.cc
 +++ b/services/network/websocket.cc
-@@ -3,6 +3,9 @@
+@@ -3,6 +424,9 @@
  // found in the LICENSE file.
  
  #include "services/network/websocket.h"
@@ -491,7 +507,7 @@ index 0000000000..1111111111
  
  #include <inttypes.h>
  #include <string.h>
-@@ -411,6 +414,16 @@
+@@ -411,6 +835,16 @@
      bool fin,
      net::WebSocketFrameHeader::OpCode type,
      base::span<const char> payload) {

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Recount unified-diff hunk headers in afeye patches.
 
-The series is anchor-style (applied with git apply --3way / --recount; see
-SERIES.md), so line NUMBERS are approximations, but the +/- COUNTS in each
-@@ header must match the hunk body exactly. This script recomputes them.
+The series is anchor-style (applied with plain `git apply`, never --3way;
+see SERIES.md), so line NUMBERS are approximations, but the +/- COUNTS in
+each @@ header must match the hunk body exactly. This script recomputes them.
 """
 import glob
 import sys

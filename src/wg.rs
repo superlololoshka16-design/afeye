@@ -97,7 +97,9 @@ pub async fn setup(t: &Tunnel, work: &Path) -> Result<(), String> {
     sc.push_str("\nPersistentKeepalive = 25\n");
     std::fs::write(&setconf, &sc).map_err(|e| e.to_string())?;
     {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
+        #[cfg(unix)]
         let _ = std::fs::set_permissions(&setconf, std::fs::Permissions::from_mode(0o600));
     }
     let scs = setconf.to_string_lossy().to_string();

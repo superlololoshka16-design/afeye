@@ -136,7 +136,7 @@
  ContainerQueryList* Element::matchContainer(const String& query) {
 --- a/third_party/blink/renderer/core/html/html_element.cc
 +++ b/third_party/blink/renderer/core/html/html_element.cc
-@@ -24,6 +24,10 @@
+@@ -24,6 +107,10 @@
   */
  
  #include "third_party/blink/renderer/core/html/html_element.h"
@@ -147,7 +147,7 @@
  
  #include <iterator>
  
-@@ -4273,11 +4277,35 @@
+@@ -4273,11 +4360,35 @@
  }
  
  int HTMLElement::offsetLeftForBinding() {
@@ -185,7 +185,7 @@
  }
  
  int HTMLElement::offsetWidthForBinding() {
-@@ -4287,6 +4315,17 @@
+@@ -4287,6 +4398,17 @@
    if (const auto* layout_object = GetLayoutBoxModelObject()) {
      result = AdjustedOffsetForZoom(layout_object->OffsetWidth());
    }
@@ -203,7 +203,7 @@
    return result;
  }
  
-@@ -4298,6 +4337,17 @@
+@@ -4298,6 +4420,17 @@
    if (const auto* layout_object = GetLayoutBoxModelObject()) {
      result = AdjustedOffsetForZoom(layout_object->OffsetHeight());
    }
@@ -223,7 +223,7 @@
  
 --- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-@@ -24,6 +24,11 @@
+@@ -24,6 +157,11 @@
   */
  
  #include "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h"
@@ -235,7 +235,7 @@
  
  #include <inttypes.h>
  
-@@ -3874,6 +3879,15 @@
+@@ -3874,6 +4012,15 @@
  
  ScriptObject WebGLRenderingContextBase::getExtension(ScriptState* script_state,
                                                       const String& name) {
@@ -251,7 +251,7 @@
    ExecutionContext* context = ExecutionContext::From(script_state);
  
    if (name == WebGLDebugRendererInfo::ExtensionName()) {
-@@ -3989,6 +4003,15 @@
+@@ -3989,6 +4136,15 @@
  
  ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
                                                      GLenum pname) {
@@ -267,7 +267,7 @@
    if (isContextLost())
      return ScriptValue::CreateNull(script_state->GetIsolate());
    const int kIntZero = 0;
-@@ -4487,6 +4510,17 @@
+@@ -4487,6 +4643,17 @@
  WebGLShaderPrecisionFormat* WebGLRenderingContextBase::getShaderPrecisionFormat(
      GLenum shader_type,
      GLenum precision_type) {
@@ -285,7 +285,7 @@
    if (isContextLost())
      return nullptr;
    if (!ValidateShaderType("getShaderPrecisionFormat", shader_type)) {
-@@ -4533,6 +4567,23 @@
+@@ -4533,6 +4700,23 @@
      }
    }
  
@@ -311,7 +311,7 @@
  
 --- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 +++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-@@ -3,6 +3,10 @@
+@@ -3,6 +187,10 @@
  // found in the LICENSE file.
  
  #include "third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.h"
@@ -322,7 +322,7 @@
  
  #include <cmath>
  #include <cstdint>
-@@ -360,6 +364,16 @@
+@@ -360,6 +548,16 @@
      int sh,
      ImageDataSettings* image_data_settings,
      ExceptionState& exception_state) {
@@ -339,7 +339,7 @@
    if (!base::CheckMul(sw, sh).IsValid<int>()) {
      exception_state.ThrowRangeError("Out of memory at ImageData creation");
      return nullptr;
-@@ -1167,6 +1181,18 @@
+@@ -1167,6 +1365,18 @@
  }
  
  TextMetrics* BaseRenderingContext2D::measureText(const String& text) {
@@ -360,7 +360,7 @@
    HTMLCanvasElement* canvas = HostAsHTMLCanvasElement();
 --- a/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
 +++ b/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
-@@ -3,6 +3,9 @@
+@@ -3,6 +213,9 @@
  // found in the LICENSE file.
  
  #include "third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.h"
@@ -370,7 +370,7 @@
  
  #include <algorithm>
  
-@@ -226,6 +229,19 @@
+@@ -226,6 +439,19 @@
  
  void OfflineAudioDestinationHandler::FinishOfflineRendering() {
    DCHECK(!IsMainThread());
@@ -392,7 +392,7 @@
    PostCrossThreadTask(
 --- a/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc
 +++ b/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc
-@@ -29,6 +29,9 @@
+@@ -29,6 +255,9 @@
   */
  
  #include "third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.h"
@@ -402,7 +402,7 @@
  
  #include <algorithm>
  #include <memory>
-@@ -828,6 +831,12 @@
+@@ -828,6 +1057,12 @@
      ScriptState* script_state,
      const RTCOfferOptions* options,
      ExceptionState& exception_state) {
@@ -415,7 +415,7 @@
    if (signaling_state_ ==
        webrtc::PeerConnectionInterface::SignalingState::kClosed) {
      exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
-@@ -1101,6 +1110,12 @@
+@@ -1101,6 +1336,12 @@
    }
  
    String sdp = session_description_init->sdp();
@@ -428,7 +428,7 @@
    // https://w3c.github.io/webrtc-pc/#dom-peerconnection-setlocaldescription
    // step 4.4 and 4.5: If SDP is empty, return the last created offer or answer.
    if (sdp.empty()) {
-@@ -1679,6 +1694,13 @@
+@@ -1679,6 +1920,13 @@
      const RTCIceCandidateInit* candidate,
      ExceptionState& exception_state) {
    DCHECK(script_state->ContextIsValid());
@@ -444,7 +444,7 @@
      exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
 --- a/third_party/blink/renderer/modules/mediastream/media_device_info.cc
 +++ b/third_party/blink/renderer/modules/mediastream/media_device_info.cc
-@@ -24,6 +24,10 @@
+@@ -24,6 +272,10 @@
   */
  
  #include "third_party/blink/renderer/modules/mediastream/media_device_info.h"
@@ -455,10 +455,11 @@
  
  #include "third_party/blink/public/mojom/mediastream/media_devices.mojom-blink.h"
  #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
-@@ -41,6 +45,15 @@
+@@ -41,6 +293,16 @@
        label_(label),
        group_id_(group_id),
-       device_type_(device_type) {}
+-      device_type_(device_type) {}
++      device_type_(device_type) {
 +#ifdef BLINK_AFEYE
 +  if (blink::afeye::Enabled()) {
 +    std::string afeye_rec = "device id=" + device_id.Utf8() +
@@ -468,12 +469,13 @@
 +                          afeye_rec.c_str());
 +  }
 +#endif
++  }
  
  String MediaDeviceInfo::deviceId() const {
    return device_id_;
 --- a/third_party/blink/renderer/modules/crypto/crypto.cc
 +++ b/third_party/blink/renderer/modules/crypto/crypto.cc
-@@ -27,6 +27,9 @@
+@@ -27,6 +289,9 @@
   */
  
  #include "third_party/blink/renderer/modules/crypto/crypto.h"
@@ -483,7 +485,7 @@
  
  #include "crypto/random.h"
  #include "third_party/blink/renderer/core/dom/quota_exceeded_error.h"
-@@ -74,6 +77,17 @@
+@@ -74,6 +339,17 @@
      return NotShared<DOMArrayBufferView>(nullptr);
    }
    crypto::RandBytes(array->ByteSpan());
@@ -503,7 +505,7 @@
  
 --- a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
 +++ b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
-@@ -29,6 +29,10 @@
+@@ -29,6 +305,10 @@
   */
  
  #include "third_party/blink/renderer/modules/crypto/subtle_crypto.h"
@@ -514,7 +516,7 @@
  
  #include "base/check_deref.h"
  #include "base/task/single_thread_task_runner.h"
-@@ -234,6 +238,34 @@
+@@ -234,6 +514,38 @@
  
  }  // namespace
  
@@ -531,9 +533,13 @@
 +      n = b->ByteLength();
 +    }
 +  } else if (raw_data->IsArrayBufferView()) {
-+    const DOMArrayBufferView* v = raw_data->GetAsArrayBufferView();
++    // v12.1: the union accessor returns NotShared<DOMArrayBufferView> - a
++    // raw-pointer assignment does not compile (in-tree precedent:
++    // GetAsArrayBufferView().Get() at subtle_crypto.cc:587).
++    NotShared<DOMArrayBufferView> v = raw_data->GetAsArrayBufferView();
 +    if (v) {
-+      auto s = v->ByteSpan();
++      const DOMArrayBufferView* view = v.Get();
++      auto s = view->ByteSpan();
 +      p = reinterpret_cast<const uint8_t*>(s.data());
 +      n = s.size();
 +    }
@@ -549,7 +555,7 @@
  SubtleCrypto::SubtleCrypto() = default;
  
  ScriptPromise<DOMArrayBuffer> SubtleCrypto::encrypt(
-@@ -242,6 +274,10 @@
+@@ -242,6 +554,10 @@
      CryptoKey* key,
      const V8BufferSource* raw_data,
      ExceptionState& exception_state) {
@@ -560,7 +566,7 @@
    // Method described by:
    // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-encrypt
  
-@@ -292,6 +328,10 @@
+@@ -292,6 +608,10 @@
      CryptoKey* key,
      const V8BufferSource* raw_data,
      ExceptionState& exception_state) {
@@ -571,7 +577,7 @@
    // Method described by:
    // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-decrypt
  
-@@ -342,6 +382,10 @@
+@@ -342,6 +662,10 @@
      CryptoKey* key,
      const V8BufferSource* raw_data,
      ExceptionState& exception_state) {
@@ -582,7 +588,7 @@
    // Method described by:
    // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-sign
  
-@@ -447,6 +491,10 @@
+@@ -447,6 +771,10 @@
      const V8AlgorithmIdentifier* raw_algorithm,
      const V8BufferSource* raw_data,
      ExceptionState& exception_state) {
@@ -593,7 +599,7 @@
    // Method described by:
    // https://w3c.github.io/webcrypto/Overview.html#SubtleCrypto-method-digest
  
-@@ -823,6 +871,10 @@
+@@ -823,6 +1151,10 @@
      CryptoKey* base_key,
      std::optional<unsigned> length_bits,
      ExceptionState& exception_state) {
@@ -606,7 +612,7 @@
  
 --- a/third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.cc
 +++ b/third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.cc
-@@ -29,6 +29,9 @@
+@@ -29,6 +361,9 @@
   */
  
  #include "third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.h"
@@ -616,7 +622,7 @@
  
  #include <algorithm>
  #include <memory>
-@@ -239,7 +242,19 @@
+@@ -239,7 +574,19 @@
  
  SerializedScriptValue::SerializedScriptValue(DataBufferPtr data)
      : data_buffer_(std::move(data)),

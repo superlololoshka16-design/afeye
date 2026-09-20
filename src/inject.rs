@@ -1,10 +1,14 @@
 pub fn source(binding: &str, spoof: bool) -> String {
-    SRC.replacen("__B__", binding, 1)
-        .replacen("__G__", if spoof { "1" } else { "0" }, 1)
+    // v12.1: count 2 - SRC carries __G__ TWICE (SGP webgl spoof gate and
+    // the _boot record's spoof flag). replacen(.., 1) left the second
+    // literal, so the boot record always reported spoof=0.
+    SRC.replacen("__B__", binding, 2)
+        .replacen("__G__", if spoof { "1" } else { "0" }, 2)
 }
 
 const SRC: &str = r#"(function(){
 "use strict";
+var AFXH=1;/* afeye-harness v12.1: marker for self-exclusion in the sink filter (is_harness) */
 var B="__B__",L=[],CAP=6000,DR=0,LN=0,SN=0,EVN=0,FNN=0,PON=0,WEN=0,WMDD=0,MQN=0,WSN=0,SLN=0,AG=Object.create(null),MS=Object.create(null),MM=Object.create(null),SLC=Object.create(null),ARM=Object.create(null),STK=Object.create(null),SRCN=Object.create(null),WMR=[];
 var TS=Function.prototype.toString,OWN=TS.call(TS),SYM=Symbol.for("afx"+B),SH=null;
 try{if(window.parent&&window.parent!==window)SH=window.parent[SYM]}catch(x){}

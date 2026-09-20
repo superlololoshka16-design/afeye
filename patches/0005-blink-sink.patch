@@ -2,7 +2,7 @@ diff --git a/third_party/blink/renderer/platform/afeye/sink.h b/third_party/blin
 new file mode 100644
 --- /dev/null
 +++ b/third_party/blink/renderer/platform/afeye/sink.h
-@@ -0,0 +1,68 @@
+@@ -0,0 +0,73 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
 +#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
 +
@@ -10,6 +10,7 @@ new file mode 100644
 +#include <stdint.h>
 +
 +#ifdef BLINK_AFEYE
++#include <atomic>
 +
 +namespace blink {
 +namespace afeye {
@@ -58,6 +59,10 @@ new file mode 100644
 +void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
 +              const uint8_t* bytes, uint32_t n);
 +uint64_t SinkDropped();
++// v12.1 (0016): ONE shared taint-edge record counter for all five
++// funnels (TextEncoder/TextDecoder/atob/btoa/FormData/URLSearchParams)
++// - five per-TU atomics were 5x the documented 100k/process cap.
++extern std::atomic<uint64_t> g_afeye_taint;
 +bool Flush(uint32_t timeout_ms);
 +// Ambient per-thread execution context ("what is running right now"):
 +// the input/event/timer hooks set it, the script/fetch hooks read it,
@@ -75,10 +80,18 @@ diff --git a/third_party/blink/renderer/platform/afeye/sink.cc b/third_party/bli
 new file mode 100644
 --- /dev/null
 +++ b/third_party/blink/renderer/platform/afeye/sink.cc
-@@ -0,0 +1,278 @@
+@@ -0,0 +73,286 @@
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +
 +#ifdef BLINK_AFEYE
++
++namespace blink {
++namespace afeye {
++// v12.1 (0016): the ONE taint-edge counter the five funnels share
++// (extern in sink.h; 0016's per-TU copies deleted).
++std::atomic<uint64_t> g_afeye_taint{0};
++}  // namespace afeye
++}  // namespace blink
 +
 +#include <atomic>
 +#include <cerrno>
@@ -356,7 +369,7 @@ new file mode 100644
 +#endif
 --- a/third_party/blink/renderer/platform/BUILD.gn
 +++ b/third_party/blink/renderer/platform/BUILD.gn
-@@ -270,7 +270,13 @@
+@@ -270,7 +629,13 @@
  
    # Enable TRACE_EVENT instrumentation for Blink bindings.
    # Disabled by default as it increases binary size.
@@ -370,7 +383,7 @@ new file mode 100644
  }
  
  # ZSTD compression is available on Fuchsia (crbug.com/534838085) but disable in
-@@ -1708,6 +1714,14 @@
+@@ -1708,6 +2073,14 @@
      }
    }
  

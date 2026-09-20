@@ -274,8 +274,6 @@ const CONTENT_MAX_RUNS: usize = 8192;
 const CONTENT_LINK_GRACE_NS: u64 = 200_000_000;
 /// hard bound on payload records walked for the content slice (memory)
 const CONTENT_MAX_RECORDS: usize = 50_000;
-/// hard bound on distinct sink runs retained (32 B each -> ~128 MB ceiling)
-const CONTENT_MAX_TOTAL_RUNS: usize = 4_000_000;
 
 // --- v11 the FACT GRAPH (honest selection, not timer guessing) -------------
 // The v8 content-slice was 1-HOP: a carrier had to share a run DIRECTLY with a
@@ -375,6 +373,57 @@ fn name_of(payload: &[u8]) -> (String, Vec<u8>) {
     }
 }
 
+/// v12.1: 0013/0021 emit PROSE (EmitStr, no NUL split): "cookie-get len=N
+/// <value>", "storage-get key=.. vlen=N <value>", "json-stringify len=..
+/// replacer=.. head=<value>". name_of() gives tag="" for those, so the
+/// VALUE_TAGS graph gate skipped every one of them and the advertised
+/// cookie-relay / stringify->req-body linkage never existed. Derive the
+/// (tag, body) pair from the known prefixes so those VALUE bytes join the
+/// content graph. Records that parse to an empty value stay prose
+/// (return None) - metadata lines never become graph nodes.
+fn value_of_prose(payload: &[u8]) -> Option<(String, Vec<u8>)> {
+    let t = std::str::from_utf8(payload).ok()?;
+    for tag in ["cookie-get", "cookie-set"] {
+        if let Some(rest) = t.strip_prefix(tag) {
+            // " len=%u " then the value head
+            let rest = rest.trim_start();
+            if let Some(sp) = rest.find(' ') {
+                let v = &rest[sp + 1..];
+                if !v.is_empty() {
+                    return Some((tag.to_string(), v.as_bytes().to_vec()));
+                }
+            }
+            return None;
+        }
+    }
+    for tag in ["storage-get", "storage-set"] {
+        if let Some(rest) = t.strip_prefix(tag) {
+            // " key=<k> vlen=%u " then the value head
+            if let Some(vp) = rest.find(" vlen=") {
+                let after = &rest[vp + 6..];
+                if let Some(sp) = after.find(' ') {
+                    let v = &after[sp + 1..];
+                    if !v.is_empty() {
+                        return Some((tag.to_string(), v.as_bytes().to_vec()));
+                    }
+                }
+            }
+            return None;
+        }
+    }
+    if let Some(rest) = t.strip_prefix("json-stringify") {
+        // " len=%d replacer=%d head=" then the plaintext head
+        if let Some(hp) = rest.find(" head=") {
+            let v = &rest[hp + 6..];
+            if !v.is_empty() {
+                return Some(("json-stringify".to_string(), v.as_bytes().to_vec()));
+            }
+        }
+        return None;
+    }
+    None
+}
+
 /// v6 script names are "iso:<isolate> <real name>" (compiler.cc sink).
 fn split_iso(name: &str) -> (Option<String>, String) {
     if let Some(rest) = name.strip_prefix("iso:") {
@@ -397,6 +446,18 @@ fn worker_of(txt: &str) -> Option<(String, String)> {
 }
 
 fn is_hot(name: &str, body: &[u8]) -> bool {
+    // v12.1: our own injected instrumentation (inject.rs) embeds literal
+    // HOT_PATTERNS substrings, so its script-source always matched and the
+    // harness chain shipped in BOTH zips as "token-forming". The v12.1 SRC
+    // carries the AFXH marker line - exclude it here. SERIES.md: "if OUR
+    // crawler's own harness shows up, that is a capture-integrity alarm".
+    if body.windows(13).any(|w| w == b"afeye-harness") {
+        return false;
+    }
+    if name.contains("afeye-harness") {
+        return false;
+    }
+
     // compiled inside an antifraud handler/timer: provenance says so
     if name.starts_with("evt:") || name.starts_with("timer:") {
         return true;
@@ -434,14 +495,20 @@ fn overlaps_content_bridge(content_ts: &[u64], first_ts: u64, last_ts: u64) -> b
     a < content_ts.len() && content_ts[a] <= hi
 }
 
-/// v11 (0023): did this pid's sink report ANY dropped record at or before
-/// `ts`? Conservative by design: one drop anywhere earlier in the process is
-/// enough to refuse the "proven dead end" verdict, because the dropped record
-/// could be the missing link of any chain in that pid.
-fn drops_witnessed(drop_events: &[(u64, u64, u64)], pid: u64, ts: u64) -> bool {
+/// v11 (0023): did ANY sink report dropped records at or before `ts`?
+/// Conservative by design: one drop anywhere earlier is enough to refuse
+/// the "proven dead end" verdict, because the dropped record could be the
+/// missing link of any chain. v12.1 widened from same-pid to ANY pid: the
+/// graph's nodes span processes (carriers live in renderer pids, the
+/// req-body/ws sinks in the network-service pid), so a sink dropped in
+/// ANOTHER process kills the seed exactly like a renderer-side drop. The
+/// throttle (10/s) also means dts is the REPORT time, not the drop time -
+/// reports up to 500 ms after the window end still witness it.
+fn drops_witnessed(drop_events: &[(u64, u64, u64)], _pid: u64, ts: u64) -> bool {
+    let horizon = ts.saturating_add(500_000_000);
     drop_events
         .iter()
-        .any(|(dts, dpid, n)| *dpid == pid && *dts <= ts && *n > 0)
+        .any(|(dts, _dpid, n)| *dts <= horizon && *n > 0)
 }
 
 /// v11: minimum hop distance from any graph-tainted payload record inside the
@@ -468,27 +535,9 @@ fn is_monotone(b: &[u8]) -> bool {
     !b.is_empty() && b.iter().all(|&x| x == b[0])
 }
 
-/// blake3 content-runs of a payload body: fixed windows, overlapping stride,
-/// monotone windows skipped. Two records sharing a run carry the same bytes
-/// somewhere in their body - the data-dependency the backward slice follows.
-fn content_runs(body: &[u8]) -> Vec<[u8; 32]> {
-    let mut out: Vec<[u8; 32]> = Vec::new();
-    if body.len() < CONTENT_RUN_BYTES {
-        if !is_monotone(body) && !body.is_empty() {
-            out.push(*blake3::hash(body).as_bytes());
-        }
-        return out;
-    }
-    let mut off = 0usize;
-    while off + CONTENT_RUN_BYTES <= body.len() && out.len() < CONTENT_MAX_RUNS {
-        let win = &body[off..off + CONTENT_RUN_BYTES];
-        if !is_monotone(win) {
-            out.push(*blake3::hash(win).as_bytes());
-        }
-        off += CONTENT_RUN_STEP;
-    }
-    out
-}
+/// v12.1: content_runs() (the v8 1-hop slice primitive) was superseded by
+/// run_keys + the fact graph and had ZERO callers - deleted.
+/// CONTENT_MAX_TOTAL_RUNS (its memory ceiling) went with it.
 
 /// v11: u64 run keys (first 8 bytes of each blake3 run) - the graph edge
 /// identity. 64-bit truncation over <=16M keys: collision probability ~4e-6,
@@ -831,6 +880,34 @@ struct TriggerRef {
     what: String,
 }
 
+/// v12.1: same ambient-family exclusion for kind-24 (event-dispatch): 0006
+/// emits a record for EVERY dispatched DOM event, and "evt mousemove ..." /
+/// "evt-mouse mousemove ..." fire continuously during cursor emulation.
+/// Without this the trigger loop accepted them unconditionally and
+/// handler-born saturated again (the v7 bug v9 closed on the input side).
+const AMBIENT_EVENT_TYPES: &[&str] = &[
+    "mousemove",
+    "pointermove",
+    "touchmove",
+    "pointerover",
+    "pointerout",
+    "pointerenter",
+    "pointerleave",
+    "scroll",
+    "mouseover",
+    "mouseout",
+];
+
+fn is_trigger_event(txt: &str) -> bool {
+    for prefix in ["evt ", "evt-mouse ", "evt-key ", "evt-pointer "] {
+        if let Some(rest) = txt.strip_prefix(prefix) {
+            let etype = rest.split(' ').next().unwrap_or("");
+            return !AMBIENT_EVENT_TYPES.contains(&etype);
+        }
+    }
+    true
+}
+
 /// v9: is this input record a MEANINGFUL compile trigger? A mousemove storm
 /// (bot-emulated or real) fires hundreds/sec and would trigger-mark every
 /// chain compiled on the page; clicks/keys/wheel/gestures are the discrete
@@ -849,8 +926,11 @@ fn is_trigger_input(txt: &str) -> bool {
         return etype != "MouseMove"
             && etype != "PointerMove"
             && etype != "PointerRawUpdate"
+            && etype != "PointerHoverMove"
             && etype != "MouseLeave"
-            && etype != "MouseEnter";
+            && etype != "MouseEnter"
+            && etype != "TouchMove"
+            && etype != "GestureScrollUpdate";
     }
     true
 }
@@ -875,6 +955,10 @@ fn latest_trigger_before(recs: &[Rec], ts: u64, window_ns: u64) -> Option<Trigge
         if TRIGGER_KINDS.contains(&r.kind.as_str()) {
             let txt = r.txt.as_deref().unwrap_or("");
             if r.kind == "input" && !is_trigger_input(txt) {
+                i -= 1;
+                continue;
+            }
+            if r.kind == "event-dispatch" && !is_trigger_event(txt) {
                 i -= 1;
                 continue;
             }
@@ -1201,8 +1285,17 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                 }
             }
             "nav-start" => {
-                if nav_start.map(|t| r.ts < t).unwrap_or(true) {
-                    nav_start = Some(r.ts);
+                // v12.1: the payload carries the TRUE T0 (mono_ns=,
+                // navigation_start.since_origin() from the browser process);
+                // the record ts is only when the renderer emitted it. Use
+                // the payload value, fall back to r.ts for old .rec files.
+                let mono = txt
+                    .split("mono_ns=")
+                    .nth(1)
+                    .and_then(|v| v.trim().parse::<u64>().ok());
+                let t = mono.unwrap_or(r.ts);
+                if nav_start.map(|old| t < old).unwrap_or(true) {
+                    nav_start = Some(t);
                 }
             }
             _ => {}
@@ -1565,7 +1658,17 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             Some(p) => p,
             None => continue,
         };
-        let (tag, body) = name_of(&payload);
+        let (mut tag, mut body) = name_of(&payload);
+        // v12.1: NUL-less kind-16 PROSE records (0013 cookie/storage values,
+        // 0021 json-stringify head) carry real VALUE bytes but no NUL split -
+        // derive the pair so they join the graph (see value_of_prose; the
+        // VALUE_TAGS gate below then matches by the derived tag).
+        if r.kind == "fingerprint" && tag.is_empty() {
+            if let Some((t2, b2)) = value_of_prose(&payload) {
+                tag = t2;
+                body = b2;
+            }
+        }
         if body.is_empty() {
             continue;
         }
@@ -1583,10 +1686,18 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         // beacon is the only observable evidence that anything left.
         // tag must be an HTTP method here (req-body / req-headers are the
         // other kind-17 tags; a bare url record carries "GET"/"POST"/...).
+        // v12.1: the seed is the QUERY STRING length, not the whole URL -
+        // a 90+ char path with a 2-char "?v=" is a cache-buster, and the old
+        // whole-URL check made it a hop-0 sink: page-load chains overlapping
+        // its ts got graph-sink@0 = PROVEN on a timer accident.
+        let query_len = body
+            .iter()
+            .position(|&c| c == b'?')
+            .map(|q| body.len() - q - 1)
+            .unwrap_or(0);
         let is_query_sink = r.kind == "net-request"
             && HTTP_METHODS.contains(&tag.as_str())
-            && body.len() >= QUERY_SINK_MIN_BYTES
-            && body.contains(&b'?');
+            && query_len >= QUERY_SINK_MIN_BYTES;
         // 0017: only the OUTBOUND ws frame sinks; inbound tags stay carriers
         // (a challenge response can be re-sent verbatim later).
         let is_ws_sink = r.kind == "websocket" && tag == "ws-frame-out";
@@ -1605,6 +1716,12 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             }
             carriers_seen += 1;
         } else if total_keys >= GRAPH_MAX_EDGES {
+            // v12.1: the edge budget is exhausted - admit the SINK with empty
+            // keys instead of dropping it: a dropped seed deletes every
+            // upstream chain's provenness silently. Empty keys = hop-0
+            // taint at its own ts; the edge budget only bounds adjacency,
+            // never the seed set itself.
+            nodes.push(GraphNode { ts: r.ts, sink: true, keys: Vec::new() });
             continue;
         }
 
@@ -1780,6 +1897,24 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         .collect();
     content_ts.dedup();
 
+    // v12.1: kind-8 entries cap script names at 200 chars with non-printables
+    // folded to '?' (0003), lazy-compile names at 160 (0022), while chain
+    // display names are untruncated - long-named scripts (>160 chars, e.g.
+    // the query-URL scripts this repo's own capture carries) never joined.
+    // Canonicalize both sides the same way before the lookup.
+    fn canon_name(n: &str) -> String {
+        n.chars()
+            .take(160)
+            .map(|ch| {
+                if !ch.is_ascii_graphic() && ch != ' ' {
+                    '?'
+                } else {
+                    ch
+                }
+            })
+            .collect()
+    }
+
     // ---- v9 entry-join: attribute records of interest to the CHAIN that was
     // the active C++->JS entry, using the kind-8 stream. This is the caller
     // identity that kind-29/16/28 records lack in C++ (no stack walk there) -
@@ -1797,14 +1932,20 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     // error-stack records are attributed the same way (kind 38 carries no
     // caller in C++; the entry-join recovers it)
 
-    // display-name -> chain idx (first wins; display names are the bare
-    // resource URL that kind-8 script= also carries, so they join directly).
-    // OWNED keys: this map outlives three passes that take `&mut chain_list`,
-    // and borrowing the names would hold an immutable borrow across them.
-    let mut name_to_chain: HashMap<String, usize> = HashMap::new();
+    // (pid, display-name) -> chain idx (first wins; display names are the
+    // bare resource URL that kind-8 script= also carries, so they join
+    // directly). v12.1: keyed by pid too - two renderer processes that load
+    // the same URL produce two chains with identical display names, and a
+    // bare-name key attributed pid B's fetch to pid A's chain (wrong
+    // PROVEN verdict). OWNED keys: this map outlives three passes that take
+    // `&mut chain_list`, and borrowing the names would hold an immutable
+    // borrow across them.
+    let mut name_to_chain: HashMap<(u64, String), usize> = HashMap::new();
     for (idx, c) in chain_list.iter().enumerate() {
         if !c.name.is_empty() {
-            name_to_chain.entry(c.name.clone()).or_insert(idx);
+            name_to_chain
+                .entry((c.pid, canon_name(&c.name)))
+                .or_insert(idx);
         }
     }
     // per-chain accumulators keyed by idx
@@ -1828,9 +1969,11 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             None => continue,
         };
         // strip the iso prefix the kind-8 name may carry (split_iso mirrors
-        // the chain display-name normalization)
+        // the chain display-name normalization), then canonicalize the
+        // truncation/folding the C++ side applies to entry names so
+        // long-named scripts still join (see canon_name)
         let (_, bare) = split_iso(script);
-        let idx = match name_to_chain.get(bare.as_str()) {
+        let idx = match name_to_chain.get(&(r.pid, canon_name(&bare))) {
             Some(i) => *i,
             None => continue,
         };
@@ -2052,7 +2195,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             if bare == *child {
                 continue;
             }
-            let pidx = match name_to_chain.get(bare.as_str()) {
+            let pidx = match name_to_chain.get(&(*pid, canon_name(&bare))) {
                 Some(i) => *i,
                 None => continue,
             };
@@ -2296,6 +2439,8 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             if TRIGGER_KINDS.contains(&rr.kind.as_str())
                 && !(rr.kind == "input"
                     && !is_trigger_input(rr.txt.as_deref().unwrap_or("")))
+                && !(rr.kind == "event-dispatch"
+                    && !is_trigger_event(rr.txt.as_deref().unwrap_or("")))
             {
                 best = Some(cursor);
             }
@@ -2407,6 +2552,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "rule": "token-forming = sink-call | handler-born | fp-probes>=2 | integrity-check | net-window | content-sink | send-initiator | token-access | fp-probes-entry | gopd-check | stack-inspect (v10); content-sink crosses the encryption boundary via crypto-out/ws-frame-out byte identity (v9); the *-entry/send-initiator/token-access/gopd/stack signals come from the kind-8 entry-join (caller attribution, no stack walk) - dead ends stay whole in the raw run zip",
         },
         "graph": {
+            "fanout_dropped": stats.graph_fanout_dropped,
             "nodes": stats.graph_nodes,
             "edges": stats.graph_edges,
             "sink_seeds": stats.graph_sinks,

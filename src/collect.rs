@@ -179,7 +179,7 @@ impl ScanState {
 impl PartWriter {
     /// Append `payload`, rolling to a fresh part when the current one is
     /// past the roll size. Returns (rel_path, offset).
-    fn push(&mut self, raw_out: &Path, layer: &str, kname: &str, payload: &[u8]) -> (String, u64) {
+    fn push(&mut self, raw_out: &Path, layer: &str, kname: &str, payload: &[u8]) -> Option<(String, u64)> {
         if self.written >= PART_ROLL_BYTES {
             self.seq += 1;
             let fname = format!("{}-{}-p{:04}.bin", layer, kname, self.seq);
@@ -190,14 +190,22 @@ impl PartWriter {
                     self.rel = rel;
                     self.written = 0;
                 }
-                Err(_) => return (self.rel.clone(), self.written),
+                // v12.1: a failed roll-open previously returned a FABRICATED
+                // (rel, off) - the index pointed at bytes that never landed
+                // and read_payload() silently vanished the record. Keep
+                // appending to the current part instead: honest, and the
+                // record stays materialized.
+                Err(_) => {}
             }
         }
         let off = self.written;
-        if self.file.write_all(payload).is_ok() {
-            self.written += payload.len() as u64;
+        if self.file.write_all(payload).is_err() {
+            // write failure: do NOT index the record (an index line would
+            // reference bytes that were never appended)
+            return None;
         }
-        (self.rel.clone(), off)
+        self.written += payload.len() as u64;
+        Some((self.rel.clone(), off))
     }
 }
 
@@ -429,11 +437,15 @@ pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &
                 // reference (part, offset). Storage packing only - the
                 // filter unpacks by (p, o, len) and nothing is lost.
                 if let Some(pw) = part_writer(&raw_out, &mut state.parts, layer, kname) {
-                    let (rel, off) = pw.push(&raw_out, layer, kname, payload);
-                    j.key("p");
-                    j.s(&rel);
-                    j.key("o");
-                    j.u64v(off);
+                    // v12.1: a None here means the payload did not land -
+                    // no index line for it (the record is dropped loudly by
+                    // its absence, not silently by a lying pointer).
+                    if let Some((rel, off)) = pw.push(&raw_out, layer, kname, payload) {
+                        j.key("p");
+                        j.s(&rel);
+                        j.key("o");
+                        j.u64v(off);
+                    }
                 } else {
                     let fname = format!("{}-{}-{:06}.bin", layer, kname, state.seq);
                     let _ = fs::write(raw_out.join(&fname), payload);

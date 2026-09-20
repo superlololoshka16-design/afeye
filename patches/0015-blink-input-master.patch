@@ -68,8 +68,8 @@
 +      const auto& afeye_m = static_cast<const WebMouseEvent&>(event);
 +      std::snprintf(afeye_buf + afeye_n, sizeof(afeye_buf) - afeye_n,
 +                    " x=%.1f y=%.1f sx=%.1f sy=%.1f btn=%d clicks=%d",
-+                    afeye_m.PositionInWindow().x(),
-+                    afeye_m.PositionInWindow().y(),
++                    afeye_m.PositionInWidget().x(),
++                    afeye_m.PositionInWidget().y(),
 +                    afeye_m.PositionInScreen().x(),
 +                    afeye_m.PositionInScreen().y(),
 +                    static_cast<int>(afeye_m.button), afeye_m.ClickCount());
@@ -98,11 +98,11 @@
 +    case WebInputEvent::Type::kPointerMove: {
 +      const auto& afeye_p = static_cast<const WebPointerEvent&>(event);
 +      std::snprintf(afeye_buf + afeye_n, sizeof(afeye_buf) - afeye_n,
-+                    " pid=%u ptype=%d x=%.1f y=%.1f pressure=%.2f",
-+                    afeye_p.unique_pointer_id,
++                    " id=%d ptype=%d x=%.1f y=%.1f force=%.2f",
++                    afeye_p.id,
 +                    static_cast<int>(afeye_p.pointer_type),
-+                    afeye_p.PositionInWindow().x(),
-+                    afeye_p.PositionInWindow().y(), afeye_p.pressure);
++                    afeye_p.PositionInWidget().x(),
++                    afeye_p.PositionInWidget().y(), afeye_p.force);
 +      break;
 +    }
 +    default:
