@@ -364,7 +364,7 @@ index 0000000000..1111111111
  
    # Enable DWARF line info for Torque files.
    # TODO(olivf): Find out how this works on other platforms.
-@@ -7040,6 +7385,20 @@
+@@ -7040,6 +7385,25 @@
        "src/extensions/vtunedomain-support-extension.h",
      ]
      deps += [ "third_party/vtune:v8_vtune_trace_mark" ]
@@ -376,6 +376,11 @@ index 0000000000..1111111111
 +  # sink.cc never compiled and every `#ifdef V8_AFEYE` hook in api.cc /
 +  # compiler.cc / wasm / execution silently compiled to nothing. The
 +  # args.gn extra_cflags define is the belt to this suspenders.
++  # v12.1: `defines = []` first - this target scope never declared a
++  # defines list, so a bare `defines +=` is an Undefined identifier error
++  # in GN (the CI build died at exactly BUILD.gn:7059). Same pattern as
++  # the `libs = []` declaration above.
++  defines = []
 +  if (v8_enable_afeye) {
 +    sources += [
 +      "src/afeye/sink.cc",
