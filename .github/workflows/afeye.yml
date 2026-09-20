@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-            AFEYE_TG_TOKEN: ${{ secrets.AFEYE_TG_TOKEN }}
+  AFEYE_TG_TOKEN: ${{ secrets.AFEYE_TG_TOKEN }}
   AFEYE_TG_CHAT: ${{ secrets.AFEYE_TG_CHAT }}
   AFEYE_TG_ON: ${{ vars.AFEYE_TG_ON || '1' }}
   AFEYE_QUEUE_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/queue/pending.json
