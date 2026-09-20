@@ -27,7 +27,7 @@ pub const DEFAULT_RAW_DIR: &str = "/tmp/afeye-raw";
 const MAX_RECORD: u32 = 16 + (1 << 20);
 const PREVIEW: usize = 4096;
 
-const KINDS: [&str; 39] = [
+const KINDS: [&str; 40] = [
     "sink-hello",
     "script-source",
     "bytecode-entry",
@@ -93,6 +93,11 @@ const KINDS: [&str; 39] = [
     // (0022): the automation-detection surface and the only cheap JS->JS
     // call-edge source in the engine.
     "error-stack",
+    // 39 sink-drop - the sink ring's own overflow counter, emitted by each
+    // layer's drain thread directly to the fd (0023). The witness that lets
+    // the filter distinguish "this branch fed nothing" from "this branch's
+    // records were dropped" - without it `unresolved` would be a guess.
+    "sink-drop",
 ];
 
 /// High-frequency small-record kinds are BATCHED: their payloads append to

@@ -63,6 +63,7 @@ KIND_NAMES = {
     36: "nav-start",
     37: "taint-edge",
     38: "error-stack",
+    39: "sink-drop",
 }
 
 HDR = struct.Struct("<IBHI")  # len, kind, flags, rsv

@@ -1,11 +1,29 @@
-# afeye chromium patch series v10
+# afeye chromium patch series v11
 
-**22 patches** against **Chromium 153.0.8010.52** (v8 rev
+**23 patches** against **Chromium 153.0.8010.52** (v8 rev
 `d1fed5cd7e3b114dea70f18b20d26f816322833d`). The whole series is
 re-verified to apply cumulatively with plain `git apply` against a
 pristine tree assembled from sources fetched at that tag
-(22/22; v10 hunks re-validated on freshly fetched pristine files for
-0020/0021/0022).
+(23/23; v11 hunks re-validated on freshly fetched pristine files for
+0020/0021/0022/0023).
+
+v11 makes the SELECTION honest and adds the witness that makes honesty
+possible. One new C++ patch:
+
+- **0023 (sink-drop witness, kind 39).** Every sink already counts its ring
+  overflows (`SinkDropped()`), but the counter was never emitted - so the
+  filter could not tell "this branch fed nothing" from "this branch's
+  records were dropped". Each layer's drain thread now writes
+  `sink-drop layer=X dropped=N` DIRECTLY to its fd (never through the ring:
+  a drop report that could itself be dropped is worthless), throttled to
+  ~10/s and only when the count moved. This is what turns `unresolved` from
+  a guess into a verdict: a chain with no link AND zero drops in its pid
+  before the end of its window is `dead-end-proven`; with drops present it
+  stays `unresolved`.
+
+The rest of v11 is Rust-only: the fact graph, compile-provenance, and the
+four-state verdict (see "the FACT GRAPH" and "three-way verdict" under the
+deep filter below). The 22-patch capture surface is otherwise unchanged.
 
 v10 is the **v8-depth pass over v9** - a dedicated audit of the engine
 layer found 8 gaps where capture was still selective. Seven landed as
@@ -445,9 +463,11 @@ types match - the thunk sees the slow path.
 | 0020 v8-wasm-streaming-exec | 2 (`module-compiler.cc`, `runtime-wasm.cc`) | v8 |
 | 0021 v8-payload-stack | 2 + header (`builtins-json.cc`, `messages.cc`, `messages.h`) | v8 |
 | 0022 v8-introspection | 1 new + 2 existing (`js-objects.cc` new; `compiler.cc`*, `builtins-date.cc`* already patched) | v8 |
+| 0023 sink-drop-witness | 0 new (`sink.cc`/`sink.h` x3 - already created by 0001/0005/0011) | v8 + blink_platform + network service |
 
 ~55 changed/new TUs total (*already-patched TUs - ccache miss only for the
-changed file). v8 relinks once for 0020-0022 combined. The CI build (`scripts/build-chromium.sh`)
+changed file). v8 relinks once for 0020-0023; blink_platform and the network
+service relink for 0023's sink.cc change. The CI build (`scripts/build-chromium.sh`)
 runs `ccache -z` before ninja and `ccache -s` after: on a warm cache
 only these TUs recompile - a series tweak costs minutes, not hours.
 First build chains across 4h30m windows under the 6h runner cap
@@ -471,7 +491,7 @@ is no libc stdio buffer to lose, and each process owns its own file
 (no cross-writer locking needed); a hard SIGKILL can still lose the
 last sub-millisecond of ring backlog (counted, see honest limits).
 
-Kinds after v10 (one new kind over v9 - 38 error-stack): 0
+Kinds after v11 (one new kind over v10 - 39 sink-drop): 0
 sink-hello, 1 script-source (v8, `iso:` names, **four funnels: eval /
 streamed / buffered / wrapped, 0002+0022**),
 3 wasm-module (**+ streaming + code-cache paths, 0020**), 8 call-origin
@@ -490,8 +510,9 @@ constructor, 0012/0022)**, **34
 isolate**, **35 worker**, **36
 nav-start**, **37 taint-edge (0016: TextEncoder/TextDecoder/atob/
 btoa/FormData/URLSearchParams - the plaintext boundaries)**, **38
-error-stack (0021: every materialized Error.stack head)**. Silent
-(wire compat): 2, 4-7, 9-10, 13-14, 20-22.
+error-stack (0021: every materialized Error.stack head)**, **39 sink-drop
+(0023: the ring-overflow witness that makes `dead-end-proven` provable)**.
+Silent (wire compat): 2, 4-7, 9-10, 13-14, 20-22.
 
 `tools/rec_census.py` parses this format standalone (with the same
 kind names as `src/collect.rs`) and carries `--expect layer:kind=MIN`
@@ -520,6 +541,92 @@ still holds every hash + ts + pid.
   (the eval-chunk-then-probe antifraud pattern). Chain entries carry
   the exact `fp_reads` list, `integrity_checks` (kind-32 samples),
   `clock_reads` cadence.
+- **the FACT GRAPH (v11)** - selection by demonstrated byte identity, not by
+  timer guessing. The v8 content-slice was 1-HOP (a carrier had to share a
+  run DIRECTLY with a sink), so a transitive pipeline collector -> storage ->
+  TextEncoder -> crypto was credited only by luck, and it could not answer
+  WHY. v11 builds the real graph:
+  - **nodes** = payload records: crypto-op, structured-clone, net-request
+    (req-body AND the `method\0url` record - a payload can leave in the query
+    string with no body at all, proven by this repo's own capture: analytics
+    beacons with 500-1300 char queries and empty bodies), taint-edge,
+    websocket.
+  - **edges** = a shared content run: blake3 over 32 B windows, 16 B stride,
+    monotone windows skipped so zero-padding never links. Adjacency is a flat
+    sorted `Vec<(u64 key, u32 node)>` - 12 B/edge instead of a HashMap at
+    ~50 B/entry. Key = first 8 bytes of the run hash; at 8 M edges the
+    birthday-collision probability is ~1e-6 and a collision can only ADD an
+    edge, so the failure mode is a thicker filtered zip, never a lost chain.
+    Runs shared by >4096 records are skipped as boilerplate (a common JSON
+    prefix would otherwise taint the whole page).
+  - **seeds** = sink records: req-body, ws-frame-out, payload-forming crypto
+    raw_data, crypto-out (0018), and a request URL whose query is >=96 B
+    (body-less pixel/beacon transport). Sinks additionally carry base64 and
+    hex VARIANT runs so a standard-alphabet envelope step still matches.
+  - **slice** = BFS backwards from every seed, 6 hops max. A chain gets
+    `graph-sink@N` when a tainted record falls inside its materialization
+    window - N hops of DEMONSTRATED byte identity to the wire.
+  - **CSR adjacency** (compressed sparse row): `adj_keys` (8 B per distinct
+    key) + `adj_off` (4 B per key) + `adj_nodes` (4 B per edge). One binary
+    search per key, then a direct slice - versus a tuple `Vec` at 16 B/edge
+    (alignment padding) that also stored every key twice, or a `HashMap` at
+    ~56 B/entry. ~96 MB worst case at the 8M-edge budget.
+  - **sink-first admission**: the budget gates CARRIERS only, never sinks. A
+    dropped sink is a dropped BFS seed, which silently deletes every chain
+    upstream of it - and since records are ts-sorted, a single cutoff would
+    have lost exactly the LATE token sends (the 10-30 s collect-then-send case
+    this graph exists for).
+  - **fanout cap, counted**: a run shared by >4096 records is boilerplate (a
+    common JSON prefix) and is skipped for carriers, with every skipped edge
+    reported as `edges_dropped_by_fanout`. Sink nodes bypass the cap. This is
+    the ONE place the graph can produce an honest false-negative, so it is
+    visible in the report rather than silent.
+  - **URL-identity (pass 1b)**: a chain whose display name is a URL the net
+    layer actually requested is DOWNLOADED code, not inline. Structural fact
+    only - it never marks a chain proven by itself, because attributing a
+    resp-body span to its URL needs per-request correlation the wire format
+    does not carry (concurrent responses interleave in one pid).
+  - **HONEST LIMIT, proven against this repo's own capture**
+    (`afeye-20260918-144834.zip`, the 4 Cloudflare `.post` bodies): their
+    wire charset is `$+,-./0-9:A-Za-z{}` with NO `=` padding anywhere, i.e.
+    a vendor-specific alphabet, not base64. Variant runs cover STANDARD
+    encodings only; a custom-alphabet envelope will NOT match and the chain
+    is reported `unresolved` rather than guessed at. Crossing that needs the
+    alphabet extracted from captured script-source plus a parameterized
+    decoder - deliberately not built on a guess.
+- **compile-provenance (v11, pass 2)** - the byte graph cannot see WHO
+  eval'd the token code (an eval'd chunk's source is code, not payload). But
+  when a PROVEN chain's first fragment materialized, some chain was the
+  active C++->JS entry (kind-8) - that chain ran the eval / dynamic import /
+  Function constructor. It is marked `spawned-proven` with the child names in
+  the report. Direction is deliberately one-way UP: taint is NOT inherited
+  downward, because a deobfuscator legitimately evals both the token pipeline
+  and piles of library code - downward inheritance would drag every template
+  engine into the filtered zip.
+- **four-state verdict (v11, pass 3)** - every chain carries a `verdict`:
+  - `proven` - graph-sink | send-initiator | token-access | spawned-proven:
+    observed FACTS (byte identity to a sink, an entry that initiated the send,
+    an entry that touched the stored token, an entry that compiled proven
+    code).
+  - `heuristic` - token-forming by evidence, not proof: sink-call text match,
+    handler-born window, fp-probes, integrity-check, net-window. Kept in the
+    filtered zip by default because the real collectors often live here.
+  - `dead-end-proven` - no link AND a COMPLETENESS WITNESS: zero sink-ring
+    drops (kind 39, 0023) in this pid up to the end of the chain's
+    materialization window. Only then is the absence of a link evidence
+    instead of a capture gap. Per-chain the report also carries
+    `dead_end_witness.ring_drops_in_pid`.
+  - `unresolved` - no link and no witness: the capture may have dropped the
+    evidence, or the dataflow never crossed a C++ boundary (fingerprint ->
+    closure variable -> sent 30 s later by another chain). NEVER claimed to
+    be a proven dead end.
+  `AF_STRICT_GRAPH=1` cuts the filtered zip to `proven` only; the run zip
+  never changes. Still honest limits: a pure-JS transform chain (custom
+  DEFLATE/RSA/encoder, CryptoJS-style AES with `subtle.crypto` never called)
+  produces NO intermediate payload record, so nothing between collect and
+  wire can be linked by bytes - those chains land in `unresolved` or
+  `dead-end-proven`, and the token story survives through the assembling and
+  sending chains that ARE proven.
 - **dead-end classification (v7, hardened v9)** - every chain
   additionally gets `token_forming` + the `signals` that fired:
   `sink-call` (own code carries a collector/network sink call) |
@@ -655,6 +762,34 @@ disables the call stream, `AFEYE_TRACE_CLOCK=0` the clock stream.
   (the stack accessor), bootstrapper defines hundreds; an unfiltered
   hook drowns the stream. Left as a follow-up with the filter designed
   against real .rec volume, not guessed.
+- **The graph CANNOT see these, and says `unresolved` instead of guessing**
+  (verified against pristine 153 + the repo's own capture):
+  - *cross-chain closure handoff*: fingerprint collected at 200 ms, held in a
+    closure variable, sent at 30 s by a DIFFERENT chain. No C++ boundary is
+    crossed between collect and send, so no byte ever links them. The
+    single-chain case IS proven (hop 0); the two-chain case is not.
+  - *pure-JS transforms*: a vendor serializer that goes `charCodeAt` -> manual
+    `Uint8Array.push` -> custom-alphabet encoder -> DEFLATE/RSA never touches
+    TextEncoder, btoa, subtle.crypto or any hooked boundary. afeye sees the
+    final wire body and nothing between. This is the hardest real limit: it is
+    why `unresolved` is a first-class verdict rather than an error state.
+  - *wasm internal computation*: linear memory is not captured anywhere, and
+    per-call export dispatch is generated machine code (no C++ funnel exists).
+    Input and output are visible if they cross a hooked boundary; the transform
+    inside is a black box. kind-31 firstcall proves WHICH functions ran.
+  - *cookie -> request header*: the jar attaches `Cookie:` inside `//net`
+    (`URLRequestHttpJob::SetCookieHeaderAndStart`, url_request_http_job.cc:870),
+    AFTER the 0011 hook in `URLLoader::ScheduleStart` logs headers. Hooking it
+    needs a sink in the `//net` component (a separate relink), so it is
+    DEFERRED - not silently missing. The relay is still inferable: the cookie
+    VALUE is captured by 0013 (kind 16) and the `Set-Cookie` that planted it by
+    kind-18 response headers, and both are graph nodes.
+  - *gzipped responses*: kind-18 resp-body is RAW WIRE bytes, script-source is
+    DECOMPRESSED - they cannot byte-match, so a dynamic-import module is not
+    linked to its response by content. The module is still attributed
+    structurally via URL-identity (`fetched_url`), which is why kind-18 is
+    deliberately kept OUT of the graph: it would spend the node budget on
+    subresource responses that can never link.
 - **G6 caller-edges are NOT walked at lazy-compile time.** The audit
   proposed a JavaScriptStackFrameIterator walk in Compiler::Compile to
   name caller->callee. Rejected for this pass: it runs on EVERY

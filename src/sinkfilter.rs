@@ -99,6 +99,23 @@ pub struct SinkFilterStats {
     pub wasm_cached: u64,
     pub lazy_funcs: u64,
     pub payload_assembler_chains: u64,
+    // v11 fact graph
+    pub graph_nodes: u64,
+    pub graph_edges: u64,
+    pub graph_sinks: u64,
+    pub graph_tainted: u64,
+    pub graph_hop1: u64,
+    pub graph_deep: u64,
+    pub graph_chains: u64,
+    pub provenance_parents: u64,
+    pub fetched_url_chains: u64,
+    pub proven_chains: u64,
+    pub heuristic_chains: u64,
+    pub unresolved_chains: u64,
+    pub dead_end_proven: u64,
+    pub graph_distinct_keys: u64,
+    pub graph_fanout_dropped: u64,
+    pub strict_graph: bool,
 }
 
 /// sink calls that mark a chain as reaching the collector / the network
@@ -259,6 +276,50 @@ const CONTENT_LINK_GRACE_NS: u64 = 200_000_000;
 const CONTENT_MAX_RECORDS: usize = 50_000;
 /// hard bound on distinct sink runs retained (32 B each -> ~128 MB ceiling)
 const CONTENT_MAX_TOTAL_RUNS: usize = 4_000_000;
+
+// --- v11 the FACT GRAPH (honest selection, not timer guessing) -------------
+// The v8 content-slice was 1-HOP: a carrier had to share a run DIRECTLY with a
+// sink record. That loses transitivity - collector -> storage -> TextEncoder ->
+// crypto, where the collector matches only the middle link, gets missed; and a
+// payload wrapped in JSON/base64 between two hops breaks byte identity
+// entirely (the 32 B windows shift). The graph fixes both:
+//   * MULTI-HOP: BFS over shared-run edges from every sink record. A chain is
+//     graph-tainted when a record inside ITS materialization window sits on a
+//     byte-identity path to an upload/crypto/ws sink - any number of hops.
+//   * VARIANT RUNS: sink bodies additionally emit runs over base64(body) and
+//     hex(body), so a payload wrapped in a STANDARD encoding still matches.
+//     Only for sinks (hundreds of records), never for every carrier.
+//   * COMPILE-PROVENANCE (pass 2): the chain whose entry was active when a
+//     PROVEN chain's source materialized is marked as its parent. One-way UP
+//     only - taint is deliberately NOT inherited downward, because a
+//     deobfuscator evals both the token pipeline and piles of library code,
+//     and downward inheritance would drag all of it into the filtered zip.
+/// Run keys are the first 8 bytes of the blake3 hash of a 32 B window. CSR
+/// layout cost: 8 B per DISTINCT key (adj_keys) + 4 B per edge (adj_nodes) +
+/// 4 B per key (adj_off). At this budget that is ~96 MB worst case, plus the
+/// per-node key vectors. A tuple Vec<(u64,u32)> would be 16 B/edge from
+/// alignment padding and would store every key a SECOND time in nodes[].keys;
+/// a HashMap<u64,Vec<u32>> costs ~56 B/entry. CSR is cheaper than both and
+/// answers a lookup with one binary search plus a direct slice.
+/// A real capture lands far below the ceiling: a 960 B stringify head yields
+/// ~58 keys, so 50k typical payload records are ~3M edges. Only the
+/// multi-hundred-KB blobs (req-body, ssv, crypto raw_data) approach
+/// CONTENT_MAX_RUNS.
+const GRAPH_MAX_EDGES: usize = 8_000_000;
+/// BFS hop ceiling (byte paths deeper than this are noise, not token flow)
+const GRAPH_MAX_HOPS: u32 = 6;
+/// variant-run encoding is only worth it on bodies at least this big
+const VARIANT_MIN_BYTES: usize = 64;
+/// cap on sink records that get variant runs (base64+hex of each)
+const VARIANT_MAX_SINKS: usize = 4_096;
+/// a request URL whose query is at least this long is treated as a payload
+/// sink (short queries are cache-busters and utm noise)
+const QUERY_SINK_MIN_BYTES: usize = 96;
+/// the kind-17 `method\0url` records carry the method as the tag; everything
+/// else in that kind is req-body / req-headers / complete
+const HTTP_METHODS: &[&str] = &[
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+];
 /// crypto-op tags whose content is payload-forming for the outbound token.
 /// "encrypt"/"sign"/"deriveBits"/"digest" are the raw_data INPUTS (0007):
 /// plaintext that upstream carriers (TextEncoder, SSV, storage, taint-edge)
@@ -373,6 +434,34 @@ fn overlaps_content_bridge(content_ts: &[u64], first_ts: u64, last_ts: u64) -> b
     a < content_ts.len() && content_ts[a] <= hi
 }
 
+/// v11 (0023): did this pid's sink report ANY dropped record at or before
+/// `ts`? Conservative by design: one drop anywhere earlier in the process is
+/// enough to refuse the "proven dead end" verdict, because the dropped record
+/// could be the missing link of any chain in that pid.
+fn drops_witnessed(drop_events: &[(u64, u64, u64)], pid: u64, ts: u64) -> bool {
+    drop_events
+        .iter()
+        .any(|(dts, dpid, n)| *dpid == pid && *dts <= ts && *n > 0)
+}
+
+/// v11: minimum hop distance from any graph-tainted payload record inside the
+/// chain's materialization window. The window is the honest boundary of what
+/// "this chain handled those bytes" can mean without a JS-level dataflow
+/// analysis: the record was written while this chain's code was the compiled
+/// body in play, so the bytes came from it.
+fn graph_hops_for(graph_ts: &[(u64, u32)], first_ts: u64, last_ts: u64) -> Option<u32> {
+    let lo = first_ts.saturating_sub(CONTENT_LINK_GRACE_NS);
+    let hi = last_ts
+        .saturating_add(FP_GRACE_NS)
+        .saturating_add(CONTENT_LINK_GRACE_NS);
+    let a = graph_ts.partition_point(|(t, _)| *t < lo);
+    let b = graph_ts.partition_point(|(t, _)| *t <= hi);
+    if a >= b {
+        return None;
+    }
+    graph_ts[a..b].iter().map(|(_, h)| *h).min()
+}
+
 /// true when every byte is identical (zero runs, padding) - such runs collide
 /// across unrelated records and would create false content links.
 fn is_monotone(b: &[u8]) -> bool {
@@ -397,6 +486,45 @@ fn content_runs(body: &[u8]) -> Vec<[u8; 32]> {
             out.push(*blake3::hash(win).as_bytes());
         }
         off += CONTENT_RUN_STEP;
+    }
+    out
+}
+
+/// v11: u64 run keys (first 8 bytes of each blake3 run) - the graph edge
+/// identity. 64-bit truncation over <=16M keys: collision probability ~4e-6,
+/// and a collision only ever ADDS an edge between unrelated records (both
+/// directions stay honest - taint spreads, never hides).
+fn run_keys(body: &[u8]) -> Vec<u64> {
+    let key = |b: &[u8]| -> u64 {
+        let h = blake3::hash(b).as_bytes()[..8].to_vec();
+        u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
+    };
+    let mut out: Vec<u64> = Vec::new();
+    if body.len() < CONTENT_RUN_BYTES {
+        if !body.is_empty() && !is_monotone(body) {
+            out.push(key(body));
+        }
+        return out;
+    }
+    let mut off = 0usize;
+    while off + CONTENT_RUN_BYTES <= body.len() && out.len() < CONTENT_MAX_RUNS {
+        let win = &body[off..off + CONTENT_RUN_BYTES];
+        if !is_monotone(win) {
+            out.push(key(win));
+        }
+        off += CONTENT_RUN_STEP;
+    }
+    out
+}
+
+/// hex body as bytes (lowercase) - the variant encoding a token body takes
+/// inside JSON/query wrappers
+fn hex_bytes(b: &[u8]) -> Vec<u8> {
+    const H: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(b.len() * 2);
+    for &x in b {
+        out.push(H[(x >> 4) as usize]);
+        out.push(H[(x & 0xf) as usize]);
     }
     out
 }
@@ -456,6 +584,25 @@ fn chain_signals(c: &Chain, net_ts: &[u64], content_ts: &[u64]) -> (Vec<String>,
         // v10: this chain materialized Error.stack - automation detection
         // and/or caller-graph introspection
         signals.push("stack-inspect".into());
+    }
+    if !c.spawned_proven.is_empty() {
+        // v11 pass 2: this chain was the active entry when a PROVEN chain's
+        // script materialized - it eval'd / dynamically compiled the code that
+        // built or sent the token. The orchestrator/deobfuscator: it may never
+        // touch a payload byte itself, and the byte graph therefore cannot
+        // reach it. Downward inheritance is deliberately NOT done (a
+        // deobfuscator evals both the token pipeline and piles of library
+        // code), so this marks the parent only.
+        signals.push("spawned-proven".into());
+    }
+    if let Some(h) = c.graph_hops {
+        // v11: PROVEN byte-identity path to a sink record, h hops away.
+        // h=0 the chain wrote the upload/crypto result itself; h=1 its bytes
+        // are identical to a sink's (what the v8 content-sink could see);
+        // h>=2 transitive through intermediate payloads (storage, TextEncoder,
+        // btoa) - unreachable for any timer heuristic. This is the strongest
+        // signal in the set: it is a fact about bytes, not a guess about time.
+        signals.push(format!("graph-sink@{h}"));
     }
     (signals, net_adjacent, content_sink)
 }
@@ -599,6 +746,9 @@ fn wasm_imports_exports(b: &[u8]) -> (Vec<String>, Vec<String>) {
 
 struct Chain {
     file: Option<std::fs::File>,
+    /// process this chain's scripts ran in (the entry-join and provenance
+    /// keys are per-pid: renderer and network service share no timeline)
+    pid: u64,
     /// raw chain name (with the "iso:<ptr> " prefix when present)
     name: String,
     frags: u64,
@@ -650,6 +800,28 @@ struct Chain {
     /// execution, 0023 kind 8 "lazy-compile") - dead-code evidence inside a
     /// live script
     executed_funcs: u64,
+    /// v11: minimum hop distance from this chain's window to a sink record in
+    /// the byte-identity graph. None = not connected by byte identity.
+    graph_hops: Option<u32>,
+    /// v11: an observed FACT (byte-identity path, initiated send, or
+    /// cookie/storage access) - not a heuristic. Drives AF_STRICT_GRAPH.
+    proven: bool,
+    /// v11: no observable link AND a completeness witness (zero ring drops in
+    /// this pid up to the end of the window, 0023 kind 39). Only then is the
+    /// absence of a link evidence rather than a capture gap.
+    dead_end_proven: bool,
+    /// v11 URL-identity: this chain's display name IS an http(s) URL that the
+    /// net layer actually requested (kind 17 `method\0url`) - so this chain is
+    /// DOWNLOADED code, not inline. A structural fact, not a taint claim: the
+    /// resp-body -> URL mapping is NOT deterministic under concurrent requests
+    /// in one process, so this never marks a chain proven by itself.
+    fetched_url: bool,
+    /// v11 compile-provenance: this chain was the active C++->JS entry when
+    /// a PROVEN chain's script-source materialized - i.e. it eval'd /
+    /// dynamically compiled the code that built or sent the token. The
+    /// orchestrator/deobfuscator, which may never touch a payload byte
+    /// itself. Carries the proven child's name for the report.
+    spawned_proven: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -976,6 +1148,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     let mut wasm_firstcalls = 0u64;
     let mut wasm_traps = 0u64;
     let mut automation_tells: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut drop_events: Vec<(u64, u64, u64)> = Vec::new(); // (ts, pid, total)
     let mut nav_start: Option<u64> = None;
     for r in &recs {
         let txt = r.txt.as_deref().unwrap_or("");
@@ -991,6 +1164,18 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                 }
             }
             "clock" => clock_ts.push(r.ts),
+            // v11 (0023, kind 39): ring-overflow witness. Each layer's drain
+            // thread writes "sink-drop layer=X dropped=N" when records were
+            // lost. Without this the filter cannot tell "this branch fed
+            // nothing" from "this branch's records were dropped", so
+            // `unresolved` would be a guess instead of a verdict.
+            "sink-drop" => {
+                if let Some(n) = txt.split("dropped=").nth(1) {
+                    if let Ok(n) = n.trim().parse::<u64>() {
+                        drop_events.push((r.ts, r.pid, n));
+                    }
+                }
+            }
             "worker" => {
                 if let Some((iso, name)) = worker_of(txt) {
                     workers.push((r.ts, iso, name));
@@ -1071,6 +1256,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                     let worker = worker_name_for(&workers, r.ts, &iso);
                     let c = Chain {
                         file,
+                        pid: r.pid,
                         name: display,
                         frags: 0,
                         bytes: 0,
@@ -1098,6 +1284,11 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                         stack_samples: Vec::new(),
                         payload_assembler: false,
                         executed_funcs: 0,
+                        fetched_url: false,
+                        graph_hops: None,
+                        proven: false,
+                        dead_end_proven: false,
+                        spawned_proven: Vec::new(),
                     };
                     chain_list.push(c);
                     chains.insert(key, idx);
@@ -1290,39 +1481,85 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     }
     net_ts.sort_unstable();
 
-    // ---- v8 content-based backward slice -----------------------------------
-    // Build the set of content-runs that belong to SINK records (payload-forming
-    // crypto: encrypt/sign/deriveBits/digest raw_data, and upload bodies), then
-    // credit every payload record that shares a run with that set. A chain that
-    // materialized while a credited payload was written feeds the token even
-    // when the actual send is 10-30 s later - the case the fixed net-window
-    // drops. Payload kinds read here (per-record .bin, never batched):
-    //   crypto-op (kind 11)      - "encrypt"/"sign"/... + NUL + raw_data
-    //   structured-clone (kind 15)- "ssv" + NUL + IDB/postMessage payload
-    //   net-request (kind 17)     - "req-body" + NUL + upload bytes
-    //   taint-edge (kind 37)      - "text-encoder"/"btoa"/"form-data"/... +
-    //                               NUL + the exact plaintext bytes at each
-    //                               string->bytes boundary (0016). Carriers
-    //                               only - never sinks: they extend the graph
-    //                               UPSTREAM of the crypto/upload sinks.
+    // ---- v11 the FACT GRAPH: multi-hop byte-identity backward slice ---------
+    // The v8 slice was 1-HOP (carrier must share a run DIRECTLY with a sink),
+    // so a transitive pipeline collector -> storage -> TextEncoder -> crypto
+    // was credited only if the collector happened to touch the sink bytes,
+    // and a JSON/base64 envelope between hops broke identity outright. v11
+    // builds the real graph:
+    //   nodes  = payload records (crypto-op, structured-clone, net-request,
+    //            taint-edge, websocket)
+    //   edges  = a shared content run (blake3 over 32 B windows, stride 16;
+    //            monotone windows skipped so padding never links)
+    //   seeds  = SINK records: upload bodies (req-body), WS outbound frames,
+    //            payload-forming crypto raw_data, and the crypto RESULT
+    //            (0018 crypto-out - the ciphertext that the upload carries)
+    //   slice  = BFS backwards over edges, GRAPH_MAX_HOPS deep
+    // A chain whose materialization window holds a tainted record fed the
+    // token BY DEMONSTRATED BYTE IDENTITY, at a known hop distance - not by a
+    // timer guess. Variant runs (base64/hex of a sink body) let the slice
+    // cross the envelope step where a ciphertext gets base64-wrapped.
+    //
+    // Memory: edges are a flat sorted Vec<(u64 key, u32 node)> - 12 B each -
+    // instead of a HashMap<u64, Vec<u32>> (~50 B/entry + buckets). The key is
+    // the first 8 bytes of the run hash; at 16 M edges the birthday-collision
+    // probability is ~4e-6, and a collision can only ADD an edge (taint
+    // spreads, it never hides), so the failure mode is a thicker filtered
+    // zip, never a lost token chain.
     let payload_kinds = [
         "crypto-op",
         "structured-clone",
         "net-request",
         "taint-edge",
         "websocket",
+        // kind 16, but ONLY the byte-carrying records (VALUE_TAGS gate below).
+        // kind 18 net-resp-body is deliberately EXCLUDED: those are raw wire
+        // bytes (usually gzip/brotli-encoded) that do not byte-match the
+        // decompressed script-source or any plaintext payload, and every
+        // subresource response would crowd the CONTENT_MAX_RECORDS node budget
+        // with records that can never link. The Set-Cookie half of the cookie
+        // relay is covered instead by the kind-16 cookie-get/cookie-set values.
+        "fingerprint",
     ];
-    let mut sink_runs: HashSet<[u8; 32]> = HashSet::new();
-    let mut carriers: Vec<(u64, Vec<[u8; 32]>)> = Vec::new();
-    let mut payload_records = 0usize;
-    let mut total_runs = 0usize;
-    let mut sink_full = false;
+    // kind-16 records split into two classes and only ONE belongs in the
+    // graph: spans carrying real fingerprint/response BYTES vs prose metadata
+    // lines. Prose would create edges between unrelated records (a "css/
+    // get-computed prop=font-family val=Arial" line shares runs with every
+    // other page that reads the same property).
+    const VALUE_TAGS: &[&str] = &[
+        "cookie-get",          // 0013
+        "cookie-set",          // 0013
+        "storage-get",         // 0013
+        "storage-set",         // 0013
+        "canvas/get-image-data-r", // 0014 pixel result
+        "webgl/read-pixels-r", // 0014 pixel result
+        "audio/float-frequency",   // 0014
+        "audio/byte-frequency",    // 0014
+        "audio/float-timedomain",  // 0014
+        "audio/byte-timedomain",   // 0014
+        "json-stringify",      // 0021 assembled plaintext head
+    ];
+    // The request URL is a carrier too: a payload can leave in the QUERY
+    // STRING with no body at all (pixel beacons, img.src fallbacks), which no
+    // req-body sink ever sees. This repo's own capture carries such requests
+    // with 500-1300 char queries and empty bodies. Kind 17's first record is
+    // EmitTwoStr(method, url) = "METHOD\0url", so the URL is the body after
+    // the NUL split - the same read_payload/name_of path as every other
+    // carrier, no new plumbing.
+
+    struct GraphNode {
+        ts: u64,
+        sink: bool,
+        keys: Vec<u64>,
+    }
+
+    let mut nodes: Vec<GraphNode> = Vec::new();
+    let mut total_keys = 0usize;
+    let mut sinks_seen = 0usize;
+    let mut carriers_seen = 0usize;
     for r in &recs {
         if !payload_kinds.contains(&r.kind.as_str()) {
             continue;
-        }
-        if payload_records >= CONTENT_MAX_RECORDS {
-            break;
         }
         let payload = match read_payload(&raw_dir, r) {
             Some(p) => p,
@@ -1332,48 +1569,215 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         if body.is_empty() {
             continue;
         }
-        payload_records += 1;
-        let is_crypto_sink =
-            r.kind == "crypto-op" && SINK_CRYPTO_OPS.iter().any(|o| tag.contains(o));
-        let is_upload = r.kind == "net-request" && tag == "req-body";
-        // 0017: the WS OUTBOUND frame is an upload sink in its own right -
-        // Kasada/HUMAN telemetry channels send the token over WS, never
-        // touching req-body. Exact match: inbound tags ("ws-frame",
-        // "ws-frame-fin") stay carriers (challenge responses may be
-        // re-sent verbatim), only "ws-frame-out" sinks.
-        let is_ws_sink = r.kind == "websocket" && tag == "ws-frame-out";
-        // runs are retained for the carrier pass ONLY while the global
-        // budget lasts - past CONTENT_MAX_TOTAL_RUNS total retained runs
-        // later records contribute nothing (empty vec), keeping memory
-        // bounded at ~128 MB regardless of blob sizes.
-        let mut runs = Vec::new();
-        if total_runs < CONTENT_MAX_TOTAL_RUNS {
-            runs = content_runs(&body);
-            if runs.len() > CONTENT_MAX_TOTAL_RUNS - total_runs {
-                runs.truncate(CONTENT_MAX_TOTAL_RUNS - total_runs);
-            }
-            total_runs += runs.len();
+        // kind 16: only the byte-carrying records join the graph (see
+        // VALUE_TAGS). kind 18 (net-resp-body): the raw wire response, which
+        // is the module bytes a dynamic import later compiles.
+        if r.kind == "fingerprint" && !VALUE_TAGS.iter().any(|t| tag.starts_with(t)) {
+            continue;
         }
-        if (is_crypto_sink || is_upload || is_ws_sink) && !sink_full {
-            for h in &runs {
-                if sink_runs.len() >= CONTENT_MAX_TOTAL_RUNS {
-                    sink_full = true;
+        let is_crypto_sink = r.kind == "crypto-op"
+            && SINK_CRYPTO_OPS.iter().any(|o| tag.contains(o));
+        let is_upload = r.kind == "net-request" && tag == "req-body";
+        // the method\0url record: a carrier, and a SINK when the query is
+        // long enough to be a payload rather than a cache-buster. A body-less
+        // beacon is the only observable evidence that anything left.
+        // tag must be an HTTP method here (req-body / req-headers are the
+        // other kind-17 tags; a bare url record carries "GET"/"POST"/...).
+        let is_query_sink = r.kind == "net-request"
+            && HTTP_METHODS.contains(&tag.as_str())
+            && body.len() >= QUERY_SINK_MIN_BYTES
+            && body.contains(&b'?');
+        // 0017: only the OUTBOUND ws frame sinks; inbound tags stay carriers
+        // (a challenge response can be re-sent verbatim later).
+        let is_ws_sink = r.kind == "websocket" && tag == "ws-frame-out";
+        let sink = is_crypto_sink || is_upload || is_ws_sink || is_query_sink;
+
+        // Budget gates CARRIERS only. A sink is always admitted: it is a BFS
+        // seed, and dropping one silently deletes every chain upstream of it.
+        // recs are ts-sorted, so the old single break cut the run at the first
+        // 50k records and lost the LATE token send - the very 10-30s
+        // collect-then-send case this graph exists to catch. Sinks are few
+        // (hundreds per run: uploads, crypto ops) so this cannot blow up;
+        // GRAPH_MAX_EDGES still bounds the total.
+        if !sink {
+            if carriers_seen >= CONTENT_MAX_RECORDS || total_keys >= GRAPH_MAX_EDGES {
+                continue;
+            }
+            carriers_seen += 1;
+        } else if total_keys >= GRAPH_MAX_EDGES {
+            continue;
+        }
+
+        let mut keys = run_keys(&body);
+        // variant runs: only sinks pay for them, bounded by VARIANT_MAX_SINKS.
+        // These cover the STANDARD encodings only: base64 (RFC 4648) and
+        // lowercase hex. HONEST LIMIT, proven against this repo's own capture
+        // (afeye-20260918-144834.zip, the 4 Cloudflare .post bodies): their
+        // wire charset is "$+,-./0-9:A-Za-z{}" with NO "=" padding at all, so
+        // it is a vendor-specific alphabet, not base64. A sink whose bytes are
+        // wrapped in a custom alphabet will NOT match these variant runs and
+        // the graph reports the chain as unresolved rather than guessing.
+        // Fixing that needs the alphabet extracted from the captured
+        // script-source and a parameterized decoder - not another encoding
+        // guess.
+        if sink && body.len() >= VARIANT_MIN_BYTES && sinks_seen < VARIANT_MAX_SINKS {
+            sinks_seen += 1;
+            let room = GRAPH_MAX_EDGES.saturating_sub(total_keys);
+            if room > 0 {
+                use base64::Engine as _;
+                let b64 = base64::engine::general_purpose::STANDARD
+                    .encode(&body)
+                    .into_bytes();
+                let mut vk = run_keys(&b64);
+                vk.extend(run_keys(&hex_bytes(&body)));
+                vk.truncate(room.min(vk.len()));
+                total_keys += vk.len();
+                keys.extend(vk);
+            }
+        }
+        // per-node bound: run_keys already caps at CONTENT_MAX_RUNS; the
+        // variant runs (base64+hex, ~2x) share the same ceiling so one huge
+        // blob cannot eat the global edge budget.
+        if keys.len() > CONTENT_MAX_RUNS {
+            keys.truncate(CONTENT_MAX_RUNS);
+        }
+        // dedup: a periodic body (period dividing the 16B stride) emits the
+        // same window repeatedly. Duplicates would inflate fanout and make the
+        // BFS re-walk identical neighbour lists.
+        keys.sort_unstable();
+        keys.dedup();
+        total_keys += keys.len();
+        nodes.push(GraphNode { ts: r.ts, sink, keys });
+    }
+
+    // ---- CSR adjacency (compressed sparse row) --------------------------------
+    // Three flat arrays beat both alternatives here:
+    //   flat Vec<(u64,u32)> : 16 B/edge (align padding) + a SECOND copy of the
+    //                         keys in nodes[].keys, and a 23-probe binary
+    //                         search per neighbour lookup
+    //   HashMap<u64,Vec<u32>>: ~56 B/entry + bucket overhead, fastest lookup
+    //                         but ~1.7x the memory
+    //   CSR                 : one bsearch on `adj_keys`, then a direct slice -
+    //                         8 B per distinct key + 4 B per edge + 4 B offset,
+    //                         no duplicated key storage, no hashing.
+    let mut adj_keys: Vec<u64> = Vec::new();
+    let mut adj_off: Vec<u32> = Vec::new();
+    let mut adj_nodes: Vec<u32> = Vec::new();
+    {
+        // counting pass: gather (key, node) pairs, then sort by key once
+        let mut pairs: Vec<(u64, u32)> = Vec::with_capacity(total_keys);
+        for (ni, n) in nodes.iter().enumerate() {
+            for k in &n.keys {
+                if pairs.len() >= GRAPH_MAX_EDGES {
                     break;
                 }
-                sink_runs.insert(*h);
+                pairs.push((*k, ni as u32));
             }
         }
-        carriers.push((r.ts, runs));
+        pairs.sort_unstable();
+        let mut edge_count = 0usize;
+        let mut i = 0usize;
+        while i < pairs.len() {
+            let key = pairs[i].0;
+            let start = i;
+            while i < pairs.len() && pairs[i].0 == key {
+                i += 1;
+            }
+            adj_keys.push(key);
+            adj_off.push(edge_count as u32);
+            for p in &pairs[start..i] {
+                adj_nodes.push(p.1);
+            }
+            edge_count += i - start;
+        }
+        adj_off.push(edge_count as u32);
+        stats.graph_edges = edge_count as u64;
+        stats.graph_distinct_keys = adj_keys.len() as u64;
     }
-    // carriers sharing >=1 run with the sink set are "sink-linked": their
-    // timestamp marks a position where token-feeding bytes were handled.
-    let mut content_ts: Vec<u64> = Vec::new();
-    for (ts, runs) in &carriers {
-        if runs.iter().any(|h| sink_runs.contains(h)) {
-            content_ts.push(*ts);
+
+    // A run shared by more than this many records is boilerplate (a common
+    // JSON prefix, an identical SSV header across thousands of records), not
+    // token payload - linking on it would taint the whole page. This cap is
+    // the ONE place the graph can produce an honest false-negative, so it is
+    // counted and reported, never silent. Sink nodes bypass the cap: a token
+    // window that happens to share a boilerplate prefix with thousands of
+    // records must still spread its own taint - the danger is only in the
+    // carrier direction, where an over-linked key would light up everything.
+    const GRAPH_MAX_FANOUT: usize = 4096;
+
+    // BFS backwards from every sink node
+    let mut dist: Vec<u32> = vec![u32::MAX; nodes.len()];
+    let mut queue: Vec<u32> = Vec::new();
+    let mut seed_count = 0usize;
+    for (ni, n) in nodes.iter().enumerate() {
+        if n.sink {
+            dist[ni] = 0;
+            queue.push(ni as u32);
+            seed_count += 1;
         }
     }
-    content_ts.sort_unstable();
+    let mut fanout_dropped: u64 = 0;
+    let mut head = 0usize;
+    while head < queue.len() {
+        let u = queue[head] as usize;
+        head += 1;
+        let du = dist[u];
+        if du >= GRAPH_MAX_HOPS {
+            continue;
+        }
+        let from_sink = nodes[u].sink;
+        for k in &nodes[u].keys {
+            let ki = match adj_keys.binary_search(k) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            let lo = adj_off[ki] as usize;
+            let hi = adj_off[ki + 1] as usize;
+            if !from_sink && hi - lo > GRAPH_MAX_FANOUT {
+                fanout_dropped += (hi - lo) as u64;
+                continue;
+            }
+            for v in &adj_nodes[lo..hi] {
+                let v = *v as usize;
+                if dist[v] == u32::MAX {
+                    dist[v] = du + 1;
+                    queue.push(v as u32);
+                }
+            }
+        }
+    }
+    stats.graph_fanout_dropped = fanout_dropped;
+
+    // tainted payload positions: (ts, hops) sorted by ts - the chain marker
+    // takes the MINIMUM hop distance inside its window
+    let mut graph_ts: Vec<(u64, u32)> = Vec::new();
+    let mut tainted_nodes = 0usize;
+    let mut hop_hist: BTreeMap<u32, u64> = BTreeMap::new();
+    for (ni, n) in nodes.iter().enumerate() {
+        if dist[ni] != u32::MAX {
+            tainted_nodes += 1;
+            graph_ts.push((n.ts, dist[ni]));
+            *hop_hist.entry(dist[ni]).or_insert(0) += 1;
+        }
+    }
+    graph_ts.sort_unstable();
+    stats.graph_nodes = nodes.len() as u64;
+    // graph_edges already set inside the CSR build block
+    stats.graph_sinks = seed_count as u64;
+    stats.graph_tainted = tainted_nodes as u64;
+    // hop 0 = the sink record itself; hop 1 = byte-identical to a sink (the
+    // old 1-hop content-sink); hop >= 2 = transitive through intermediate
+    // payloads - what the timer heuristics could never reach.
+    stats.graph_hop1 = hop_hist.get(&1).copied().unwrap_or(0);
+    stats.graph_deep = hop_hist.iter().filter(|(h, _)| **h >= 2).map(|(_, n)| *n).sum();
+
+    // backward-compatible 1-hop view: content_ts drives the existing
+    // `content-sink` signal; the graph adds `graph-sink` with the hop count.
+    let mut content_ts: Vec<u64> = graph_ts
+        .iter()
+        .filter(|(_, h)| *h <= 1)
+        .map(|(t, _)| *t)
+        .collect();
     content_ts.dedup();
 
     // ---- v9 entry-join: attribute records of interest to the CHAIN that was
@@ -1394,11 +1798,13 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     // caller in C++; the entry-join recovers it)
 
     // display-name -> chain idx (first wins; display names are the bare
-    // resource URL that kind-8 script= also carries, so they join directly)
-    let mut name_to_chain: HashMap<&str, usize> = HashMap::new();
+    // resource URL that kind-8 script= also carries, so they join directly).
+    // OWNED keys: this map outlives three passes that take `&mut chain_list`,
+    // and borrowing the names would hold an immutable borrow across them.
+    let mut name_to_chain: HashMap<String, usize> = HashMap::new();
     for (idx, c) in chain_list.iter().enumerate() {
         if !c.name.is_empty() {
-            name_to_chain.entry(c.name.as_str()).or_insert(idx);
+            name_to_chain.entry(c.name.clone()).or_insert(idx);
         }
     }
     // per-chain accumulators keyed by idx
@@ -1554,6 +1960,120 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         }
     }
 
+    // v11: hop distance per chain FIRST - chain_signals reports it.
+    for c in &mut chain_list {
+        c.graph_hops = graph_hops_for(&graph_ts, c.first_ts, c.last_ts);
+    }
+
+    // ---- v11 honest classification, three ordered passes -------------------
+    // PROVEN      : an observed FACT - a byte-identity path to a sink
+    //               (graph-sink), an entry that initiated a fetch/XHR/beacon
+    //               (send-initiator), an entry that read/wrote a cookie or
+    //               storage value (token-access), or an entry that eval'd /
+    //               dynamically compiled a chain which is itself proven
+    //               (provenance, pass 2).
+    // HEURISTIC   : evidence, not proof - text match, time windows, probe
+    //               counts. Kept in the filtered zip by default: the real
+    //               collectors often live here.
+    // UNRESOLVED  : no observable connection. Deliberately NOT called a
+    //               "proven dead end": in-memory dataflow (fingerprint ->
+    //               closure variable -> sent 30 s later by another chain)
+    //               crosses NO C++ boundary, so boundary-level capture can
+    //               never prove the negative. The token story survives because
+    //               the ASSEMBLING and SENDING chains are proven; only the
+    //               invisible middle is dropped. AF_STRICT_GRAPH=1 cuts the
+    //               filtered zip to PROVEN only.
+    //
+    // PASS 1 - the per-chain facts that need no other chain.
+    for c in &mut chain_list {
+        c.proven = c.graph_hops.is_some() || c.send_initiator || c.token_access;
+    }
+
+    // ---- PASS 1b: URL-identity (structural, zero-risk) ---------------------
+    // A chain whose display name is a URL the net layer actually requested is
+    // downloaded code. Deliberately NOT a proven/taint signal: attributing a
+    // resp-body span to its URL would need per-request correlation that the
+    // wire format does not carry (concurrent responses interleave in one pid),
+    // and claiming it would be exactly the kind of guess this pass removes.
+    {
+        let mut requested: HashSet<String> = HashSet::new();
+        for r in recs.iter().filter(|r| r.kind == "net-request") {
+            let txt = r.txt.as_deref().unwrap_or("");
+            if let Some(nul) = txt.find('\u{0}') {
+                let url = &txt[nul + 1..];
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    requested.insert(url.to_string());
+                }
+            }
+        }
+        for c in &mut chain_list {
+            if !c.name.is_empty() && requested.contains(&c.name) {
+                c.fetched_url = true;
+                stats.fetched_url_chains += 1;
+            }
+        }
+    }
+
+    // ---- PASS 2: compile-provenance edges --------------------------------------
+    // The byte graph cannot see WHO eval'd/compiled the token code: an
+    // eval'd chunk's source crosses kind-1 with the name "eval", and its
+    // bytes are code, not payload. But the moment a PROVEN chain's first
+    // fragment materialized, some chain was the active C++->JS entry (kind-8)
+    // - that chain is the one that ran the eval / dynamic import / Function
+    // constructor which produced it. Mark that parent.
+    //
+    // Direction matters: the edge is recorded on the PARENT only. Taint is
+    // NOT inherited downward, because a deobfuscator legitimately evals both
+    // the token pipeline and piles of library code - downward inheritance
+    // would drag every lodash template into the filtered zip. The parent
+    // marker answers "which orchestrator spawned proven code", which is what
+    // the report needs, without contaminating the cut.
+    //
+    // Honest limit: the parent is the nearest C++->JS entry, so a chunk
+    // compiled during a long synchronous run is attributed to that entry;
+    // and a chunk compiled on a background thread has no entry to attribute
+    // (script_at returns None) - it stays unparented rather than guessing.
+    {
+        let mut proven_names: Vec<(u64, u64, usize, &str)> = chain_list
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.proven && !c.name.is_empty())
+            .map(|(i, c)| (c.pid, c.first_ts, i, c.name.as_str()))
+            .collect();
+        proven_names.sort_unstable_by_key(|x| (x.0, x.1));
+        let mut parents: HashMap<usize, Vec<String>> = HashMap::new();
+        for (pid, ts, _ci, child) in &proven_names {
+            let parent = match entry_index.script_at(&recs, *pid, *ts) {
+                Some(p) => p,
+                None => continue,
+            };
+            let (_, bare) = split_iso(parent);
+            // a chain that compiled itself (toplevel script) is not a parent
+            if bare == *child {
+                continue;
+            }
+            let pidx = match name_to_chain.get(bare.as_str()) {
+                Some(i) => *i,
+                None => continue,
+            };
+            let v = parents.entry(pidx).or_default();
+            let cname = child.to_string();
+            if !v.contains(&cname) && v.len() < 16 {
+                v.push(cname);
+            }
+        }
+        for (pidx, children) in parents {
+            if let Some(c) = chain_list.get_mut(pidx) {
+                c.spawned_proven = children;
+                stats.provenance_parents += 1;
+            }
+        }
+    }
+
+    // PASS 3 - signals and the three-way verdict, now that provenance is known.
+    let strict_graph =
+        std::env::var("AF_STRICT_GRAPH").map(|v| v == "1").unwrap_or(false);
+    stats.strict_graph = strict_graph;
     for c in &mut chain_list {
         let (signals, net_adjacent, content_sink) = chain_signals(c, &net_ts, &content_ts);
         if net_adjacent {
@@ -1562,11 +2082,35 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         if content_sink {
             stats.content_sink_chains += 1;
         }
-        if !signals.is_empty() {
+        if c.graph_hops.is_some() {
+            stats.graph_chains += 1;
+        }
+        // provenance upgrades the parent: it is a kind-8 fact about which
+        // entry compiled the proven code, not a guess.
+        if !c.spawned_proven.is_empty() {
+            c.proven = true;
+        }
+        if c.proven {
+            stats.proven_chains += 1;
+        }
+        if !signals.is_empty() || c.proven {
             c.token_forming = true;
             stats.token_chains += 1;
+            if !c.proven {
+                stats.heuristic_chains += 1;
+            }
         } else {
             stats.dead_end_chains += 1;
+            // An UNRESOLVED chain is a PROVEN dead end only with a
+            // completeness witness: no ring drops in this pid up to the end of
+            // its materialization window. With drops present the absence of a
+            // link is not evidence - the link may have been dropped.
+            if !drops_witnessed(&drop_events, c.pid, c.last_ts) {
+                c.dead_end_proven = true;
+                stats.dead_end_proven += 1;
+            } else {
+                stats.unresolved_chains += 1;
+            }
         }
         c.signals = signals;
         c.net_adjacent = net_adjacent;
@@ -1608,15 +2152,33 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     stats.hot_chains = hot as u64;
     stats.cold_chains = cold as u64;
 
-    // v9 prune list: EVERY kept-but-not-token-forming chain path, no cap.
-    // The report below caps at 4000 chains; main.rs cuts the filtered zip on
-    // token_forming=false - chains past the cap were silently escaping the
-    // cut (the eval-storm case: thousands of chains, dead ends leaking into
-    // the "token-only" zip). This compact list is the authoritative cut set.
+    // v9 prune list: the authoritative cut set for the filtered zip, UNCAPPED
+    // (the report's chains[] caps at 4000; chains past the cap were silently
+    // escaping the cut - eval storms leak thousands).
+    // v11: in AF_STRICT_GRAPH mode the keep rule tightens from "token_forming"
+    // (facts + heuristics) to "proven" (facts only: byte-identity graph path,
+    // observed send initiation, observed cookie/storage access). Everything
+    // else is pruned, INCLUDING heuristic-only chains.
     let prune_report: Vec<serde_json::Value> = chain_list
         .iter()
-        .filter(|c| !c.path.is_empty() && !c.token_forming)
-        .map(|c| json!({ "path": c.path, "bytes": c.bytes }))
+        .filter(|c| {
+            !c.path.is_empty() && if stats.strict_graph { !c.proven } else { !c.token_forming }
+        })
+        .map(|c| {
+            json!({
+                "path": c.path,
+                "bytes": c.bytes,
+                "verdict": if c.proven {
+                    "proven"
+                } else if c.token_forming {
+                    "heuristic"
+                } else if c.dead_end_proven {
+                    "dead-end-proven"
+                } else {
+                    "unresolved"
+                },
+            })
+        })
         .collect();
     stats.prune_paths = prune_report.len() as u64;
 
@@ -1660,6 +2222,30 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         }
         if c.executed_funcs > 0 {
             entry["executed_funcs"] = json!(c.executed_funcs);
+        }
+        if let Some(h) = c.graph_hops {
+            entry["graph_hops"] = json!(h);
+        }
+        if !c.spawned_proven.is_empty() {
+            entry["spawned_proven"] = json!(c.spawned_proven);
+            entry["provenance"] = json!("entry");
+        }
+        if c.fetched_url {
+            entry["fetched_url"] = json!(true);
+        }
+        entry["verdict"] = json!(if c.proven {
+            "proven"
+        } else if c.token_forming {
+            "heuristic"
+        } else if c.dead_end_proven {
+            "dead-end-proven"
+        } else {
+            "unresolved"
+        });
+        if !c.token_forming {
+            entry["dead_end_witness"] = json!({
+                "ring_drops_in_pid": drops_witnessed(&drop_events, c.pid, c.last_ts),
+            });
         }
         if let Some(t) = &c.trigger {
             entry["trigger"] = json!({
@@ -1819,6 +2405,27 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "stack_inspect": stats.stack_inspect_chains,
             "payload_assembler": stats.payload_assembler_chains,
             "rule": "token-forming = sink-call | handler-born | fp-probes>=2 | integrity-check | net-window | content-sink | send-initiator | token-access | fp-probes-entry | gopd-check | stack-inspect (v10); content-sink crosses the encryption boundary via crypto-out/ws-frame-out byte identity (v9); the *-entry/send-initiator/token-access/gopd/stack signals come from the kind-8 entry-join (caller attribution, no stack walk) - dead ends stay whole in the raw run zip",
+        },
+        "graph": {
+            "nodes": stats.graph_nodes,
+            "edges": stats.graph_edges,
+            "sink_seeds": stats.graph_sinks,
+            "tainted_nodes": stats.graph_tainted,
+            "hop1": stats.graph_hop1,
+            "hop2_plus": stats.graph_deep,
+            "chains_linked": stats.graph_chains,
+            "max_hops": GRAPH_MAX_HOPS,
+            "rule": "nodes = payload records (crypto-op/structured-clone/net-request/taint-edge/websocket); edges = shared 32B blake3 run (stride 16, monotone skipped); seeds = req-body + ws-frame-out + payload-forming crypto raw_data + crypto-out; BFS backwards, hop-capped; sinks also carry base64/hex variant runs so an envelope step still matches. A chain is graph-sink@N when a tainted record falls in its materialization window - N hops of DEMONSTRATED byte identity to the wire, not a timer guess.",
+        },
+        "classification": {
+            "strict_graph": stats.strict_graph,
+            "proven": stats.proven_chains,
+            "heuristic": stats.heuristic_chains,
+            "dead_end_proven": stats.dead_end_proven,
+            "unresolved": stats.unresolved_chains,
+            "provenance_parents": stats.provenance_parents,
+            "fetched_url_chains": stats.fetched_url_chains,
+            "rule": "proven = graph-sink | send-initiator | token-access | spawned-proven (observed facts: byte identity to a sink, an entry that initiated the send, an entry that touched the stored token, an entry that compiled proven code); heuristic = token_forming without a fact (sink-call text, handler-born window, fp-probes, integrity, net-window); unresolved = no observable connection. Unresolved is NOT claimed to be a proven dead end: in-memory dataflow (fingerprint -> closure -> sent later by another chain) crosses no C++ boundary, so boundary-level capture cannot prove the negative. AF_STRICT_GRAPH=1 cuts the filtered zip to proven only.",
         },
         "v8_depth": {
             "lazy_funcs": stats.lazy_funcs,
@@ -2039,6 +2646,7 @@ mod tests {
     ) -> Chain {
         Chain {
             file: None,
+            pid: 1,
             name: "x.js".into(),
             frags: 1,
             bytes: 10,
@@ -2070,6 +2678,11 @@ mod tests {
             stack_samples: Vec::new(),
             payload_assembler: false,
             executed_funcs: 0,
+            fetched_url: false,
+            graph_hops: None,
+            proven: false,
+            dead_end_proven: false,
+            spawned_proven: Vec::new(),
         }
     }
 

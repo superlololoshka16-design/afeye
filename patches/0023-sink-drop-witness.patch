@@ -1,0 +1,228 @@
+--- a/services/network/afeye_sink.cc
++++ b/services/network/afeye_sink.cc
+@@ -92,6 +92,29 @@ void EmitHello(int fd) {
+   WriteAll(fd, rec, total);
+ }
+ 
++// Writes a kind-39 drop report DIRECTLY to the fd, bypassing the ring: a drop
++// report that had to queue in the ring could itself be dropped, which would
++// defeat the only purpose it has. Only the drain thread ever writes to this
++// fd, so there is no cross-writer interleaving to guard.
++void WriteDropReport(int fd, uint64_t dropped) {
++  if (fd < 0) return;
++  char msg[96];
++  int n = std::snprintf(msg, sizeof(msg), "sink-drop layer=%s dropped=%llu",
++                        kLayer, static_cast<unsigned long long>(dropped));
++  if (n <= 0) return;
++  uint8_t rec[16 + 96];
++  uint32_t total = 16 + static_cast<uint32_t>(n);
++  std::memcpy(rec, &total, sizeof(total));
++  rec[4] = kSinkDrop;
++  rec[5] = 0;
++  rec[6] = 0;
++  rec[7] = 0;
++  uint64_t ts = MonoNs();
++  std::memcpy(rec + 8, &ts, sizeof(ts));
++  std::memcpy(rec + 16, msg, static_cast<size_t>(n));
++  WriteAll(fd, rec, total);
++}
++
+ void DrainLoop() {
+   char pid[16];
+   std::snprintf(pid, sizeof(pid), "%d", static_cast<int>(::getpid()));
+@@ -99,6 +122,10 @@ void DrainLoop() {
+   int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
+   if (fd >= 0) EmitHello(fd);
+   std::vector<uint8_t> buf;
++  // drop-report throttling: emit at most ~10/s and only when the count moved,
++  // so a sustained overflow cannot itself flood the file.
++  uint64_t reported_drops = 0;
++  uint64_t last_report_ns = 0;
+   for (;;) {
+     size_t len = 0;
+     bool have = false;
+@@ -130,6 +157,17 @@ void DrainLoop() {
+     } else {
+       std::this_thread::sleep_for(std::chrono::microseconds(500));
+     }
++    // ring-overflow witness: the filter needs this to tell "this branch fed
++    // nothing" apart from "this branch's records were dropped".
++    const uint64_t now_dropped = g_dropped.load(std::memory_order_relaxed);
++    if (now_dropped != reported_drops) {
++      const uint64_t now_ns = MonoNs();
++      if (now_ns - last_report_ns >= 100ull * 1000ull * 1000ull) {
++        WriteDropReport(fd, now_dropped);
++        reported_drops = now_dropped;
++        last_report_ns = now_ns;
++      }
++    }
+   }
+ }
+ 
+--- a/services/network/afeye_sink.h
++++ b/services/network/afeye_sink.h
+@@ -14,6 +14,12 @@ enum EventKind : uint8_t {
+   kNetReq = 17,
+   kNetRespBody = 18,
+   kWebSocket = 19,
++  // 39 sink-drop: the ring's own overflow counter, emitted by the drain
++  // thread directly to the fd (never through the ring - a drop report that
++  // could itself be dropped would be useless). Without this the Rust filter
++  // cannot tell "this branch fed nothing" from "this branch's records were
++  // dropped", so `unresolved` would be a guess instead of a verdict.
++  kSinkDrop = 39,
+ };
+ 
+ bool Enabled();
+--- a/third_party/blink/renderer/platform/afeye/sink.cc
++++ b/third_party/blink/renderer/platform/afeye/sink.cc
+@@ -92,6 +92,29 @@ void EmitHello(int fd) {
+   WriteAll(fd, rec, total);
+ }
+ 
++// Writes a kind-39 drop report DIRECTLY to the fd, bypassing the ring: a drop
++// report that had to queue in the ring could itself be dropped, which would
++// defeat the only purpose it has. Only the drain thread ever writes to this
++// fd, so there is no cross-writer interleaving to guard.
++void WriteDropReport(int fd, uint64_t dropped) {
++  if (fd < 0) return;
++  char msg[96];
++  int n = std::snprintf(msg, sizeof(msg), "sink-drop layer=%s dropped=%llu",
++                        kLayer, static_cast<unsigned long long>(dropped));
++  if (n <= 0) return;
++  uint8_t rec[16 + 96];
++  uint32_t total = 16 + static_cast<uint32_t>(n);
++  std::memcpy(rec, &total, sizeof(total));
++  rec[4] = kSinkDrop;
++  rec[5] = 0;
++  rec[6] = 0;
++  rec[7] = 0;
++  uint64_t ts = MonoNs();
++  std::memcpy(rec + 8, &ts, sizeof(ts));
++  std::memcpy(rec + 16, msg, static_cast<size_t>(n));
++  WriteAll(fd, rec, total);
++}
++
+ void DrainLoop() {
+   char pid[16];
+   std::snprintf(pid, sizeof(pid), "%d", static_cast<int>(::getpid()));
+@@ -99,6 +122,10 @@ void DrainLoop() {
+   int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
+   if (fd >= 0) EmitHello(fd);
+   std::vector<uint8_t> buf;
++  // drop-report throttling: emit at most ~10/s and only when the count moved,
++  // so a sustained overflow cannot itself flood the file.
++  uint64_t reported_drops = 0;
++  uint64_t last_report_ns = 0;
+   for (;;) {
+     size_t len = 0;
+     bool have = false;
+@@ -130,6 +157,17 @@ void DrainLoop() {
+     } else {
+       std::this_thread::sleep_for(std::chrono::microseconds(500));
+     }
++    // ring-overflow witness: the filter needs this to tell "this branch fed
++    // nothing" apart from "this branch's records were dropped".
++    const uint64_t now_dropped = g_dropped.load(std::memory_order_relaxed);
++    if (now_dropped != reported_drops) {
++      const uint64_t now_ns = MonoNs();
++      if (now_ns - last_report_ns >= 100ull * 1000ull * 1000ull) {
++        WriteDropReport(fd, now_dropped);
++        reported_drops = now_dropped;
++        last_report_ns = now_ns;
++      }
++    }
+   }
+ }
+ 
+--- a/third_party/blink/renderer/platform/afeye/sink.h
++++ b/third_party/blink/renderer/platform/afeye/sink.h
+@@ -41,6 +41,12 @@ enum EventKind : uint8_t {
+   // the token pipeline, so the Rust filter can run content-runs across them
+   // (backward slice by DATA, not by timer).
+   kTaintEdge = 37,
++  // 39 sink-drop: the ring's own overflow counter, emitted by the drain
++  // thread directly to the fd (never through the ring - a drop report that
++  // could itself be dropped would be useless). Without this the Rust filter
++  // cannot tell "this branch fed nothing" from "this branch's records were
++  // dropped", so `unresolved` would be a guess instead of a verdict.
++  kSinkDrop = 39,
+ };
+ 
+ bool Enabled();
+--- a/v8/src/afeye/sink.cc
++++ b/v8/src/afeye/sink.cc
+@@ -92,6 +92,29 @@ void EmitHello(int fd) {
+   WriteAll(fd, rec, total);
+ }
+ 
++// Writes a kind-39 drop report DIRECTLY to the fd, bypassing the ring: a drop
++// report that had to queue in the ring could itself be dropped, which would
++// defeat the only purpose it has. Only the drain thread ever writes to this
++// fd, so there is no cross-writer interleaving to guard.
++void WriteDropReport(int fd, uint64_t dropped) {
++  if (fd < 0) return;
++  char msg[96];
++  int n = std::snprintf(msg, sizeof(msg), "sink-drop layer=%s dropped=%llu",
++                        kLayer, static_cast<unsigned long long>(dropped));
++  if (n <= 0) return;
++  uint8_t rec[16 + 96];
++  uint32_t total = 16 + static_cast<uint32_t>(n);
++  std::memcpy(rec, &total, sizeof(total));
++  rec[4] = kSinkDrop;
++  rec[5] = 0;
++  rec[6] = 0;
++  rec[7] = 0;
++  uint64_t ts = MonoNs();
++  std::memcpy(rec + 8, &ts, sizeof(ts));
++  std::memcpy(rec + 16, msg, static_cast<size_t>(n));
++  WriteAll(fd, rec, total);
++}
++
+ void DrainLoop() {
+   char pid[16];
+   std::snprintf(pid, sizeof(pid), "%d", static_cast<int>(::getpid()));
+@@ -99,6 +122,10 @@ void DrainLoop() {
+   int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
+   if (fd >= 0) EmitHello(fd);
+   std::vector<uint8_t> buf;
++  // drop-report throttling: emit at most ~10/s and only when the count moved,
++  // so a sustained overflow cannot itself flood the file.
++  uint64_t reported_drops = 0;
++  uint64_t last_report_ns = 0;
+   for (;;) {
+     size_t len = 0;
+     bool have = false;
+@@ -130,6 +157,17 @@ void DrainLoop() {
+     } else {
+       std::this_thread::sleep_for(std::chrono::microseconds(500));
+     }
++    // ring-overflow witness: the filter needs this to tell "this branch fed
++    // nothing" apart from "this branch's records were dropped".
++    const uint64_t now_dropped = g_dropped.load(std::memory_order_relaxed);
++    if (now_dropped != reported_drops) {
++      const uint64_t now_ns = MonoNs();
++      if (now_ns - last_report_ns >= 100ull * 1000ull * 1000ull) {
++        WriteDropReport(fd, now_dropped);
++        reported_drops = now_dropped;
++        last_report_ns = now_ns;
++      }
++    }
+   }
+ }
+ 
+--- a/v8/src/afeye/sink.h
++++ b/v8/src/afeye/sink.h
+@@ -35,6 +35,12 @@ enum EventKind : uint8_t {
+   // 38 error-stack: Error().stack / captureStackTrace materialization
+   // (0022) - the automation-detection surface AND the JS->JS edge source.
+   kErrorStack = 38,
++  // 39 sink-drop: the ring's own overflow counter, emitted by the drain
++  // thread directly to the fd (never through the ring - a drop report that
++  // could itself be dropped would be useless). Without this the Rust filter
++  // cannot tell "this branch fed nothing" from "this branch's records were
++  // dropped", so `unresolved` would be a guess instead of a verdict.
++  kSinkDrop = 39,
+ };
+ 
+ bool Enabled();
