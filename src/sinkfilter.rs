@@ -95,6 +95,11 @@ pub struct SinkFilterStats {
     pub stack_inspect_chains: u64,
     pub automation_tells: u64,
     pub wasm_firstcalls: u64,
+    pub wasm_mem_grows: u64,
+    pub exec_compiles: u64,
+    pub exec_jit: u64,
+    pub exec_byte: u64,
+    pub exec_wasm_code: u64,
     pub wasm_traps: u64,
     pub wasm_cached: u64,
     pub lazy_funcs: u64,
@@ -1305,6 +1310,11 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     let mut workers: Vec<(u64, String, String)> = Vec::new(); // (ts, iso, name)
     let mut wasm_inst: Vec<(u64, u64, bool, String)> = Vec::new(); // (ts, pid, is_imports_header, txt)
     let mut wasm_firstcalls = 0u64;
+    let mut wasm_mem_grows = 0u64;  // v12.2 (0025): linear-memory grow events
+    let mut exec_compiles = 0u64;  // v12.2 (0025): all compiled functions
+    let mut exec_jit = 0u64;
+    let mut exec_byte = 0u64;
+    let mut exec_wasm_code = 0u64;
     let mut wasm_traps = 0u64;
     let mut automation_tells: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut drop_events: Vec<(u64, u64, u64)> = Vec::new(); // (ts, pid, total)
@@ -1335,6 +1345,25 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                     }
                 }
             }
+            // v12.2 (0025): kind-34 'exec <type> <name> len=N' - every
+            // function AS COMPILED (bytecode, baseline, turbofan, wasm):
+            // the full execution surface beyond lazy-first. Tier-up
+            // compiles land here. Counted in v8_depth; per-chain
+            // attribution joins by script name (the exec name is the
+            // FUNCTION name - the chain attribution stays lazy-compile's
+            // job; here we keep the totals + the tier distribution).
+            "isolate" => {
+                if txt.starts_with("exec ") {
+                    exec_compiles += 1;
+                    if txt.starts_with("exec jit ") {
+                        exec_jit += 1;
+                    } else if txt.starts_with("exec byte ") {
+                        exec_byte += 1;
+                    } else if txt.starts_with("exec wasm ") {
+                        exec_wasm_code += 1;
+                    }
+                }
+            }
             "worker" => {
                 if let Some((iso, name)) = worker_of(txt) {
                     workers.push((r.ts, iso, name));
@@ -1348,6 +1377,10 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                     wasm_firstcalls += 1;
                 } else if txt.starts_with("wasm-trap ") {
                     wasm_traps += 1;
+                } else if txt.starts_with("wasm-mem grow ") {
+                    // v12.2 (0025): the wasm linear-memory grow event - the
+                    // PoW-style alloc pattern (Kasada grows in bursts).
+                    wasm_mem_grows += 1;
                 }
             }
             // v10 (0021, kind 38): the materialized Error.stack string - the
@@ -1381,6 +1414,11 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     // v10 (0020/0021): wasm execution facts + automation-marker hits folded
     // from the pre-scan
     stats.wasm_firstcalls = wasm_firstcalls;
+    stats.wasm_mem_grows = wasm_mem_grows;
+    stats.exec_compiles = exec_compiles;
+    stats.exec_jit = exec_jit;
+    stats.exec_byte = exec_byte;
+    stats.exec_wasm_code = exec_wasm_code;
     stats.wasm_traps = wasm_traps;
     stats.automation_tells = automation_tells.values().sum();
 
@@ -2650,9 +2688,14 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         },
         "v8_depth": {
             "lazy_funcs": stats.lazy_funcs,
+            "exec_compiles": stats.exec_compiles,
+            "exec_jit": stats.exec_jit,
+            "exec_byte": stats.exec_byte,
+            "exec_wasm_code": stats.exec_wasm_code,
             "wasm_firstcalls": stats.wasm_firstcalls,
             "wasm_traps": stats.wasm_traps,
             "wasm_cached": stats.wasm_cached,
+            "wasm_mem_grows": stats.wasm_mem_grows,
             "automation_tells": automation_tells,
             "note": "lazy_funcs = wasm-free JS functions that actually executed (0023); wasm_firstcalls = wasm functions that ran at least once; automation_tells = harness markers found in materialized Error.stacks (kind 38) - if the crawler's own harness shows up here, that is a capture-integrity alarm",
         },
