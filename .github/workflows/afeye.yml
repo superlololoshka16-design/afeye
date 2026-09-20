@@ -49,11 +49,17 @@ jobs:
           # .cadence == 'go'` consumer was permanently false and the
           # scheduled crawl never ran.
           out = os.environ.get("GITHUB_OUTPUT", "")
+          # v12.1.2: GITHUB_OUTPUT lines are strict key=value - the WHOLE
+          # rest of the line is the value, so "cadence=go credits=0" set
+          # cadence to "go credits=0" and every == 'go' condition stayed
+          # false. Diagnostics go to stdout; the output file gets the
+          # clean first token only.
           def emit(v):
               print(v)
-              if out:
+              if out and "=" in v:
+                  k, _, rest = v.partition("=")
                   with open(out, "a") as f:
-                      f.write(v + "\n")
+                      f.write(k + "=" + rest.split(" ")[0] + "\n")
           last_end = float(st.get("last_end", 0))
           credits = int(st.get("credits", 0))
           deadline = last_end + 3 * 3600 * credits
