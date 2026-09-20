@@ -1,11 +1,33 @@
-# afeye chromium patch series v11
+# afeye chromium patch series v12
 
-**23 patches** against **Chromium 153.0.8010.52** (v8 rev
+**24 patches** against **Chromium 153.0.8010.52** (v8 rev
 `d1fed5cd7e3b114dea70f18b20d26f816322833d`). The whole series is
 re-verified to apply cumulatively with plain `git apply` against a
 pristine tree assembled from sources fetched at that tag
-(23/23; v11 hunks re-validated on freshly fetched pristine files for
-0020/0021/0022/0023).
+(24/24; v12 hunk re-validated on freshly fetched pristine files for 0024).
+
+v12 is ONE patch, 0024, and it is the single biggest capture win in the
+series: it makes EVERY WebIDL value universal instead of funnel-by-funnel.
+Until now the dom-api thunk (0008) logged only the member NAME
+("dom Navigator.get userAgent") - the VALUE (the actual userAgent string,
+screen.width, deviceMemory, hardwareConcurrency, plugins list, every
+fingerprint read by exact name) was invisible, because the wrapped callback
+sets ReturnValue INSIDE itself and the public bindings never re-exposed it.
+0024 reads it back with `ReturnValue::Get()` right after `orig()` runs - so
+ALL IDL getter/operation return values land in the kind-29 stream in ONE
+already-patched TU (idl_member_installer.cc), zero new files. Strings are
+read with `WriteOneByte` into stack scratch (no `Utf8Value` heap alloc - the
+no-alloc discipline from 0003/0004); numbers/bools format inline; objects
+report their type tag (their payload bytes are caught at their own funnels).
+`AFEYE_TRACE_DOM_VALUES=0` reverts to name-only.
+
+This does NOT make 0013/0019 redundant - they cover what 0024 structurally
+cannot: (a) WRITE side - `document.cookie = X` and `Storage.setItem(k,v)`
+return undefined, so the written value is the ARGUMENT, still caught by 0013;
+(b) NON-IDL interceptor paths - `getComputedStyle().fontFamily` (camelCase
+named-getter installs via SetHandler, not IDLMemberInstaller) is invisible to
+the thunk, still caught by 0019's CSS funnel. 0024 + 0013 + 0019 are
+complementary, not overlapping.
 
 v11 makes the SELECTION honest and adds the witness that makes honesty
 possible.
@@ -431,6 +453,12 @@ types match - the thunk sees the slow path.
 | `Permissions::query` / `Notification::permission` (0019) | the headless mismatch tell: query NAME + permission VALUE, pairable by the filter (kind 16) |
 | `LocalDOMWindow::matchMedia` / `MediaQueryList::matches` (0019) | device/OS feature probes: query string + matches bit (kind 16) |
 
+### the v12 universal value capture - `0024`
+
+| funnel | covers |
+|---|---|
+| `AfeyeDomApiThunk` value readback (idl_member_installer.cc, 0024) | EVERY WebIDL attribute-get and operation return value via `ReturnValue::Get()` - the actual userAgent/screen.*/deviceMemory/plugins/etc strings and numbers that 0008 only named. One existing TU, no new files, no-alloc (WriteOneByte into stack scratch). kind 29 now carries `dom <Iface>.get <m> val=<value>`. `AFEYE_TRACE_DOM_VALUES=0` reverts to name-only. Write-side (setters/void ops) and interceptor paths (getComputedStyle camelCase) stay on 0013/0019 |
+
 ### the v10 v8-depth pass - `0020` + `0021` + `0022`
 
 | funnel | covers |
@@ -476,6 +504,7 @@ types match - the thunk sees the slow path.
 | 0021 v8-payload-stack | 2 + header (`builtins-json.cc`, `messages.cc`, `messages.h`) | v8 |
 | 0022 v8-introspection | 1 new + 2 existing (`js-objects.cc` new; `compiler.cc`*, `builtins-date.cc`* already patched) | v8 |
 | 0023 sink-drop-witness | 0 new (`sink.cc`/`sink.h` x3 - already created by 0001/0005/0011) | v8 + blink_platform + network service |
+| 0024 blink-dom-api-values | 0 new (`idl_member_installer.cc` already patched by 0008) | blink platform |
 
 ~55 changed/new TUs total (*already-patched TUs - ccache miss only for the
 changed file). v8 relinks once for 0020-0023; blink_platform and the network

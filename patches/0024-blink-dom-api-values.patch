@@ -1,0 +1,104 @@
+--- a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
++++ b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
+@@ -6,8 +6,10 @@
+ #ifdef BLINK_AFEYE
+ #include <atomic>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <mutex>
++#include "v8/include/v8-array.h"
+ #include "third_party/blink/renderer/platform/afeye/sink.h"
+ #endif
+ 
+@@ -46,6 +48,55 @@ constexpr size_t kAfeyeApiCells = 1u << 16;
+ AfeyeApiCell g_afeye_api_cells[kAfeyeApiCells] = {};
+ std::mutex g_afeye_api_mu;
+ std::atomic<uint64_t> g_afeye_api_calls{0};
++// AFEYE_TRACE_DOM_VALUES=0 falls back to name-only dom-api records (the 0008
++// behaviour). On by default: the VALUE is the fingerprint, the name is not.
++bool g_afeye_api_values_off = []() {
++  const char* v = ::getenv("AFEYE_TRACE_DOM_VALUES");
++  return v != nullptr && *v != '\0' && v[0] == '0';
++}();
++
++// afeye (0024): read the value a WebIDL getter/operation JUST returned, into
++// stack scratch - no heap. The 0008 thunk logged only the member NAME
++// ("dom Navigator.get userAgent"); the VALUE - the actual userAgent string,
++// screen.width, deviceMemory, hardwareConcurrency, every fingerprint read -
++// was invisible, because ReturnValue::Set happens INSIDE the wrapped callback
++// and the public bindings never re-exposed it. ReturnValue::Get() does, so we
++// read it right after orig() runs. Strings go through WriteOneByte into a
++// stack buffer (no v8::String::Utf8Value heap alloc, which would be the
++// hot-path allocation the no-alloc pass forbade); numbers/bools format inline;
++// objects report their type tag only (their payload bytes are caught at their
++// own funnels - 0014 pixels, 0013 cookie/storage values, etc).
++void AfeyeCaptureValue(v8::Isolate* isolate,
++                       v8::Local<v8::Value> rv,
++                       char* buf,
++                       size_t buf_sz) {
++  if (rv.IsEmpty() || rv->IsUndefined()) {
++    std::snprintf(buf, buf_sz, "undefined");
++  } else if (rv->IsNull()) {
++    std::snprintf(buf, buf_sz, "null");
++  } else if (rv->IsBoolean()) {
++    std::snprintf(buf, buf_sz, "%d", rv->IsTrue() ? 1 : 0);
++  } else if (rv->IsNumber()) {
++    std::snprintf(buf, buf_sz, "%.17g", rv->NumberValue(isolate->GetCurrentContext()).FromMaybe(0));
++  } else if (rv->IsString()) {
++    v8::Local<v8::String> str = rv.As<v8::String>();
++    int len = str->Utf8Length(isolate);
++    if (len < 0) len = 0;
++    if (static_cast<size_t>(len) > buf_sz - 1) len = static_cast<int>(buf_sz - 1);
++    str->WriteOneByte(isolate, reinterpret_cast<uint8_t*>(buf), 0, len,
++                      v8::String::NO_NULL_TERMINATION);
++    buf[len] = '\0';
++    for (int i = 0; i < len; ++i) {
++      unsigned char c = static_cast<unsigned char>(buf[i]);
++      if (c < 0x20 || c >= 0x7f) buf[i] = '?';
++    }
++  } else if (rv->IsArray()) {
++    std::snprintf(buf, buf_sz, "[array len=%d]",
++                  rv.As<v8::Array>()->Length());
++  } else {
++    std::snprintf(buf, buf_sz, "[object]");
++  }
++}
+ 
+ void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
+   AfeyeApiCell* cell = nullptr;
+@@ -54,15 +105,28 @@ void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
+     cell = static_cast<AfeyeApiCell*>(data.As<v8::External>()->Value());
+   }
+   if (cell) {
+-    // hard cap keeps the dom-api stream from starving the script stream
+-    if (g_afeye_api_calls.fetch_add(1, std::memory_order_relaxed) <
+-        8000000) {
+-      blink::afeye::EmitStr(blink::afeye::kDomApi,
+-                            blink::afeye::NowNs(), cell->what);
+-    }
++    const bool afeye_record =
++        g_afeye_api_calls.fetch_add(1, std::memory_order_relaxed) < 8000000;
++    // Run the real callback FIRST so its ReturnValue is populated, then read
++    // the value back. The cap still bounds the whole dom-api stream.
+     if (cell->orig) {
+       cell->orig(info);
+     }
++    if (afeye_record) {
++      if (g_afeye_api_values_off) {
++        blink::afeye::EmitStr(blink::afeye::kDomApi, blink::afeye::NowNs(),
++                              cell->what);
++      } else {
++        char afeye_val[160];
++        AfeyeCaptureValue(info.GetIsolate(), info.GetReturnValue().Get(),
++                          afeye_val, sizeof(afeye_val));
++        char afeye_buf[320];
++        std::snprintf(afeye_buf, sizeof(afeye_buf), "%s val=%.150s",
++                      cell->what, afeye_val);
++        blink::afeye::EmitStr(blink::afeye::kDomApi, blink::afeye::NowNs(),
++                              afeye_buf);
++      }
++    }
+   }
+ }
+ 
