@@ -8,7 +8,6 @@ mod events;
 mod human;
 mod inject;
 mod relay;
-mod sinkfilter;
 mod tg;
 mod timefmt;
 mod wg;
@@ -16,6 +15,7 @@ mod writer;
 mod zipper;
 
 use afeye::collect;
+use afeye::sinkfilter;
 use crate::ctx::{Ctx, Cn, Target, Tunnel};
 use crate::events::{FxEvent, K_META};
 use bytes::Bytes;

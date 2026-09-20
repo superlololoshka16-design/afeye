@@ -359,6 +359,76 @@ fn read_payload(raw_dir: &Path, r: &Rec) -> Option<Vec<u8>> {
     Some(b.get(start..end)?.to_vec())
 }
 
+
+/// v12.1: antifraud vendor by URL (moved from the bin-private ctx module so
+/// the lib-exported filter is self-contained; the net-window seed logic
+/// uses it). Same rules as ctx::vendor_of_url.
+const AF_VENDORS: &[(&str, &str)] = &[
+    ("challenges.cloudflare.com", "cloudflare"),
+    ("cloudflare.com", "cloudflare"),
+    ("datadome.co", "datadome"),
+    ("kasada.io", "kasada"),
+    ("perimeterx.net", "human"),
+    ("px-cdn.net", "human"),
+    ("px-client.net", "human"),
+    ("humansecurity.com", "human"),
+    ("perfdrive.com", "human"),
+    ("edgesuite.net", "akamai"),
+    ("akamaiedge.net", "akamai"),
+    ("fpjs.io", "fpjs"),
+    ("seon.io", "seon"),
+    ("arkoselabs.com", "arkose"),
+    ("hcaptcha.com", "hcaptcha"),
+    ("imperva.com", "imperva"),
+    ("threatmetrix.com", "threatmetrix"),
+];
+
+fn af_host_of(url: &str) -> &str {
+    let s = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => return "",
+    };
+    let auth_end = s.find(['/', '?', '#']).unwrap_or(s.len());
+    let auth = &s[..auth_end];
+    let hostport = match auth.rfind('@') {
+        Some(i) => &auth[i + 1..],
+        None => auth,
+    };
+    match hostport.rfind(':') {
+        Some(i) if !hostport[..i].contains(':') || hostport.starts_with('[') => {
+            if hostport.starts_with('[') {
+                &hostport[..hostport.find(']').map(|j| j + 1).unwrap_or(hostport.len())]
+            } else {
+                &hostport[..i]
+            }
+        }
+        _ => hostport,
+    }
+}
+
+fn af_vendor_of_url(url: &str) -> Option<&'static str> {
+    let h = af_host_of(url);
+    if h.is_empty() {
+        return None;
+    }
+    if url.contains("/cdn-cgi/") || url.contains("/turnstile") {
+        return Some("cloudflare");
+    }
+    if url.contains("/recaptcha") {
+        return Some("recaptcha");
+    }
+    for (suf, v) in AF_VENDORS {
+        if h == *suf
+            || (h.len() > suf.len()
+                && h.ends_with(suf)
+                && h.as_bytes()[h.len() - suf.len() - 1] == b'.')
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
 fn txt_head(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
@@ -1180,7 +1250,12 @@ fn build_input_cadence(recs: &[Rec]) -> InputCadence {
 
 pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     let index_p = collect_dir.join("index.jsonl");
-    let raw_dir = collect_dir.join("raw");
+    // v12.1: the collector's index `p` fields are relative to the OUT dir
+    // (they literally start with "raw/"), NOT to the raw dir itself -
+    // joining them under collect/raw resolved collect/raw/raw/... and
+    // every payload read silently returned None (fragments=0, graph=0,
+    // everything dead while the report still looked fine).
+    let raw_dir = collect_dir.to_path_buf();
     let mut stats = SinkFilterStats {
         keep_cold: std::env::var("AF_SINK_KEEP_COLD").map(|v| v == "1").unwrap_or(false),
         ..Default::default()
@@ -1567,7 +1642,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             None => ("", txt),
         };
         let non_get = !method.is_empty() && method != "GET" && method != "HEAD";
-        let vendor = crate::ctx::vendor_of_url(url).is_some();
+        let vendor = af_vendor_of_url(url).is_some();
         if non_get || vendor {
             net_ts.push(r.ts);
         }
@@ -2745,7 +2820,7 @@ mod tests {
             h: String::new(),
             path: String::new(),
             off: None,
-            txt: Some("evt mousemove".into()),
+            txt: Some("evt click".into()),
         }
     }
 
@@ -2765,6 +2840,15 @@ mod tests {
         assert!(latest_trigger_before(&recs, 100_410_000_000, 250_000_000).is_none());
         // before anything -> nothing
         assert!(latest_trigger_before(&recs, 10, 250_000_000).is_none());
+        // v12.1: ambient event-dispatch types are NOT triggers (mousemove
+        // storms re-saturated handler-born - the v7 bug)
+        let amb = vec![
+            tr(100_000_000_000, "script-source"),
+            tr(100_010_000_000, "event-dispatch"), // ambient mousemove below
+        ];
+        let mut amb = amb;
+        amb[1].txt = Some("evt mousemove".into());
+        assert!(latest_trigger_before(&amb, 100_100_000_000, 250_000_000).is_none());
     }
 
     #[test]
@@ -2872,4 +2956,143 @@ mod tests {
         assert_eq!(s, vec!["net-window".to_string()]);
         assert!(net);
     }
+    // ---- v12.1 e2e: .rec wire stream -> production collector -> production
+    // filter -> verdicts. Proves the deep filter actually runs on data (the
+    // v12 bug: the driver never fed it), that the cookie/taint/crypto/body
+    // records join the content graph, and that a dead-end chain is honestly
+    // separated from the token chain.
+    #[test]
+    fn e2e_token_chain_verdicts() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let raw_dir = tmp.path().join("raw-src");
+        let collect_dir = tmp.path().join("collect");
+        std::fs::create_dir_all(&raw_dir).unwrap();
+
+        // ---- the wire stream (u32 | u8 kind | u8 flags | u16 | u64 ts | payload)
+        let mut rec: Vec<u8> = Vec::new();
+        let t0: u64 = 1_000_000_000;
+        let mut recs_written = 0usize;
+        {
+            let mut w = std::io::Cursor::new(&mut rec);
+            let mut put = |kind: u8, ts: u64, payload: &[u8]| {
+                let total: u32 = (16 + payload.len()) as u32;
+                w.write_all(&total.to_le_bytes()).unwrap();
+                w.write_all(&[kind, 0]).unwrap();
+                w.write_all(&[0u8, 0]).unwrap();
+                w.write_all(&ts.to_le_bytes()).unwrap();
+                w.write_all(payload).unwrap();
+                recs_written += 1;
+            };
+            // sink-hello (kind 0) - the liveness record
+            put(0, t0, b"afeye-sink/v8 v2 pid=1");
+            // the token pipeline script (kind 1, EmitTwoStr name\0source)
+            // name carries no iso: prefix; body embeds a collector sink call
+            put(1, t0 + 1_000_000, b"https://af.io/collector.js\0function build(){fetch('/t')}build()");
+            // a DEAD-END library script (runs, feeds nothing)
+            put(1, t0 + 2_000_000, b"https://cdn.io/lodash.js\0var _=function(){return 1}");
+            // fp probe reads (kind 29 dom-api, batched)
+            put(29, t0 + 3_000_000, b"dom Navigator.get userAgent");
+            put(29, t0 + 3_100_000, b"dom Screen.get width");
+            // the fingerprint assembly: json-stringify as EmitSpan (v12.1 0021)
+            // tag\0body - the plaintext head that must join the graph
+            let fp_head = b"{\"ua\":\"x\",\"screen\":1920,\"lang\":\"en\"}";
+            let mut js = Vec::new();
+            js.extend_from_slice(b"json-stringify len=44 replacer=0");
+            js.push(0);
+            js.extend_from_slice(fp_head);
+            put(16, t0 + 4_000_000, &js);
+            // TextEncoder.encode of the SAME bytes (taint-edge, kind 37,
+            // tag\0body) - the carrier hop between collect and crypto
+            let mut te = Vec::new();
+            te.extend_from_slice(b"text-encoder");
+            te.push(0);
+            te.extend_from_slice(fp_head);
+            put(37, t0 + 5_000_000, &te);
+            // SubtleCrypto.encrypt raw_data (crypto-op kind 11, tag\0bytes)
+            // - the payload-forming SINK: plaintext input
+            let mut co = Vec::new();
+            co.extend_from_slice(b"encrypt");
+            co.push(0);
+            co.extend_from_slice(fp_head);
+            put(11, t0 + 6_000_000, &co);
+            // the req-body upload (net-request kind 17, tag\0body) - the
+            // wire sink. Body shares bytes with the crypto input so the
+            // backward slice crosses to it.
+            let mut rb = Vec::new();
+            rb.extend_from_slice(b"req-body");
+            rb.push(0);
+            rb.extend_from_slice(fp_head);
+            put(17, t0 + 7_000_000, &rb);
+            // cookie-set: the token park (kind 16, EmitSpan tag\0value)
+            let mut ck = Vec::new();
+            ck.extend_from_slice(b"cookie-set len=33");
+            ck.push(0);
+            ck.extend_from_slice(b"tok=deadbeefdeadbeefdeadbeef");
+            put(16, t0 + 8_000_000, &ck);
+            // fetch initiation (kind 28) + the entry that names the sender
+            // (kind 8 call-completed, batched)
+            put(28, t0 + 9_000_000, b"fetch url=https://af.io/relay type=fetch ctx=evt:mousedown");
+            put(8, t0 + 8_999_000, b"call argc=1 script=https://af.io/collector.js:2");
+            // nav-start (kind 36)
+            put(36, t0 - 500_000, b"nav-start mono_ns=999500000");
+        }
+        assert!(recs_written >= 10);
+
+        // ---- run the PRODUCTION collector over the .rec stream
+        std::env::set_var("AF_RAW_DIR", &raw_dir);
+        let fname = format!("v8-{}.rec", 4242);
+        std::fs::write(raw_dir.join(&fname), &rec).unwrap();
+        let collector = crate::collect::Collector::spawn_dirs(raw_dir.clone(), collect_dir.clone());
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let stats = collector.stop();
+        assert!(stats.records >= 10, "collector parsed {} records", stats.records);
+        assert!(stats.corrupt == 0, "corrupt records: {}", stats.corrupt);
+        assert!(stats.per.contains_key("v8/script-source"));
+        assert!(stats.per.contains_key("v8/fingerprint"));
+        assert!(stats.per.contains_key("v8/crypto-op"));
+
+        // ---- run the PRODUCTION filter
+        let sf = run(&collect_dir).expect("sinkfilter run");
+        // the graph must exist and the sinks must be in it
+        assert!(sf.graph_sinks >= 2, "graph sinks: {}", sf.graph_sinks);
+        assert!(sf.graph_tainted >= 1, "graph tainted: {}", sf.graph_tainted);
+        // BOTH scripts became chains
+        assert!(sf.chains >= 2, "chains: {}", sf.chains);
+        // the token chain is proven (graph path to a sink), the library is not
+        assert!(sf.proven_chains >= 1, "proven: {}", sf.proven_chains);
+
+        // ---- report.json: verdict per chain
+        let rep: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(collect_dir.join("filtered/report.json")).unwrap(),
+        )
+        .unwrap();
+        let chains = rep["chains"].as_array().unwrap();
+        let mut saw_proven_token = false;
+        let mut saw_dead_library = false;
+        for ch in chains {
+            let name = ch["name"].as_str().unwrap_or("");
+            let verdict = ch["verdict"].as_str().unwrap_or("");
+            if name.contains("collector.js") {
+                assert!(
+                    verdict.contains("proven") || ch["token_forming"].as_bool().unwrap_or(false),
+                    "token chain verdict={verdict} signals={:?}",
+                    ch["signals"]
+                );
+                saw_proven_token = true;
+            }
+            if name.contains("lodash") {
+                saw_dead_library = true;
+            }
+        }
+        assert!(saw_proven_token, "collector.js chain missing from report");
+        assert!(saw_dead_library, "lodash chain missing from report");
+        // the token chain's file must exist in filtered/scripts/
+        assert!(!std::fs::read_dir(collect_dir.join("filtered/scripts"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
 }
