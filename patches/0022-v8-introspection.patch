@@ -1,0 +1,257 @@
+--- a/v8/src/builtins/builtins-date.cc
++++ b/v8/src/builtins/builtins-date.cc
+@@ -63,6 +63,30 @@ Tagged<Object> SetDateValue(Isolate* isolate, DirectHandle<JSDate> date,
+ // https://tc39.es/ecma262/#sec-date-constructor
+ BUILTIN(DateConstructor) {
+   HandleScope scope(isolate);
++#ifdef V8_AFEYE
++  // afeye (0020): the Date CONSTRUCTOR clock read - `Date()` and `new Date()`
++  // with no args call JSDate::CurrentTimeValue exactly like Date.now() (0004).
++  // Antifraud timing checks commonly cross-check Date.now() against
++  // new Date().getTime(); a clock hook that moves only one of them is itself a
++  // detector, and half the clock stream was invisible. Zero-arg reads only:
++  // Date(2020,1,1) parses an argument, it is not a clock read.
++  {
++    const bool afeye_no_args =
++        (args.length() - 1) == 0;  // args[0] is the receiver/new.target slot
++    if (afeye_no_args && v8::afeye::Enabled()) {
++      static std::atomic<uint64_t> g_afeye_date_ctor{0};
++      static bool g_afeye_date_ctor_off = []() {
++        const char* v = ::getenv("AFEYE_TRACE_CLOCK");
++        return v != nullptr && *v != '\0' && v[0] == '0';
++      }();
++      if (!g_afeye_date_ctor_off &&
++          g_afeye_date_ctor.fetch_add(1, std::memory_order_relaxed) < 2000000) {
++        v8::afeye::EmitStr(v8::afeye::kClock, v8::afeye::NowNs(),
++                           "clock date-ctor");
++      }
++    }
++  }
++#endif
+   if (IsUndefined(*args.new_target())) {
+     double const time_val =
+         static_cast<double>(JSDate::CurrentTimeValue(isolate));
+--- a/v8/src/codegen/compiler.cc
++++ b/v8/src/codegen/compiler.cc
+@@ -4,11 +4,16 @@
+ 
+ #include "src/codegen/compiler.h"
+ #ifdef V8_AFEYE
++#include <atomic>
+ #include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <string>
+ #include "include/v8-primitive.h"
+ #include "src/afeye/sink.h"
+ #include "src/objects/casting.h"
++#include "src/objects/script-inl.h"
++#include "src/objects/string-inl.h"
+ #endif
+ 
+ #include <memory>
+@@ -3045,10 +3050,97 @@ bool Compiler::CollectSourcePositions(
+ }
+ 
+ // static
++#ifdef V8_AFEYE
++// afeye (0023, G6): the LAZY-COMPILE funnel. With lazy compilation (default)
++// every function body compiles here on its FIRST call - so this is the
++// cheapest "which functions ACTUALLY executed, and when" signal in the engine.
++// NO-ALLOC: reads the SFI name + its script name:line off the Tagged<> heap
++// objects under DisallowGarbageCollection via GetFlatContent (the exact 0003
++// Invoke pattern). Reuses kind 8 (kCallCompleted) so the Rust timeline needs
++// no new decoder; tagged "lazy-compile" to distinguish from Invoke entries.
++// The JS->JS CALLER edge is NOT walked here on purpose: this runs on every
++// function's first call, and a frame-walk I cannot compile-test risks bricking
++// the whole capture. Caller chains come from Error.stack (0022, G2) at the
++// moments antifraud introspects, and from Invoke (0003) for C++->JS entries.
++static void AfeyeLogLazyCompile(Tagged<SharedFunctionInfo> sfi) {
++  static std::atomic<uint64_t> g_afeye_lazy{0};
++  if (g_afeye_lazy.fetch_add(1, std::memory_order_relaxed) >= 4000000) {
++    return;
++  }
++  DisallowGarbageCollection no_gc;
++  char afeye_name[65] = {0};
++  int afeye_name_len = 0;
++  Tagged<String> afeye_sfi_name = sfi->Name();
++  if (IsString(afeye_sfi_name)) {
++    String::FlatContent afeye_flat = afeye_sfi_name->GetFlatContent(no_gc);
++    if (afeye_flat.IsFlat()) {
++      uint32_t afeye_l = afeye_flat.length();
++      if (afeye_l > 64) afeye_l = 64;
++      if (afeye_flat.IsOneByte()) {
++        const uint8_t* afeye_p = afeye_flat.ToOneByteVector().begin();
++        for (uint32_t k = 0; k < afeye_l; ++k) {
++          uint8_t c = afeye_p[k];
++          afeye_name[k] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
++        }
++      } else {
++        const base::uc16* afeye_p = afeye_flat.ToUC16Vector().begin();
++        for (uint32_t k = 0; k < afeye_l; ++k) {
++          base::uc16 c = afeye_p[k];
++          afeye_name[k] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
++        }
++      }
++      afeye_name_len = static_cast<int>(afeye_l);
++    }
++  }
++  char afeye_script[161] = {0};
++  int afeye_script_len = 6;
++  std::memcpy(afeye_script, "native", 7);
++  int afeye_line = 0;
++  if (IsScript(sfi->script())) {
++    Tagged<Script> afeye_sc = Cast<Script>(sfi->script());
++    afeye_line = afeye_sc->GetLineNumber(sfi->StartPosition());
++    if (afeye_line < 0) afeye_line = 0;
++    Tagged<Object> afeye_nm = afeye_sc->name();
++    if (IsString(afeye_nm)) {
++      String::FlatContent afeye_flat =
++          Cast<String>(afeye_nm)->GetFlatContent(no_gc);
++      if (afeye_flat.IsFlat()) {
++        uint32_t afeye_l = afeye_flat.length();
++        if (afeye_l > 160) afeye_l = 160;
++        if (afeye_flat.IsOneByte()) {
++          const uint8_t* afeye_p = afeye_flat.ToOneByteVector().begin();
++          for (uint32_t k = 0; k < afeye_l; ++k) {
++            uint8_t c = afeye_p[k];
++            afeye_script[k] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
++          }
++        } else {
++          const base::uc16* afeye_p = afeye_flat.ToUC16Vector().begin();
++          for (uint32_t k = 0; k < afeye_l; ++k) {
++            base::uc16 c = afeye_p[k];
++            afeye_script[k] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
++          }
++        }
++        afeye_script_len = static_cast<int>(afeye_l);
++      }
++    }
++  }
++  char afeye_buf[320];
++  std::snprintf(afeye_buf, sizeof(afeye_buf),
++                "lazy-compile name=%.*s script=%.*s:%d", afeye_name_len,
++                afeye_name, afeye_script_len, afeye_script, afeye_line);
++  v8::afeye::EmitStr(v8::afeye::kCallCompleted, v8::afeye::NowNs(), afeye_buf);
++}
++#endif
++
+ bool Compiler::Compile(Isolate* isolate, Handle<SharedFunctionInfo> shared_info,
+                        ClearExceptionFlag flag,
+                        IsCompiledScope* is_compiled_scope,
+                        CreateSourcePositions create_source_positions_flag) {
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled()) {
++    AfeyeLogLazyCompile(*shared_info);
++  }
++#endif
+   // We should never reach here if the function is already compiled.
+   DCHECK(!shared_info->is_compiled());
+   DCHECK(!is_compiled_scope->is_compiled());
+@@ -4242,6 +4334,16 @@ MaybeDirectHandle<JSFunction> Compiler::GetWrappedFunction(
+   ScriptCompileTimerScope compile_timer(isolate, no_cache_reason,
+                                         &compilation_details);
+ 
++#ifdef V8_AFEYE
++  // afeye (0020, G9): the FOURTH compile funnel - ScriptCompiler::CompileFunction
++  // (wrapped-function API). It has its own cache lookup / deserialize /
++  // NewScript / CompileToplevel path and never passes the three funnels 0002
++  // hooks, so wrapped-function sources were the one gap in the "every line of
++  // JS exactly once" claim. Same helper, same kind-1 record, same iso: prefix.
++  AfeyeDumpScriptSource(isolate, direct_handle(*source, isolate), "wrapped",
++                        script_details.name_obj);
++#endif
++
+   if (compile_options & ScriptCompiler::kConsumeCodeCache) {
+     DCHECK(cached_data);
+     DCHECK_EQ(script_details.repl_mode, REPLMode::kNo);
+--- a/v8/src/objects/js-objects.cc
++++ b/v8/src/objects/js-objects.cc
+@@ -7,6 +7,15 @@
+ #include <limits>
+ #include <optional>
+ 
++#ifdef V8_AFEYE
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++
++#include "src/afeye/sink.h"
++#include "src/objects/string-inl.h"
++#endif
++
+ #include "src/api/api-arguments-inl.h"
+ #include "src/api/api-natives.h"
+ #include "src/base/strong-alias.h"
+@@ -2034,6 +2043,71 @@ Maybe<bool> JSReceiver::GetOwnPropertyDescriptor(LookupIterator* it,
+   desc->set_enumerable((attrs & DONT_ENUM) == 0);
+   // 8. Set D.[[Configurable]] to the value of X's [[Configurable]] attribute.
+   desc->set_configurable((attrs & DONT_DELETE) == 0);
++#ifdef V8_AFEYE
++  // afeye (0023, G5): Object.getOwnPropertyDescriptor over a DOM object is how
++  // antifraud VERIFIES navigator.webdriver / plugins / document.cookie /
++  // window.chrome were NOT tampered with: a patched browser emits a data
++  // descriptor where stock emits an accessor, or wrong attribute bits - that
++  // delta changes the token. 0008 sees getter invocations, never descriptor
++  // introspection. Reached only for special receivers / proxies (plain-object
++  // GOPD stays in the CSA fast path - correct: the antifraud-relevant targets
++  // are blink DOM objects and proxies). Logs holder instance-type + key + the
++  // result attributes (the tamper evidence). GetName() allocates a Handle;
++  // this function already allocates (ToPropertyDescriptor path), so in-budget.
++  if (v8::afeye::Enabled()) {
++    static std::atomic<uint64_t> g_afeye_gopd{0};
++    static bool g_afeye_gopd_off = []() {
++      const char* v = ::getenv("AFEYE_TRACE_GOPD");
++      return v != nullptr && *v != '\0' && v[0] == '0';
++    }();
++    if (!g_afeye_gopd_off &&
++        g_afeye_gopd.fetch_add(1, std::memory_order_relaxed) < 2000000) {
++      char afeye_key[65] = {0};
++      DirectHandle<Name> afeye_name = it->GetName();
++      if (IsString(*afeye_name)) {
++        DisallowGarbageCollection afeye_no_gc;
++        String::FlatContent afeye_flat =
++            Cast<String>(*afeye_name)->GetFlatContent(afeye_no_gc);
++        if (afeye_flat.IsFlat()) {
++          uint32_t afeye_l = afeye_flat.length();
++          if (afeye_l > 64) afeye_l = 64;
++          if (afeye_flat.IsOneByte()) {
++            const uint8_t* afeye_p = afeye_flat.ToOneByteVector().begin();
++            for (uint32_t afeye_k = 0; afeye_k < afeye_l; ++afeye_k) {
++              uint8_t afeye_c = afeye_p[afeye_k];
++              afeye_key[afeye_k] =
++                  (afeye_c >= 0x20 && afeye_c < 0x7f)
++                      ? static_cast<char>(afeye_c)
++                      : '?';
++            }
++          } else {
++            const base::uc16* afeye_p = afeye_flat.ToUC16Vector().begin();
++            for (uint32_t afeye_k = 0; afeye_k < afeye_l; ++afeye_k) {
++              base::uc16 afeye_c = afeye_p[afeye_k];
++              afeye_key[afeye_k] =
++                  (afeye_c >= 0x20 && afeye_c < 0x7f)
++                      ? static_cast<char>(afeye_c)
++                      : '?';
++            }
++          }
++          afeye_key[afeye_l] = '\0';
++        }
++      }
++      char afeye_buf[192];
++      std::snprintf(afeye_buf, sizeof(afeye_buf),
++                    "gopd holder_type=%d key=%.64s kind=%s writable=%d "
++                    "enumerable=%d configurable=%d",
++                    static_cast<int>(
++                        it->GetHolder<JSReceiver>()->map()->instance_type()),
++                    afeye_key, is_accessor_pair ? "accessor" : "data",
++                    is_accessor_pair ? 0 : ((attrs & READ_ONLY) == 0 ? 1 : 0),
++                    (attrs & DONT_ENUM) == 0 ? 1 : 0,
++                    (attrs & DONT_DELETE) == 0 ? 1 : 0);
++      v8::afeye::EmitStr(v8::afeye::kFingerprint, v8::afeye::NowNs(),
++                         afeye_buf);
++    }
++  }
++#endif
+   // 9. Return D.
+   DCHECK(PropertyDescriptor::IsAccessorDescriptor(desc) !=
+          PropertyDescriptor::IsDataDescriptor(desc));

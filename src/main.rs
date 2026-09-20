@@ -588,7 +588,21 @@ async fn run() -> Result<(), String> {
             let mut dropped = 0usize;
             if let Ok(rep) = std::fs::read(fdir.join("collect/filtered/report.json")) {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&rep) {
-                    if let Some(chains) = v.get("chains").and_then(|c| c.as_array()) {
+                    // v9: the authoritative cut set is report.prunes (EVERY
+                    // not-token-forming chain, uncapped). The old chains[]
+                    // walk silently missed chains past the 4000-entry report
+                    // cap - eval storms leaked dead ends into the token-only
+                    // zip. Fall back to chains[] for reports written by older
+                    // filter versions.
+                    if let Some(prune) = v.get("prune").and_then(|p| p.as_array()) {
+                        for ch in prune {
+                            let path = ch.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                            if !path.is_empty() {
+                                let _ = std::fs::remove_file(fdir.join("collect").join(path));
+                                dropped += 1;
+                            }
+                        }
+                    } else if let Some(chains) = v.get("chains").and_then(|c| c.as_array()) {
                         for ch in chains {
                             let token = ch.get("token_forming").and_then(|t| t.as_bool()).unwrap_or(false);
                             let path = ch.get("path").and_then(|p| p.as_str()).unwrap_or("");

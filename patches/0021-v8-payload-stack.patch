@@ -1,0 +1,223 @@
+--- a/v8/src/builtins/builtins-json.cc
++++ b/v8/src/builtins/builtins-json.cc
+@@ -3,6 +3,14 @@
+ // found in the LICENSE file.
+ 
+ #include "src/builtins/builtins-utils-inl.h"
++#ifdef V8_AFEYE
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++
++#include "src/afeye/sink.h"
++#include "src/objects/string-inl.h"
++#endif
+ #include "src/builtins/builtins.h"
+ #include "src/json/json-parser.h"
+ #include "src/json/json-stringifier.h"
+@@ -30,14 +38,80 @@ BUILTIN(JsonParse) {
+                                         std::nullopt));
+ }
+ 
++#ifdef V8_AFEYE
++namespace {
++// no-alloc flat-string head copy (the 0003/0004 pattern). Returns bytes
++// copied; skips non-flat strings rather than calling Flatten (Flatten can GC).
++int AfeyeJsonCopyHead(Tagged<String> str, char* dst, uint32_t cap) {
++  DisallowGarbageCollection no_gc;
++  String::FlatContent flat = str->GetFlatContent(no_gc);
++  if (!flat.IsFlat()) {
++    dst[0] = '\0';
++    return 0;
++  }
++  uint32_t len = flat.length();
++  if (len > cap) len = cap;
++  if (flat.IsOneByte()) {
++    const uint8_t* p = flat.ToOneByteVector().begin();
++    for (uint32_t k = 0; k < len; ++k) {
++      uint8_t c = p[k];
++      dst[k] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
++    }
++  } else {
++    const base::uc16* p = flat.ToUC16Vector().begin();
++    for (uint32_t k = 0; k < len; ++k) {
++      base::uc16 c = p[k];
++      dst[k] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
++    }
++  }
++  dst[len] = '\0';
++  return static_cast<int>(len);
++}
++}  // namespace
++#endif
++
+ // ES6 section 24.3.2 JSON.stringify.
+ BUILTIN(JsonStringify) {
+   HandleScope scope(isolate);
+   Handle<JSAny> object = Cast<JSAny>(args.atOrUndefined(isolate, 1));
+   Handle<JSAny> replacer = Cast<JSAny>(args.atOrUndefined(isolate, 2));
+   Handle<Object> indent = args.atOrUndefined(isolate, 3);
+-  RETURN_RESULT_OR_FAILURE(isolate,
+-                           JsonStringify(isolate, object, replacer, indent));
++  MaybeDirectHandle<Object> afeye_result =
++      JsonStringify(isolate, object, replacer, indent);
++#ifdef V8_AFEYE
++  // afeye (0021, G3): the ASSEMBLED PLAINTEXT. This is the single highest-
++  // signal v8 record for token reconstruction: the fingerprint object becomes
++  // a string here, immediately before the crypto layer (kind 11) encrypts it
++  // and the wire layer (kind 17/18) sends it. The Rust content-slice can
++  // blake3-match this head against the uploaded body / crypto raw_data
++  // instead of inferring payload formation from timing alone. Logs the result
++  // head (960 B, same cap as the 0013 cookie/storage values) under
++  // DisallowGarbageCollection via GetFlatContent - no Utf8Value, no
++  // std::string, no second allocation. A replacer is logged as a flag: it is
++  // how antifraud walks/serializes selectively. AFEYE_TRACE_JSON=0 disables.
++  DirectHandle<Object> afeye_r;
++  if (v8::afeye::Enabled() && afeye_result.ToHandle(&afeye_r) &&
++      IsString(*afeye_r)) {
++    static std::atomic<uint64_t> g_afeye_json{0};
++    static bool g_afeye_json_off = []() {
++      const char* v = ::getenv("AFEYE_TRACE_JSON");
++      return v != nullptr && *v != '\0' && v[0] == '0';
++    }();
++    if (!g_afeye_json_off &&
++        g_afeye_json.fetch_add(1, std::memory_order_relaxed) < 2000000) {
++      char afeye_head[961];
++      int afeye_n =
++          AfeyeJsonCopyHead(Cast<String>(*afeye_r), afeye_head, 960);
++      char afeye_buf[1056];
++      std::snprintf(afeye_buf, sizeof(afeye_buf),
++                    "json-stringify len=%d replacer=%d head=%s", afeye_n,
++                    IsUndefined(*replacer) ? 0 : 1, afeye_head);
++      v8::afeye::EmitStr(v8::afeye::kFingerprint, v8::afeye::NowNs(),
++                         afeye_buf);
++    }
++  }
++#endif
++  RETURN_RESULT_OR_FAILURE(isolate, afeye_result);
+ }
+ 
+ // https://tc39.es/proposal-json-parse-with-source/#sec-json.rawjson
+--- a/v8/src/execution/messages.cc
++++ b/v8/src/execution/messages.cc
+@@ -6,6 +6,15 @@
+ 
+ #include <memory>
+ 
++#ifdef V8_AFEYE
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++
++#include "src/afeye/sink.h"
++#include "src/objects/string-inl.h"
++#endif
++
+ #include "src/api/api-inl.h"
+ #include "src/ast/ast.h"
+ #include "src/ast/prettyprinter.h"
+@@ -1145,8 +1154,40 @@ ErrorUtils::StackPropertyLookupResult ErrorUtils::GetErrorStackProperty(
+   return {it.GetHolder<JSObject>(), result};
+ }
+ 
++#ifdef V8_AFEYE
++namespace {
++// no-alloc flat-string head copy (the 0003/0004 pattern). Skips non-flat
++// strings rather than calling Flatten (Flatten can GC).
++int AfeyeStackCopyHead(Tagged<String> str, char* dst, uint32_t cap) {
++  DisallowGarbageCollection no_gc;
++  String::FlatContent flat = str->GetFlatContent(no_gc);
++  if (!flat.IsFlat()) {
++    dst[0] = '\0';
++    return 0;
++  }
++  uint32_t len = flat.length();
++  if (len > cap) len = cap;
++  if (flat.IsOneByte()) {
++    const uint8_t* p = flat.ToOneByteVector().begin();
++    for (uint32_t k = 0; k < len; ++k) {
++      uint8_t c = p[k];
++      dst[k] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
++    }
++  } else {
++    const base::uc16* p = flat.ToUC16Vector().begin();
++    for (uint32_t k = 0; k < len; ++k) {
++      base::uc16 c = p[k];
++      dst[k] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
++    }
++  }
++  dst[len] = '\0';
++  return static_cast<int>(len);
++}
++}  // namespace
++#endif
++
+ // static
+-MaybeDirectHandle<Object> ErrorUtils::GetFormattedStack(
++MaybeDirectHandle<Object> ErrorUtils::GetFormattedStackImpl(
+     Isolate* isolate, DirectHandle<JSObject> maybe_error_object) {
+   TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.stack_trace"),
+               perfetto::StaticString(__func__));
+@@ -1193,6 +1234,47 @@ MaybeDirectHandle<Object> ErrorUtils::GetFormattedStack(
+   return lookup.error_stack;
+ }
+ 
++#ifdef V8_AFEYE
++// afeye (0022, G2): Error().stack / Error.captureStackTrace / prepareStackTrace
++// - the string that materializes the whole JS call stack. Two antifraud uses:
++// (a) DETECTOR - automation leaves patterns in the stack (puppeteer/playwright
++// internals, `at eval (eval at <anonymous>)`, CDP-injected frames); Cloudflare
++// Turnstile / DataDome / Kasada hash stack-derived facts into the token;
++// (b) DATA - the script URLs + function names in the stack are themselves a
++// per-install fingerprint, AND the only cheap JS->JS call-edge source in the
++// engine (0003's Invoke sees C++->JS only). This is the single funnel every
++// .stack read converges on; GetFormattedStackImpl above is the renamed
++// original (all 4 of its return paths funnel back through here).
++// static
++MaybeDirectHandle<Object> ErrorUtils::GetFormattedStack(
++    Isolate* isolate, DirectHandle<JSObject> maybe_error_object) {
++  MaybeDirectHandle<Object> afeye_stack =
++      GetFormattedStackImpl(isolate, maybe_error_object);
++  if (v8::afeye::Enabled()) {
++    DirectHandle<Object> afeye_s;
++    if (afeye_stack.ToHandle(&afeye_s) && IsString(*afeye_s)) {
++      static std::atomic<uint64_t> g_afeye_stack{0};
++      static bool g_afeye_stack_off = []() {
++        const char* v = ::getenv("AFEYE_TRACE_STACK");
++        return v != nullptr && *v != '\0' && v[0] == '0';
++      }();
++      if (!g_afeye_stack_off &&
++          g_afeye_stack.fetch_add(1, std::memory_order_relaxed) < 2000000) {
++        char afeye_head[961];
++        int afeye_n =
++            AfeyeStackCopyHead(Cast<String>(*afeye_s), afeye_head, 960);
++        char afeye_buf[1024];
++        std::snprintf(afeye_buf, sizeof(afeye_buf),
++                      "errstack len=%d head=%s", afeye_n, afeye_head);
++        v8::afeye::EmitStr(v8::afeye::kErrorStack, v8::afeye::NowNs(),
++                           afeye_buf);
++      }
++    }
++  }
++  return afeye_stack;
++}
++#endif
++
+ // static
+ void ErrorUtils::SetFormattedStack(Isolate* isolate,
+                                    DirectHandle<JSObject> maybe_error_object,
+--- a/v8/src/execution/messages.h
++++ b/v8/src/execution/messages.h
+@@ -142,6 +142,12 @@ class ErrorUtils : public AllStatic {
+ 
+   static MaybeDirectHandle<Object> GetFormattedStack(
+       Isolate* isolate, DirectHandle<JSObject> maybe_error_object);
++#ifdef V8_AFEYE
++  // afeye (0022, G2): the original body, renamed so GetFormattedStack can wrap
++  // it with the stack-materialization sink. Identical signature/semantics.
++  static MaybeDirectHandle<Object> GetFormattedStackImpl(
++      Isolate* isolate, DirectHandle<JSObject> maybe_error_object);
++#endif
+   static void SetFormattedStack(Isolate* isolate,
+                                 DirectHandle<JSObject> maybe_error_object,
+                                 DirectHandle<JSAny> formatted_stack);

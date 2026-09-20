@@ -1,0 +1,362 @@
+--- a/third_party/blink/renderer/core/frame/universal_global_scope.cc
++++ b/third_party/blink/renderer/core/frame/universal_global_scope.cc
+@@ -4,6 +4,13 @@
+ 
+ #include "third_party/blink/renderer/core/frame/universal_global_scope.h"
+ 
++#ifdef BLINK_AFEYE
++#include <atomic>
++#include <cstdlib>
++
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
++
+ #include "base/containers/span.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
+ #include "third_party/blink/renderer/bindings/core/v8/serialization/post_message_helper.h"
+@@ -20,6 +27,21 @@
+ 
+ namespace blink {
+ 
++#ifdef BLINK_AFEYE
++namespace {
++constexpr uint64_t kAfeyeTaintCap = 100000;
++std::atomic<uint64_t> g_afeye_taint{0};
++bool g_afeye_taint_off = []() {
++  const char* v = ::getenv("AFEYE_TRACE_TAINT");
++  return v != nullptr && *v != '\0' && v[0] == '0';
++}();
++inline bool AfeyeTaintOn() {
++  return !g_afeye_taint_off &&
++         g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
++}
++}  // namespace
++#endif
++
+ String UniversalGlobalScope::btoa(const String& string_to_encode,
+                                   ExceptionState& exception_state) {
+   if (string_to_encode.IsNull()) {
+@@ -34,6 +56,20 @@ String UniversalGlobalScope::btoa(const String& string_to_encode,
+     return String();
+   }
+ 
++#ifdef BLINK_AFEYE
++  // afeye (0016): the base64 encode boundary. Kasada x-kp/x-kpsp headers and
++  // CF/DataDome token handoffs wrap ciphertext with btoa; the INPUT bytes here
++  // content-match the JS-AES output that the req-body sink later sees - the
++  // only data (not timer) edge linking pure-JS crypto to the upload.
++  if (blink::afeye::Enabled() && AfeyeTaintOn() &&
++      !string_to_encode.IsEmpty()) {
++    base::span<const uint8_t> afeye_l1 =
++        base::as_byte_span(string_to_encode.Latin1());
++    blink::afeye::EmitSpan(blink::afeye::kTaintEdge, blink::afeye::NowNs(),
++                           "btoa", afeye_l1.data(),
++                           static_cast<uint32_t>(afeye_l1.size()));
++  }
++#endif
+   return Base64Encode(base::as_byte_span(string_to_encode.Latin1()));
+ }
+ 
+@@ -58,6 +94,15 @@ String UniversalGlobalScope::atob(const String& encoded_string,
+     return String();
+   }
+ 
++#ifdef BLINK_AFEYE
++  // afeye (0016): the base64 decode boundary - the DECODED plaintext of a
++  // challenge response / stored token before JS consumes or re-encrypts it.
++  if (blink::afeye::Enabled() && AfeyeTaintOn() && !out.empty()) {
++    blink::afeye::EmitSpan(blink::afeye::kTaintEdge, blink::afeye::NowNs(),
++                           "atob", out.data(),
++                           static_cast<uint32_t>(out.size()));
++  }
++#endif
+   return String(out);
+ }
+ 
+--- a/third_party/blink/renderer/core/html/forms/form_data.cc
++++ b/third_party/blink/renderer/core/html/forms/form_data.cc
+@@ -30,6 +30,16 @@
+ 
+ #include "third_party/blink/renderer/core/html/forms/form_data.h"
+ 
++#ifdef BLINK_AFEYE
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#include "third_party/blink/renderer/platform/wtf/text/cstring.h"
++#include "third_party/blink/renderer/platform/wtf/vector.h"
++#endif
++
+ #include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_union_file_usvstring.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+@@ -48,6 +58,21 @@
+ 
+ namespace blink {
+ 
++#ifdef BLINK_AFEYE
++namespace {
++constexpr uint64_t kAfeyeTaintCap = 100000;
++std::atomic<uint64_t> g_afeye_taint{0};
++bool g_afeye_taint_off = []() {
++  const char* v = ::getenv("AFEYE_TRACE_TAINT");
++  return v != nullptr && *v != '\0' && v[0] == '0';
++}();
++inline bool AfeyeTaintOn() {
++  return !g_afeye_taint_off &&
++         g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
++}
++}  // namespace
++#endif
++
+ namespace {
+ 
+ class FormDataIterationSource final
+@@ -364,12 +389,55 @@ FormData::Entry::Entry(const String& name, const String& value)
+       << "'name' should be a USVString.";
+   DCHECK_EQ(value, ReplaceUnmatchedSurrogates(value))
+       << "'value' should be a USVString.";
++#ifdef BLINK_AFEYE
++  // afeye (0016): EVERY string field of every FormData (append/set and the
++  // HTML form-submit path all funnel through this ctor). Captures name+value
++  // as one span with a NUL separator - the per-field plaintext of
++  // form-encoded uploads (DataDome captcha POST, CF challenge ack). EmitSpan
++  // convention: <tag>\0<name>\0<value>.
++  if (blink::afeye::Enabled() && AfeyeTaintOn() && !name.IsNull()) {
++    CString afeye_name = name.Utf8();
++    CString afeye_value = value.IsNull() ? CString("") : value.Utf8();
++    size_t afeye_ln = strlen(afeye_name.data()) + strlen(afeye_value.data()) + 1;
++    if (afeye_ln > 65536) {
++      afeye_ln = 65536;
++    }
++    Vector<char> afeye_buf(afeye_ln);
++    char* afeye_p = afeye_buf.data();
++    size_t afeye_i = 0;
++    for (const char* q = afeye_name.data(); *q && afeye_i + 1 < afeye_ln; ++q) {
++      afeye_p[afeye_i++] = *q;
++    }
++    afeye_p[afeye_i++] = '\0';
++    for (const char* q = afeye_value.data(); *q && afeye_i < afeye_ln; ++q) {
++      afeye_p[afeye_i++] = *q;
++    }
++    blink::afeye::EmitSpan(blink::afeye::kTaintEdge, blink::afeye::NowNs(),
++                           "form-data",
++                           reinterpret_cast<const uint8_t*>(afeye_p),
++                           static_cast<uint32_t>(afeye_i));
++  }
++#endif
+ }
+ 
+ FormData::Entry::Entry(const String& name, Blob* blob, const String& filename)
+     : name_(name), blob_(blob), filename_(filename) {
+   DCHECK_EQ(name, ReplaceUnmatchedSurrogates(name))
+       << "'name' should be a USVString.";
++#ifdef BLINK_AFEYE
++  // afeye (0016): blob entries - metadata only (the bytes flow async and are
++  // captured by the net layer as the multipart req-body).
++  if (blink::afeye::Enabled() && AfeyeTaintOn() && !name.IsNull()) {
++    char afeye_buf[320];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "fd-blob name=%.96s file=%.96s size=%llu",
++                  name.Utf8().c_str(),
++                  filename.IsNull() ? "" : filename.Utf8().c_str(),
++                  blob ? static_cast<unsigned long long>(blob->size()) : 0ull);
++    blink::afeye::EmitStr(blink::afeye::kTaintEdge, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
+ }
+ 
+ void FormData::Entry::Trace(Visitor* visitor) const {
+--- a/third_party/blink/renderer/core/url/url_search_params.cc
++++ b/third_party/blink/renderer/core/url/url_search_params.cc
+@@ -4,6 +4,13 @@
+ 
+ #include "third_party/blink/renderer/core/url/url_search_params.h"
+ 
++#ifdef BLINK_AFEYE
++#include <atomic>
++#include <cstdlib>
++
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
++
+ #include <algorithm>
+ #include <utility>
+ 
+@@ -19,6 +26,21 @@
+ 
+ namespace blink {
+ 
++#ifdef BLINK_AFEYE
++namespace {
++constexpr uint64_t kAfeyeTaintCap = 100000;
++std::atomic<uint64_t> g_afeye_taint{0};
++bool g_afeye_taint_off = []() {
++  const char* v = ::getenv("AFEYE_TRACE_TAINT");
++  return v != nullptr && *v != '\0' && v[0] == '0';
++}();
++inline bool AfeyeTaintOn() {
++  return !g_afeye_taint_off &&
++         g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
++}
++}  // namespace
++#endif
++
+ namespace {
+ 
+ class URLSearchParamsIterationSource final
+@@ -171,6 +193,17 @@ void URLSearchParams::SetInputWithoutUpdate(const String& query_string) {
+ String URLSearchParams::toString() const {
+   Vector<char> encoded_data;
+   EncodeAsFormData(encoded_data);
++#ifdef BLINK_AFEYE
++  // afeye (0016): the full form-encoded query string - the exact bytes a
++  // fetch(X, {body: usp}) uploads. One span, content-matches the req-body
++  // sink byte-for-byte (this IS its source in the common path).
++  if (blink::afeye::Enabled() && AfeyeTaintOn() && !encoded_data.empty()) {
++    blink::afeye::EmitSpan(
++        blink::afeye::kTaintEdge, blink::afeye::NowNs(), "url-search-params",
++        reinterpret_cast<const uint8_t*>(encoded_data.data()),
++        static_cast<uint32_t>(encoded_data.size()));
++  }
++#endif
+   return String(encoded_data);
+ }
+ 
+--- a/third_party/blink/renderer/modules/encoding/text_decoder.cc
++++ b/third_party/blink/renderer/modules/encoding/text_decoder.cc
+@@ -30,6 +30,13 @@
+ 
+ #include "third_party/blink/renderer/modules/encoding/text_decoder.h"
+ 
++#ifdef BLINK_AFEYE
++#include <atomic>
++#include <cstdlib>
++
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
++
+ #include "third_party/blink/renderer/bindings/core/v8/v8_union_arraybuffer_arraybufferview.h"
+ #include "third_party/blink/renderer/core/typed_arrays/dom_array_buffer.h"
+ #include "third_party/blink/renderer/core/typed_arrays/dom_array_buffer_view.h"
+@@ -41,6 +48,21 @@
+ 
+ namespace blink {
+ 
++#ifdef BLINK_AFEYE
++namespace {
++constexpr uint64_t kAfeyeTaintCap = 100000;
++std::atomic<uint64_t> g_afeye_taint{0};
++bool g_afeye_taint_off = []() {
++  const char* v = ::getenv("AFEYE_TRACE_TAINT");
++  return v != nullptr && *v != '\0' && v[0] == '0';
++}();
++inline bool AfeyeTaintOn() {
++  return !g_afeye_taint_off &&
++         g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
++}
++}  // namespace
++#endif
++
+ TextDecoder* TextDecoder::Create(const String& label,
+                                  const TextDecoderOptions* options,
+                                  ExceptionState& exception_state) {
+@@ -118,6 +140,17 @@ String TextDecoder::Decode(base::span<const uint8_t> input,
+ 
+   bool saw_error = false;
+   String s = codec_->Decode(input, flush, fatal_, saw_error);
++#ifdef BLINK_AFEYE
++  // afeye (0016): the bytes->string boundary. The challenge RESPONSE often
++  // arrives as UTF-8 bytes the antifraud decodes then feeds to JS crypto;
++  // capture the input bytes here (the decoded String is cheap metadata - the
++  // next TE/btoa/upload edge carries it forward if it re-enters the wire).
++  if (blink::afeye::Enabled() && AfeyeTaintOn() && !input.empty()) {
++    blink::afeye::EmitSpan(blink::afeye::kTaintEdge, blink::afeye::NowNs(),
++                           "text-decoder", input.data(),
++                           static_cast<uint32_t>(input.size()));
++  }
++#endif
+ 
+   if (fatal_ && saw_error) {
+     if (!do_not_flush_) {
+--- a/third_party/blink/renderer/modules/encoding/text_encoder.cc
++++ b/third_party/blink/renderer/modules/encoding/text_encoder.cc
+@@ -30,6 +30,13 @@
+ 
+ #include "third_party/blink/renderer/modules/encoding/text_encoder.h"
+ 
++#ifdef BLINK_AFEYE
++#include <atomic>
++#include <cstdlib>
++
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
++
+ #include "base/feature_list.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_text_encoder_encode_into_result.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+@@ -40,6 +47,21 @@
+ 
+ namespace blink {
+ 
++#ifdef BLINK_AFEYE
++namespace {
++constexpr uint64_t kAfeyeTaintCap = 100000;
++std::atomic<uint64_t> g_afeye_taint{0};
++bool g_afeye_taint_off = []() {
++  const char* v = ::getenv("AFEYE_TRACE_TAINT");
++  return v != nullptr && *v != '\0' && v[0] == '0';
++}();
++inline bool AfeyeTaintOn() {
++  return !g_afeye_taint_off &&
++         g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
++}
++}  // namespace
++#endif
++
+ // Controls if TextEncode will throw an exception when failed to allocate
+ // buffer.
+ BASE_FEATURE(kThrowExceptionWhenTextEncodeOOM,
+@@ -74,6 +96,20 @@ NotShared<DOMUint8Array> TextEncoder::encode(const String& input,
+   std::string result = VisitCharacters(input, [this](auto chars) {
+     return codec_->Encode(chars, UnencodableHandling::kNone);
+   });
++#ifdef BLINK_AFEYE
++  // afeye (0016): THE string->bytes boundary. Every antifraud payload that
++  // leaves as UTF-8 bytes crosses TextEncoder.encode - Cloudflare/DataDome
++  // form bodies, Kasada JS-AES plaintext, token JSON. The bytes exist here in
++  // `result` before any encryption wraps them; emitting them lets the Rust
++  // filter run content-runs against the crypto raw_data / req-body sinks
++  // (backward slice by DATA, not by timer). Head-capped by the sink span.
++  if (blink::afeye::Enabled() && AfeyeTaintOn() && !result.empty()) {
++    blink::afeye::EmitSpan(
++        blink::afeye::kTaintEdge, blink::afeye::NowNs(), "text-encoder",
++        reinterpret_cast<const uint8_t*>(result.data()),
++        static_cast<uint32_t>(result.size()));
++  }
++#endif
+   if (base::FeatureList::IsEnabled(kThrowExceptionWhenTextEncodeOOM)) {
+     NotShared<DOMUint8Array> result_array(
+         DOMUint8Array::CreateOrNull(base::as_byte_span(result)));
+@@ -99,6 +135,18 @@ TextEncoderEncodeIntoResult* TextEncoder::encodeInto(
+       });
+   encode_into_result->setRead(encode_into_result_data.code_units_read);
+   encode_into_result->setWritten(encode_into_result_data.bytes_written);
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled() && AfeyeTaintOn() &&
++      encode_into_result_data.bytes_written > 0) {
++    base::span<uint8_t> afeye_out = destination->ByteSpan();
++    size_t afeye_n = static_cast<size_t>(encode_into_result_data.bytes_written);
++    if (afeye_n <= afeye_out.size()) {
++      blink::afeye::EmitSpan(blink::afeye::kTaintEdge, blink::afeye::NowNs(),
++                             "text-encoder-into", afeye_out.data(),
++                             static_cast<uint32_t>(afeye_n));
++    }
++  }
++#endif
+   return encode_into_result;
+ }
+ 

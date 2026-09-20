@@ -85,6 +85,20 @@ pub struct SinkFilterStats {
     pub dead_end_chains: u64,
     pub net_adjacent_chains: u64,
     pub content_sink_chains: u64,
+    pub prune_paths: u64,
+    // v9 entry-join signals (kind-8 attribution)
+    pub send_initiator_chains: u64,
+    pub token_access_chains: u64,
+    pub fp_entry_chains: u64,
+    // v10 (v8-depth pass)
+    pub gopd_chains: u64,
+    pub stack_inspect_chains: u64,
+    pub automation_tells: u64,
+    pub wasm_firstcalls: u64,
+    pub wasm_traps: u64,
+    pub wasm_cached: u64,
+    pub lazy_funcs: u64,
+    pub payload_assembler_chains: u64,
 }
 
 /// sink calls that mark a chain as reaching the collector / the network
@@ -110,15 +124,17 @@ const HOT_PATTERNS: &[&str] = &[
     "WebAssembly",
 ];
 
+/// v9 narrowed: only CAUSAL handler events - things that make a handler run
+/// and compile code inside it. v7 included READ kinds (fingerprint,
+/// dom-metric, audio, webrtc, crypto-op): during the load-phase fp storm
+/// those fire hundreds/second, so the 250ms trigger window found a
+/// "trigger" for EVERY early chain - handler-born saturated and the
+/// filtered zip degenerated into a copy of the run zip. Reads are evidence
+/// (fp-probes / content-sink / entry-join), not compile triggers.
 const TRIGGER_KINDS: &[&str] = &[
     "input",
     "event-dispatch",
     "timer",
-    "dom-metric",
-    "fingerprint",
-    "crypto-op",
-    "webrtc",
-    "audio",
 ];
 
 /// fingerprint-relevant dom-api reads. The kind-29 "what" strings look
@@ -171,6 +187,30 @@ const FP_API_NEEDLES: &[&str] = &[
     "getBattery",
 ];
 
+/// v10: harness/automation markers in a materialized Error.stack (0021).
+/// Cloudflare Turnstile / DataDome / Kasada read .stack exactly to find these;
+/// if OUR OWN crawler ever shows up here, that is a capture-integrity alarm.
+const AUTOMATION_MARKERS: &[&str] = &[
+    "pptr:",
+    "__puppeteer",
+    "playwright",
+    "__nightmare",
+    "webdriver-evaluate",
+    "__webdriver_evaluate",
+    "selenium",
+    "callSelenium",
+    "_Selenium",
+    "cdc_",
+    "__driver_evaluate",
+    "__fxdriver",
+    "callPhantom",
+    "_phantom",
+    "phantomjs",
+    "__selenium",
+    "CDP",
+    "Runtime.evaluate",
+];
+
 /// a kind-29 read matched against FP_API_NEEDLES
 struct FpRead {
     ts: u64,
@@ -219,9 +259,20 @@ const CONTENT_LINK_GRACE_NS: u64 = 200_000_000;
 const CONTENT_MAX_RECORDS: usize = 50_000;
 /// hard bound on distinct sink runs retained (32 B each -> ~128 MB ceiling)
 const CONTENT_MAX_TOTAL_RUNS: usize = 4_000_000;
-/// crypto-op tags whose raw_data is payload-forming for the outbound token
-/// (decrypt is inbound; getRandomValues is a nonce source, not the payload)
-const SINK_CRYPTO_OPS: &[&str] = &["encrypt", "sign", "deriveBits", "digest"];
+/// crypto-op tags whose content is payload-forming for the outbound token.
+/// "encrypt"/"sign"/"deriveBits"/"digest" are the raw_data INPUTS (0007):
+/// plaintext that upstream carriers (TextEncoder, SSV, storage, taint-edge)
+/// must content-match. "crypto-out" is the RESULT (0018): the ciphertext /
+/// signature / digest that the req-body and ws-frame-out sinks carry verbatim
+/// - this is the edge that lets the slice cross the encryption boundary.
+/// (decrypt is inbound; getRandomValues is a nonce source, not the payload.)
+const SINK_CRYPTO_OPS: &[&str] = &[
+    "encrypt",
+    "sign",
+    "deriveBits",
+    "digest",
+    "crypto-out",
+];
 
 #[derive(Debug)]
 struct Rec {
@@ -378,6 +429,33 @@ fn chain_signals(c: &Chain, net_ts: &[u64], content_ts: &[u64]) -> (Vec<String>,
     let content_sink = overlaps_content_bridge(content_ts, c.first_ts, c.last_ts);
     if content_sink {
         signals.push("content-sink".into());
+    }
+    // v9 entry-join signals (kind-8 attribution, first-class observations):
+    if c.send_initiator {
+        // this chain's code initiated a fetch/XHR/beacon - observed send,
+        // strictly stronger than the sink-call TEXT match
+        signals.push("send-initiator".into());
+    }
+    if c.token_access {
+        // this chain read/wrote a cookie or storage value - the store/read
+        // half of store-then-send, attributed by entry not by window
+        signals.push("token-access".into());
+    }
+    if !c.fp_entry.is_empty() {
+        // >=2 distinct fingerprint reads while this chain was the active
+        // entry - the window-independent fp-probes
+        signals.push("fp-probes-entry".into());
+    }
+    if c.gopd_check {
+        // v10: this chain inspected property DESCRIPTORS (tamper check on
+        // navigator.webdriver / plugins / window.chrome) - first-class
+        // antifraud behavior, not a data read
+        signals.push("gopd-check".into());
+    }
+    if c.stack_inspect {
+        // v10: this chain materialized Error.stack - automation detection
+        // and/or caller-graph introspection
+        signals.push("stack-inspect".into());
     }
     (signals, net_adjacent, content_sink)
 }
@@ -546,6 +624,32 @@ struct Chain {
     signals: Vec<String>,
     net_adjacent: bool,
     content_sink: bool,
+    // v9 entry-join columns (kind-8 call-completed attribution)
+    /// this chain's code was the active C++->JS entry when a fetch/XHR/
+    /// beacon was initiated (kind 28) - OBSERVED send, not text match
+    send_initiator: bool,
+    /// this chain's code read/wrote a cookie or storage value (kind 16,
+    /// 0013) - the token-access fact
+    token_access: bool,
+    /// fingerprint reads (kind 29) attributed BY ENTRY, not by
+    /// materialization window: distinct needles read while this chain was
+    /// the active entry point
+    fp_entry: Vec<String>,
+    // v10 columns (0021/0022/0023)
+    /// this chain ran Object.getOwnPropertyDescriptor over a DOM object /
+    /// proxy (0023, kind 16 "gopd ") - the tamper-verification probe
+    gopd_check: bool,
+    /// this chain materialized an Error.stack (0021, kind 38) - the
+    /// automation-detection surface; the stack head is kept as a sample
+    stack_inspect: bool,
+    stack_samples: Vec<String>,
+    /// this chain's entry ran JSON.stringify (0021 kind 16 "json-stringify")
+    /// - the plaintext payload ASSEMBLY point right before crypto/wire
+    payload_assembler: bool,
+    /// how many of this chain's functions actually lazy-compiled (first
+    /// execution, 0023 kind 8 "lazy-compile") - dead-code evidence inside a
+    /// live script
+    executed_funcs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -553,6 +657,30 @@ struct TriggerRef {
     kind: String,
     ts: u64,
     what: String,
+}
+
+/// v9: is this input record a MEANINGFUL compile trigger? A mousemove storm
+/// (bot-emulated or real) fires hundreds/sec and would trigger-mark every
+/// chain compiled on the page; clicks/keys/wheel/gestures are the discrete
+/// events a handler is plausibly born inside.
+fn is_trigger_input(txt: &str) -> bool {
+    if let Some(rest) = txt.strip_prefix("input/mouse ") {
+        let etype = rest.split(' ').next().unwrap_or("");
+        // mousemove is ambient, not a trigger
+        return etype != "mousemove";
+    }
+    if let Some(rest) = txt.strip_prefix("input/raw type=") {
+        // 0015 master funnel: stable WebInputEvent::GetName() string.
+        // MouseMove / pointer-move raw updates are ambient; discrete events
+        // (down/up/click-family, keys, wheel, gestures) are real triggers.
+        let etype = rest.split(' ').next().unwrap_or("");
+        return etype != "MouseMove"
+            && etype != "PointerMove"
+            && etype != "PointerRawUpdate"
+            && etype != "MouseLeave"
+            && etype != "MouseEnter";
+    }
+    true
 }
 
 /// The latest trigger record at or before `ts`, within `window_ns`.
@@ -573,10 +701,15 @@ fn latest_trigger_before(recs: &[Rec], ts: u64, window_ns: u64) -> Option<Trigge
             break; // dense noise (mousemove storm) - bounded walk
         }
         if TRIGGER_KINDS.contains(&r.kind.as_str()) {
+            let txt = r.txt.as_deref().unwrap_or("");
+            if r.kind == "input" && !is_trigger_input(txt) {
+                i -= 1;
+                continue;
+            }
             return Some(TriggerRef {
                 kind: r.kind.clone(),
                 ts: r.ts,
-                what: r.txt.as_deref().map(|s| txt_head(s, 120)).unwrap_or_default(),
+                what: txt_head(txt, 120),
             });
         }
         i -= 1;
@@ -587,6 +720,85 @@ fn latest_trigger_before(recs: &[Rec], ts: u64, window_ns: u64) -> Option<Trigge
 /// first FP_API_NEEDLES substring the kind-29 "what" carries, if any
 fn fp_needle_of(txt: &str) -> Option<&'static str> {
     FP_API_NEEDLES.iter().copied().find(|n| txt.contains(n))
+}
+
+// ---------------------------------------------------------------------------
+// v9 entry-join: the kind-8 call-completed stream (0003 Invoke funnel) is the
+// ready-made caller identity sitting UNUSED in the index. For every record of
+// interest (fetch initiated, cookie/storage touched, fingerprint read) the
+// last C++->JS entry at or before its ts in the same pid names the script
+// that was executing - attribution by ENTRY instead of by materialization
+// window. Honest limit: JS->JS calls do not cross Invoke (SERIES.md), so the
+// entry is the nearest C++->JS boundary, not necessarily the exact reader;
+// and records of different threads in one pid interleave (no tid in the wire
+// format). Both documented, both strictly better than window guessing.
+// ---------------------------------------------------------------------------
+
+/// how far back an entry still explains a record (sync entry -> read path;
+/// promise/microtask callbacks re-enter through Invoke so the entry stays
+/// fresh; beyond this the attribution would be a guess)
+const ENTRY_JOIN_WINDOW_NS: u64 = 250_000_000;
+
+/// per-pid ts-sorted indices into recs of kind-8 call-completed records
+struct EntryIndex {
+    per_pid: HashMap<u64, Vec<usize>>,
+}
+
+/// parse the script name out of a kind-8 txt: "call argc=N[ c=1]
+/// script=<name>:<line>". The name may contain ':' (https://...), so strip
+/// only the trailing ":<digits>". Returns the display name (the chain key
+/// after split_iso is the same bare resource name).
+fn entry_script_of(txt: &str) -> Option<&str> {
+    let rest = txt.rfind(" script=").map(|i| &txt[i + 8..])?;
+    if rest == "native" {
+        return None;
+    }
+    let cut = match rest.rfind(':') {
+        Some(c) if rest[c + 1..].chars().all(|d| d.is_ascii_digit()) && c > 0 => c,
+        _ => rest.len(),
+    };
+    let name = &rest[..cut];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn build_entry_index(recs: &[Rec]) -> EntryIndex {
+    let mut per_pid: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, r) in recs.iter().enumerate() {
+        if r.kind == "call-completed" {
+            if let Some(txt) = r.txt.as_deref() {
+                // 0023 lazy-compile records ride kind 8 too but name the
+                // COMPILED function, not an executing entry - including them
+                // would misattribute reads to whichever function happened to
+                // lazy-compile last. Entries only.
+                if !txt.starts_with("lazy-compile") && entry_script_of(txt).is_some() {
+                    per_pid.entry(r.pid).or_default().push(i);
+                }
+            }
+        }
+    }
+    // recs are ts-sorted, so each per-pid vec already is
+    EntryIndex { per_pid }
+}
+
+impl EntryIndex {
+    /// the script name of the last entry at or before `ts` in this pid,
+    /// within ENTRY_JOIN_WINDOW_NS
+    fn script_at<'a>(&self, recs: &'a [Rec], pid: u64, ts: u64) -> Option<&'a str> {
+        let v = self.per_pid.get(&pid)?;
+        let hi = v.partition_point(|&i| recs[i].ts <= ts);
+        if hi == 0 {
+            return None;
+        }
+        let idx = v[hi - 1];
+        if ts - recs[idx].ts > ENTRY_JOIN_WINDOW_NS {
+            return None;
+        }
+        entry_script_of(recs[idx].txt.as_deref()?)
+    }
 }
 
 /// v8: one kind-23 input record -> (event type, optional widget coords).
@@ -761,6 +973,9 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     let mut clock_ts: Vec<u64> = Vec::new();
     let mut workers: Vec<(u64, String, String)> = Vec::new(); // (ts, iso, name)
     let mut wasm_inst: Vec<(u64, u64, bool, String)> = Vec::new(); // (ts, pid, is_imports_header, txt)
+    let mut wasm_firstcalls = 0u64;
+    let mut wasm_traps = 0u64;
+    let mut automation_tells: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut nav_start: Option<u64> = None;
     for r in &recs {
         let txt = r.txt.as_deref().unwrap_or("");
@@ -784,6 +999,21 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "wasm-instance" => {
                 let header = txt.starts_with("wasm-instantiate");
                 wasm_inst.push((r.ts, r.pid, header, txt.to_string()));
+                // 0020/0023: execution facts ride the same kind
+                if txt.starts_with("wasm-firstcall ") {
+                    wasm_firstcalls += 1;
+                } else if txt.starts_with("wasm-trap ") {
+                    wasm_traps += 1;
+                }
+            }
+            // v10 (0021, kind 38): the materialized Error.stack string - the
+            // automation-detection surface. Scan the head for harness markers.
+            "error-stack" => {
+                for marker in AUTOMATION_MARKERS {
+                    if txt.contains(marker) {
+                        *automation_tells.entry(*marker).or_insert(0) += 1;
+                    }
+                }
             }
             "nav-start" => {
                 if nav_start.map(|t| r.ts < t).unwrap_or(true) {
@@ -795,6 +1025,11 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     }
     stats.fp_reads = fp_reads.len() as u64;
     stats.integrity_checks = fnts.len() as u64;
+    // v10 (0020/0021): wasm execution facts + automation-marker hits folded
+    // from the pre-scan
+    stats.wasm_firstcalls = wasm_firstcalls;
+    stats.wasm_traps = wasm_traps;
+    stats.automation_tells = automation_tells.values().sum();
 
     // ---- 1+2+3: chains + wasm + taint ------------------------------------
     let mut chains: HashMap<(u64, String, String), usize> = HashMap::new();
@@ -855,6 +1090,14 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                         signals: Vec::new(),
                         net_adjacent: false,
                         content_sink: false,
+                        send_initiator: false,
+                        token_access: false,
+                        fp_entry: Vec::new(),
+                        gopd_check: false,
+                        stack_inspect: false,
+                        stack_samples: Vec::new(),
+                        payload_assembler: false,
+                        executed_funcs: 0,
                     };
                     chain_list.push(c);
                     chains.insert(key, idx);
@@ -896,9 +1139,22 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                 Some(p) => p,
                 None => continue,
             };
+            // v10 (0020): the code-cache restore path emits
+            // "cached\0<wire bytes>"; the wire/stream paths emit raw module
+            // bytes with no tag. name_of splits on the FIRST NUL - for an
+            // untagged payload the (name, body) split falls through to
+            // (empty, whole) only when there is no NUL at all; a wasm module
+            // with a NUL byte in its name section would mis-split, so accept
+            // the split ONLY when the name is exactly the known tag.
+            let (tag, body) = name_of(&payload);
+            let from_cache = tag == "cached";
+            let wasm_bytes: &[u8] = if from_cache { &body } else { &payload };
+            if from_cache {
+                stats.wasm_cached += 1;
+            }
             let wp = wasm_dir.join(format!("{}.wasm", &r.h[..16.min(r.h.len())]));
-            if fs::write(&wp, &payload).is_ok() {
-                let (im, ex) = wasm_imports_exports(&payload);
+            if fs::write(&wp, wasm_bytes).is_ok() {
+                let (im, ex) = wasm_imports_exports(wasm_bytes);
                 stats.wasm_modules += 1;
                 stats.wasm_imports += im.len() as u64;
                 stats.wasm_exports += ex.len() as u64;
@@ -906,9 +1162,10 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                 // the closest following wasm-instantiate of the same pid
                 let mut entry = json!({
                     "hash": r.h,
-                    "bytes": payload.len(),
+                    "bytes": wasm_bytes.len(),
                     "ts": r.ts,
                     "pid": r.pid,
+                    "from_cache": from_cache,
                     "imports": im.iter().take(256).cloned().collect::<Vec<_>>(),
                     "exports": ex.iter().take(256).cloned().collect::<Vec<_>>(),
                 });
@@ -1009,12 +1266,29 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     }
 
     // ---- v7 dead-end classification ----------------------------------------
-    // net-request timestamps (ts-sorted like recs) for the backward slice
-    let net_ts: Vec<u64> = recs
-        .iter()
-        .filter(|r| r.kind == "net-request")
-        .map(|r| r.ts)
-        .collect();
+    // v9 net-window seeds: NOT every net-request. v7 seeded the 5s window
+    // with every subresource GET (scripts, css, images) - during the load
+    // phase that covers everything and net-window degenerated into
+    // "compiled during page load". A request can only be "payload
+    // formation" when it can CARRY a payload: a non-GET/HEAD method, or a
+    // known antifraud vendor host (their GETs carry tokens in the query),
+    // or a req-body span recorded right after it. The record text is
+    // EmitTwoStr(method, url) = "METHOD\0url" (0011 ScheduleStart), NUL
+    // escaped as \u0000 by the collector.
+    let mut net_ts: Vec<u64> = Vec::new();
+    for r in recs.iter().filter(|r| r.kind == "net-request") {
+        let txt = r.txt.as_deref().unwrap_or("");
+        let (method, url) = match txt.find('\u{0}') {
+            Some(i) => (&txt[..i], &txt[i + 1..]),
+            None => ("", txt),
+        };
+        let non_get = !method.is_empty() && method != "GET" && method != "HEAD";
+        let vendor = crate::ctx::vendor_of_url(url).is_some();
+        if non_get || vendor {
+            net_ts.push(r.ts);
+        }
+    }
+    net_ts.sort_unstable();
 
     // ---- v8 content-based backward slice -----------------------------------
     // Build the set of content-runs that belong to SINK records (payload-forming
@@ -1026,7 +1300,18 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     //   crypto-op (kind 11)      - "encrypt"/"sign"/... + NUL + raw_data
     //   structured-clone (kind 15)- "ssv" + NUL + IDB/postMessage payload
     //   net-request (kind 17)     - "req-body" + NUL + upload bytes
-    let payload_kinds = ["crypto-op", "structured-clone", "net-request"];
+    //   taint-edge (kind 37)      - "text-encoder"/"btoa"/"form-data"/... +
+    //                               NUL + the exact plaintext bytes at each
+    //                               string->bytes boundary (0016). Carriers
+    //                               only - never sinks: they extend the graph
+    //                               UPSTREAM of the crypto/upload sinks.
+    let payload_kinds = [
+        "crypto-op",
+        "structured-clone",
+        "net-request",
+        "taint-edge",
+        "websocket",
+    ];
     let mut sink_runs: HashSet<[u8; 32]> = HashSet::new();
     let mut carriers: Vec<(u64, Vec<[u8; 32]>)> = Vec::new();
     let mut payload_records = 0usize;
@@ -1039,7 +1324,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         if payload_records >= CONTENT_MAX_RECORDS {
             break;
         }
-        let payload = match read_payload(raw_dir, r) {
+        let payload = match read_payload(&raw_dir, r) {
             Some(p) => p,
             None => continue,
         };
@@ -1051,6 +1336,12 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         let is_crypto_sink =
             r.kind == "crypto-op" && SINK_CRYPTO_OPS.iter().any(|o| tag.contains(o));
         let is_upload = r.kind == "net-request" && tag == "req-body";
+        // 0017: the WS OUTBOUND frame is an upload sink in its own right -
+        // Kasada/HUMAN telemetry channels send the token over WS, never
+        // touching req-body. Exact match: inbound tags ("ws-frame",
+        // "ws-frame-fin") stay carriers (challenge responses may be
+        // re-sent verbatim), only "ws-frame-out" sinks.
+        let is_ws_sink = r.kind == "websocket" && tag == "ws-frame-out";
         // runs are retained for the carrier pass ONLY while the global
         // budget lasts - past CONTENT_MAX_TOTAL_RUNS total retained runs
         // later records contribute nothing (empty vec), keeping memory
@@ -1063,7 +1354,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             }
             total_runs += runs.len();
         }
-        if (is_crypto_sink || is_upload) && !sink_full {
+        if (is_crypto_sink || is_upload || is_ws_sink) && !sink_full {
             for h in &runs {
                 if sink_runs.len() >= CONTENT_MAX_TOTAL_RUNS {
                     sink_full = true;
@@ -1084,6 +1375,184 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     }
     content_ts.sort_unstable();
     content_ts.dedup();
+
+    // ---- v9 entry-join: attribute records of interest to the CHAIN that was
+    // the active C++->JS entry, using the kind-8 stream. This is the caller
+    // identity that kind-29/16/28 records lack in C++ (no stack walk there) -
+    // recovered externally from Invoke, zero extra C++ cost. Three facts it
+    // turns into first-class signals (observed, not text-matched):
+    //   send-initiator : a fetch/XHR/beacon was INITIATED (kind 28) while this
+    //                    chain was the entry - it really sent something.
+    //   token-access   : this chain read/wrote a cookie or storage value
+    //                    (kind 16 cookie-get/set, storage-get/set, 0013).
+    //   fp-probes(entry): >=2 DISTINCT fingerprint reads (kind 29) happened
+    //                    while this chain was the entry - attributed by
+    //                    ENTRY, immune to the load-phase window false-positives
+    //                    that plagued the materialization-window fp count.
+    let entry_index = build_entry_index(&recs);
+    // error-stack records are attributed the same way (kind 38 carries no
+    // caller in C++; the entry-join recovers it)
+
+    // display-name -> chain idx (first wins; display names are the bare
+    // resource URL that kind-8 script= also carries, so they join directly)
+    let mut name_to_chain: HashMap<&str, usize> = HashMap::new();
+    for (idx, c) in chain_list.iter().enumerate() {
+        if !c.name.is_empty() {
+            name_to_chain.entry(c.name.as_str()).or_insert(idx);
+        }
+    }
+    // per-chain accumulators keyed by idx
+    let mut send_init: HashSet<usize> = HashSet::new();
+    let mut tok_access: HashSet<usize> = HashSet::new();
+    let mut fp_entry: HashMap<usize, Vec<&'static str>> = HashMap::new();
+    let mut gopd_chains: HashSet<usize> = HashSet::new();
+    let mut stack_chains: HashSet<usize> = HashSet::new();
+    let mut assembler_chains: HashSet<usize> = HashSet::new();
+    let mut stack_samples: HashMap<usize, Vec<String>> = HashMap::new();
+    for r in &recs {
+        let interest = matches!(
+            r.kind.as_str(),
+            "fetch" | "fingerprint" | "dom-api" | "error-stack"
+        );
+        if !interest {
+            continue;
+        }
+        let script = match entry_index.script_at(&recs, r.pid, r.ts) {
+            Some(sc) => sc,
+            None => continue,
+        };
+        // strip the iso prefix the kind-8 name may carry (split_iso mirrors
+        // the chain display-name normalization)
+        let (_, bare) = split_iso(script);
+        let idx = match name_to_chain.get(bare.as_str()) {
+            Some(i) => *i,
+            None => continue,
+        };
+        let txt = r.txt.as_deref().unwrap_or("");
+        match r.kind.as_str() {
+            // kind 28: "fetch url=.. type=.. ctx=.." - a real send initiation
+            "fetch" => {
+                send_init.insert(idx);
+            }
+            // kind 16 v8-layer "json-stringify ..." (0021): the plaintext
+            // payload assembly point - which chain serialized what right
+            // before crypto/wire. Guarded arm FIRST: the plain "fingerprint"
+            // arm below would swallow every kind-16 record.
+            "fingerprint" if txt.starts_with("json-stringify ") => {
+                assembler_chains.insert(idx);
+            }
+            // kind 16 with a cookie/storage value (0013) - token access.
+            // The canvas/webgl/audio fingerprints also land in kind 16; only
+            // the cookie/storage tags are token ACCESS (read/write of the
+            // stored token), the rest are collection (fp_entry below).
+            "fingerprint" => {
+                if txt.starts_with("cookie-get")
+                    || txt.starts_with("cookie-set")
+                    || txt.starts_with("storage-get")
+                    || txt.starts_with("storage-set")
+                {
+                    tok_access.insert(idx);
+                }
+            }
+            // kind 29 dom-api fingerprint read; the 0023 GOPD records ride
+            // kind 16 (fingerprint) with the "gopd " prefix instead
+            "dom-api" => {
+                if let Some(needle) = fp_needle_of(txt) {
+                    let v = fp_entry.entry(idx).or_default();
+                    if !v.contains(&needle) {
+                        v.push(needle);
+                    }
+                }
+            }
+            // kind 38: this chain materialized an Error.stack - automation
+            // detection and/or JS->JS caller chains (the stack head IS the
+            // call graph at introspection moments)
+            "error-stack" => {
+                stack_chains.insert(idx);
+                let v = stack_samples.entry(idx).or_default();
+                if v.len() < 4 {
+                    v.push(txt_head(txt, 240));
+                }
+            }
+            _ => {}
+        }
+        // GOPD tamper-check (0023) rides kind 16 with the "gopd " prefix
+        if r.kind == "fingerprint" && txt.starts_with("gopd ") {
+            gopd_chains.insert(idx);
+        }
+    }
+    // fold the entry-join facts onto the chains
+    for idx in send_init {
+        if let Some(c) = chain_list.get_mut(idx) {
+            c.send_initiator = true;
+            stats.send_initiator_chains += 1;
+        }
+    }
+    for idx in tok_access {
+        if let Some(c) = chain_list.get_mut(idx) {
+            c.token_access = true;
+            stats.token_access_chains += 1;
+        }
+    }
+    for (idx, needles) in fp_entry {
+        if needles.len() >= 2 {
+            if let Some(c) = chain_list.get_mut(idx) {
+                c.fp_entry = needles.iter().map(|x| x.to_string()).take(32).collect();
+                stats.fp_entry_chains += 1;
+            }
+        }
+    }
+    for idx in gopd_chains {
+        if let Some(c) = chain_list.get_mut(idx) {
+            c.gopd_check = true;
+            stats.gopd_chains += 1;
+        }
+    }
+    for idx in stack_chains {
+        if let Some(c) = chain_list.get_mut(idx) {
+            c.stack_inspect = true;
+            c.stack_samples = stack_samples.remove(&idx).unwrap_or_default();
+            stats.stack_inspect_chains += 1;
+        }
+    }
+    for idx in assembler_chains {
+        if let Some(c) = chain_list.get_mut(idx) {
+            c.payload_assembler = true;
+            stats.payload_assembler_chains += 1;
+        }
+    }
+
+    // v10 executed-function evidence: 0023 lazy-compile records carry
+    // script=<bare chain name>:<line> - count them per chain. A chain with
+    // executed_funcs=0 has code that was COMPILED (toplevel) but whose
+    // functions never ran: dead weight inside a live script.
+    let mut lazy_per_name: HashMap<&str, u64> = HashMap::new();
+    for r in &recs {
+        if r.kind != "call-completed" {
+            continue;
+        }
+        let txt = r.txt.as_deref().unwrap_or("");
+        if let Some(rest) = txt.strip_prefix("lazy-compile ") {
+            stats.lazy_funcs += 1;
+            if let Some(sp) = rest.find(" script=") {
+                let script_part = &rest[sp + 8..];
+                let bare = match script_part.rfind(':') {
+                    Some(c) if script_part[c + 1..]
+                        .chars()
+                        .all(|d| d.is_ascii_digit()) => &script_part[..c],
+                    _ => script_part,
+                };
+                *lazy_per_name.entry(bare).or_insert(0) += 1;
+            }
+        }
+    }
+    for c in &mut chain_list {
+        if !c.name.is_empty() {
+            if let Some(n) = lazy_per_name.get(c.name.as_str()) {
+                c.executed_funcs = *n;
+            }
+        }
+    }
 
     for c in &mut chain_list {
         let (signals, net_adjacent, content_sink) = chain_signals(c, &net_ts, &content_ts);
@@ -1139,6 +1608,18 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     stats.hot_chains = hot as u64;
     stats.cold_chains = cold as u64;
 
+    // v9 prune list: EVERY kept-but-not-token-forming chain path, no cap.
+    // The report below caps at 4000 chains; main.rs cuts the filtered zip on
+    // token_forming=false - chains past the cap were silently escaping the
+    // cut (the eval-storm case: thousands of chains, dead ends leaking into
+    // the "token-only" zip). This compact list is the authoritative cut set.
+    let prune_report: Vec<serde_json::Value> = chain_list
+        .iter()
+        .filter(|c| !c.path.is_empty() && !c.token_forming)
+        .map(|c| json!({ "path": c.path, "bytes": c.bytes }))
+        .collect();
+    stats.prune_paths = prune_report.len() as u64;
+
     for c in chain_list.iter().filter(|c| !c.path.is_empty()).take(4000) {
         let mut entry = json!({
             "name": printable(&c.name, 200),
@@ -1155,6 +1636,30 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         }
         if c.content_sink {
             entry["content_sink"] = json!(true);
+        }
+        if c.send_initiator {
+            entry["send_initiator"] = json!(true);
+        }
+        if c.token_access {
+            entry["token_access"] = json!(true);
+        }
+        if !c.fp_entry.is_empty() {
+            entry["fp_entry"] = json!(c.fp_entry);
+        }
+        if c.gopd_check {
+            entry["gopd_check"] = json!(true);
+        }
+        if c.stack_inspect {
+            entry["stack_inspect"] = json!(true);
+            if !c.stack_samples.is_empty() {
+                entry["stack_samples"] = json!(c.stack_samples);
+            }
+        }
+        if c.payload_assembler {
+            entry["payload_assembler"] = json!(true);
+        }
+        if c.executed_funcs > 0 {
+            entry["executed_funcs"] = json!(c.executed_funcs);
         }
         if let Some(t) = &c.trigger {
             entry["trigger"] = json!({
@@ -1201,7 +1706,11 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     let mut best: Option<usize> = None;
     for r in recs.iter().filter(|r| r.kind == "net-request") {
         while cursor < recs.len() && recs[cursor].ts <= r.ts {
-            if TRIGGER_KINDS.contains(&recs[cursor].kind.as_str()) {
+            let rr = &recs[cursor];
+            if TRIGGER_KINDS.contains(&rr.kind.as_str())
+                && !(rr.kind == "input"
+                    && !is_trigger_input(rr.txt.as_deref().unwrap_or("")))
+            {
                 best = Some(cursor);
             }
             cursor += 1;
@@ -1303,7 +1812,21 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "dead_end": stats.dead_end_chains,
             "net_adjacent": stats.net_adjacent_chains,
             "content_sink": stats.content_sink_chains,
-            "rule": "token-forming = sink-call | handler-born | fp-probes>=2 | integrity-check | net-window | content-sink; content-sink is the v8 data-dependency backward slice (payload records sharing content-runs with a crypto/upload sink, no timer) - dead ends stay whole in the raw run zip",
+            "send_initiator": stats.send_initiator_chains,
+            "token_access": stats.token_access_chains,
+            "fp_entry": stats.fp_entry_chains,
+            "gopd": stats.gopd_chains,
+            "stack_inspect": stats.stack_inspect_chains,
+            "payload_assembler": stats.payload_assembler_chains,
+            "rule": "token-forming = sink-call | handler-born | fp-probes>=2 | integrity-check | net-window | content-sink | send-initiator | token-access | fp-probes-entry | gopd-check | stack-inspect (v10); content-sink crosses the encryption boundary via crypto-out/ws-frame-out byte identity (v9); the *-entry/send-initiator/token-access/gopd/stack signals come from the kind-8 entry-join (caller attribution, no stack walk) - dead ends stay whole in the raw run zip",
+        },
+        "v8_depth": {
+            "lazy_funcs": stats.lazy_funcs,
+            "wasm_firstcalls": stats.wasm_firstcalls,
+            "wasm_traps": stats.wasm_traps,
+            "wasm_cached": stats.wasm_cached,
+            "automation_tells": automation_tells,
+            "note": "lazy_funcs = wasm-free JS functions that actually executed (0023); wasm_firstcalls = wasm functions that ran at least once; automation_tells = harness markers found in materialized Error.stacks (kind 38) - if the crawler's own harness shows up here, that is a capture-integrity alarm",
         },
         "taint": {
             "fp_reads": stats.fp_reads,
@@ -1328,6 +1851,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "index": wasm_index,
         },
         "chains": chain_report,
+        "prune": prune_report,
         "net_chains": net_chains,
     });
     let _ = fs::write(
@@ -1538,6 +2062,14 @@ mod tests {
             signals: Vec::new(),
             net_adjacent: false,
             content_sink: false,
+            send_initiator: false,
+            token_access: false,
+            fp_entry: Vec::new(),
+            gopd_check: false,
+            stack_inspect: false,
+            stack_samples: Vec::new(),
+            payload_assembler: false,
+            executed_funcs: 0,
         }
     }
 

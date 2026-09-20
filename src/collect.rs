@@ -27,7 +27,7 @@ pub const DEFAULT_RAW_DIR: &str = "/tmp/afeye-raw";
 const MAX_RECORD: u32 = 16 + (1 << 20);
 const PREVIEW: usize = 4096;
 
-const KINDS: [&str; 37] = [
+const KINDS: [&str; 39] = [
     "sink-hello",
     "script-source",
     "bytecode-entry",
@@ -84,6 +84,15 @@ const KINDS: [&str; 37] = [
     "isolate",
     "worker",
     "nav-start",
+    // 37 taint-edge  - plaintext string->bytes boundary carriers (0016):
+    // TextEncoder/TextDecoder, atob/btoa, FormData entries, URLSearchParams.
+    // The backward-slice graph edges: these bytes content-match the crypto
+    // raw_data / req-body sinks they eventually fed.
+    "taint-edge",
+    // 38 error-stack - Error().stack / captureStackTrace materialization
+    // (0022): the automation-detection surface and the only cheap JS->JS
+    // call-edge source in the engine.
+    "error-stack",
 ];
 
 /// High-frequency small-record kinds are BATCHED: their payloads append to

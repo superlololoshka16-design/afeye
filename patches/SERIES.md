@@ -1,11 +1,168 @@
-# afeye chromium patch series v8
+# afeye chromium patch series v10
 
-**14 patches** against **Chromium 153.0.8010.52** (v8 rev
+**22 patches** against **Chromium 153.0.8010.52** (v8 rev
 `d1fed5cd7e3b114dea70f18b20d26f816322833d`). The whole series is
 re-verified to apply cumulatively with plain `git apply` against a
 pristine tree assembled from sources fetched at that tag
-(14/14; v8 hunks re-validated on freshly fetched pristine files for
-0001/0003/0004/0012/0013/0014).
+(22/22; v10 hunks re-validated on freshly fetched pristine files for
+0020/0021/0022).
+
+v10 is the **v8-depth pass over v9** - a dedicated audit of the engine
+layer found 8 gaps where capture was still selective. Seven landed as
+patches 0020-0022 (one rejected with reasons, see honest limits):
+
+1. **wasm streaming + execution (0020).** THE way antifraud ships wasm:
+   `compileStreaming`/`instantiateStreaming` jobs are created with EMPTY
+   bytes and the module materializes in
+   `AsyncStreamingProcessor::OnFinishedStream` - never crossing the
+   0003 SyncCompile/AsyncCompile hooks, so kind-3 was EMPTY for
+   Kasada/Cloudflare/DataDome loads. Plus the HTTP-code-cache restore
+   path (`Deserialize`, tag `cached`), per-function FIRST EXECUTION
+   (`Runtime_WasmCompileLazy` - lazy compilation is default, so every
+   function that ever ran crosses here once; zero-alloc, runs under the
+   existing DisallowGarbageCollection contract) and every wasm TRAP
+   (`ThrowWasmError` - induced-trap environment probing).
+2. **JSON.stringify result + Error.stack (0021).** The two highest-
+   signal v8 records for token reconstruction and automation detection:
+   `BUILTIN(JsonStringify)` logs the assembled PLAINTEXT head (960 B,
+   the fingerprint object immediately before crypto/wire - the content
+   slice can now match stringify-head against the uploaded body);
+   `ErrorUtils::GetFormattedStack` (renamed original -> Impl, public
+   wrapper logs) captures EVERY materialized `.stack` string head -
+   automation harness markers in stacks are a first-class detector
+   surface AND the only cheap JS->JS call-graph source in the engine
+   (Invoke sees C++->JS only). Both no-alloc (GetFlatContent under
+   DisallowGC, the 0003/0004 pattern), new kind 38 for stacks.
+3. **descriptor tamper-checks + execution edges + clock/wrapped
+   completeness (0022).** `JSReceiver::GetOwnPropertyDescriptor` (the
+   C++ funnel reached only for special receivers/proxies - exactly the
+   blink DOM objects antifraud inspects): how it VERIFIES
+   navigator.webdriver / plugins / window.chrome were not tampered
+   with - holder type + key + the RESULT attributes (the tamper
+   evidence; 0008 sees invocations, never descriptors).
+   `Compiler::Compile` lazy funnel: every function's FIRST execution as
+   `lazy-compile name=.. script=..:line` (kind 8) - dead-code evidence
+   per chain. `Compiler::GetWrappedFunction`: the fourth compile funnel
+   (CompileFunction API) closes the last script-source gap.
+   `BUILTIN(DateConstructor)`: `Date()`/`new Date()` clock reads join
+   kind 33 (a clock hook that moves only Date.now() is itself a
+   detector; half the clock stream was missing).
+
+REJECTED from the same audit (verified, not guessed): per-call wasm
+export logging (dispatch is generated machine code per-arch, no C++
+funnel exists - the firstcall record is the honest substitute); CallIC
+JS->JS edges (no CallIC C++ class in this rev, feedback is pure Torque);
+Proxy birth/traps (CSA-only fast paths, C++ fallbacks would give a
+misleading partial picture; the GOPD hook already catches proxy
+descriptor traps via the special-receiver dispatch); Intl resolvedOptions
+timezone (ICU/CppGCManaged-backed - extracting it without a compile loop
+is unsafe; the value rides out through the JSON.stringify/TE boundaries
+anyway); BUILTIN(ObjectDefineProperty) as the define funnel (misses
+Reflect + internal defines; the C++ choke is DefineOwnProperty, deferred
+with the Error-construction noise filter it would need).
+
+v9 is the **completeness pass over v8** - five subagent audits (v8
+depth, blink probes, bindings/input, wire/payload, rust graph) walked
+the pristine tree for surfaces where capture was still SELECTIVE, and
+closed every one that feeds a token:
+
+1. **the input master funnel (0015).** `WidgetEventHandler::HandleInputEvent`
+   is the single point every physical WebInputEvent crosses per root
+   frame: mouse, wheel, keyboard, gesture, pointer (touch/pen). It
+   closes three v8 blind spots at once:
+   - **`kFromDebugger` (1<<23)** - the ONLY provenance marker for
+     CDP-injected input. `isTrusted` is TRUE for Playwright/Puppeteer
+     `Input.dispatch*` (they ride the real browser input pipeline), so
+     the kind-24 flag could not tell automation from human. The bit is
+     set in devtools_input_handler.cc and survives the mojo round-trip;
+     nothing in blink ever read it. Now every kind-23 record carries
+     `dbg=0|1`.
+   - **wheel raw deltas** (scroll cadence) and **gesture types**
+     (tap/scroll/fling - the REAL mobile click/scroll) were invisible.
+   - type is logged via `WebInputEvent::GetName()` (stable string, not
+     enum int). Zero alloc: snprintf into stack scratch, 4M cap,
+     `AFEYE_TRACE_INPUT=0` off.
+2. **the plaintext boundaries (0016, kind 37 taint-edge).** Encryption
+   destroys content - the v8 content-slice could not cross a pure-JS
+   AES (Kasada) because the plaintext never landed in any record. v9
+   captures EVERY string->bytes boundary of the token pipeline:
+   `TextEncoder.encode/encodeInto` (the main one - form bodies, token
+   JSON), `TextDecoder.decode` (challenge responses), `atob/btoa`
+   (base64 token wrappers - the btoa input content-matches the JS-AES
+   ciphertext in the req-body), `FormData::Entry` ctors (per-field
+   name+value; append/set/form-submit all funnel), `URLSearchParams::
+   toString` (the exact bytes a fetch body uploads). Records are spans
+   under the existing EmitSpan convention; the Rust filter hashes them
+   (blake3 runs) like every other payload - C++ does zero hashing.
+   `AFEYE_TRACE_TAINT=0` off, 100k/process cap.
+3. **WS outbound (0017).** SERIES.md v8 claimed "WS frames both
+   directions" - FALSE: the 0011 hook sat in `OnDataFrame` (inbound
+   only). A token leaving over WS (Kasada/HUMAN telemetry channels)
+   crossed no sink. v9 emits `ws-frame-out` spans at both
+   `ReadAndSendFrameFromDataPipe` materialization points (direct +
+   reassembly). Inbound tags stay carriers, only `ws-frame-out` sinks.
+4. **the crypto result boundary (0018).** `CryptoResultImpl::
+   CompleteWithBuffer` is the single funnel where every SubtleCrypto
+   promise resolves its ArrayBuffer - the ciphertext/signature/digest
+   itself. 0007 captured raw_data BEFORE BoringSSL; the output was
+   invisible, so the slice died exactly at the encryption boundary
+   (req-body ciphertext content-matched nothing). `crypto-out` spans
+   now content-match the req-body / ws-frame-out sinks verbatim - the
+   graph crosses encryption. Op pairing in<->out stays heuristic
+   (documented): threading an op-id would touch CryptoResultImpl and
+   all 14 creation sites for an edge the content match already gives.
+5. **the fingerprint VALUES (0019).** kind-29 names every WebIDL call
+   but never its arguments or results; the named-getter interceptor
+   path (`cs.fontFamily`) bypasses the thunk ENTIRELY. v9 captures the
+   reads that feed the font/device signature:
+   - `CSSComputedStyleDeclaration::GetPropertyCSSValue` - THE funnel
+     every string-API path converges on (getPropertyValue, item(), the
+     camelCase interceptor): property name + resolved value. Font-metric
+     fingerprinting lives here. 2M cap (layout reads styles heavily).
+   - `BaseRenderingContext2D::DrawTextInternal` - the fillText/strokeText
+     INPUT (text+font+xy): what was drawn to produce the canvas digest
+     0012/0014 capture on the way out.
+   - `FontFaceSet::check` - direct font enumeration (which font probed).
+   - `Permissions::query` name + `Notification::permission` value - the
+     headless MISMATCH tell (DataDome/CreepJS pair the two).
+   - `LocalDOMWindow::matchMedia` query + `MediaQueryList::matches`
+     answer - the device/OS/rendering feature probes.
+6. **the filter stops lying (src/sinkfilter.rs, src/main.rs).**
+   - **prune cap bug (real):** `chains[]` capped at 4000 entries; the
+     filtered-zip cut walked only the report - chains past the cap
+     silently escaped into the "token-only" zip (eval storms produce
+     thousands). New uncapped compact `prune` list is the
+     authoritative cut set; main.rs uses it (old reports fall back).
+   - **handler-born saturation:** TRIGGER_KINDS included READ kinds
+     (fingerprint/dom-metric/audio/webrtc/crypto-op) - during the load-
+     phase fp storm they fire hundreds/sec, so the 250ms window found
+     a "trigger" for every early chain and filtered==run. Narrowed to
+     causal kinds {input, event-dispatch, timer}; mousemove/pointer-
+     move raw updates excluded (ambient, not compile triggers).
+   - **new sinks in the content graph:** `crypto-out` (0018) and
+     `ws-frame-out` (0017) join SINK_CRYPTO_OPS / the sink set;
+     `websocket` and `taint-edge` join payload_kinds as carriers.
+   - **entry-join (kind-8):** the call-completed stream - the ready-made
+     caller identity sitting unused in the index - now attributes every
+     fetch initiation (kind 28), cookie/storage access (kind 16),
+     fingerprint read (kind 29), JSON.stringify assembly (0021), GOPD
+     probe (0022) and Error.stack materialization (0021) to the chain
+     that was the active C++->JS entry. Signals: `send-initiator`
+     (observed send, beats the sink-call text match), `token-access`
+     (read/wrote the stored token), `fp-probes-entry` (>=2 distinct fp
+     reads by entry, immune to window false-positives), `gopd-check`
+     (descriptor tamper probe), `stack-inspect` (materialized .stack),
+     plus the `payload_assembler` column (ran JSON.stringify).
+     Lazy-compile records (0022) are EXCLUDED from the entry index
+     (they name the compiled function, not an executing entry) and
+     instead feed per-chain `executed_funcs` - dead-code evidence.
+     Limits documented: nearest C++->JS boundary, not the exact
+     reader; same-pid threads interleave.
+   - **v8_depth report block:** lazy_funcs, wasm_firstcalls,
+     wasm_traps, wasm_cached, and `automation_tells` - harness markers
+     (pptr:, playwright, cdc_, __webdriver_evaluate, ...) found in
+     materialized Error.stacks. If OUR crawler's own harness shows up
+     there, that is a capture-integrity alarm.
 
 v8 is the **latency + blind-spot pass over v7**, four changes:
 
@@ -225,6 +382,39 @@ types match - the thunk sees the slow path.
 | `HTMLCanvasElement::toBlob` (0012) | the async export ask: mime + geometry (kind 16) |
 | `Document::cookie` / `setCookie` (document.cc, 0013) | cookie-jar VALUES both directions (kind 16, head-capped 960 B) - the cf_clearance / challenge-token store |
 | `StorageArea::getItem` / `setItem` (storage_area.cc, 0013) | localStorage/sessionStorage key+value head (kind 16) - the store-then-send pattern: fingerprint parked at init, read back at send time |
+
+### the v9 completeness pass - `0015` + `0016` + `0017` + `0018`
+
+| funnel | covers |
+|---|---|
+| `WidgetEventHandler::HandleInputEvent` (widget_event_handler.cc, 0015) | THE physical-input master funnel: every mouse/wheel/key/gesture/pointer event per root frame, with `mods` + **`dbg`** (kFromDebugger - CDP-injected vs human; isTrusted cannot tell them apart) + per-type geometry. kind 23, `AFEYE_TRACE_INPUT=0` off, 4M cap |
+| `TextEncoder::encode` / `encodeInto` (0016) | the string->bytes boundary every UTF-8 payload crosses before ANY crypto (kind 37, `text-encoder`) |
+| `TextDecoder::Decode` (0016) | the bytes->string boundary of challenge responses (kind 37, `text-decoder`) |
+| `UniversalGlobalScope::btoa` / `atob` (0016) | the base64 token wrapper both directions - btoa input content-matches the JS-AES ciphertext in the upload; atob output is the decoded challenge plaintext (kind 37) |
+| `FormData::Entry` ctors (0016) | every form field name+value as one span (append/set/form-submit funnel through the ctors); blob entries log metadata (kind 37, `form-data`) |
+| `URLSearchParams::toString` (0016) | the full form-encoded query - the exact bytes of a fetch-body upload (kind 37, `url-search-params`) |
+| `WebSocket::ReadAndSendFrameFromDataPipe` (0017) | WS OUTBOUND frames (both materialization paths) - `ws-frame-out` spans; the v8 "both directions" claim was inbound-only (kind 19) |
+| `CryptoResultImpl::CompleteWithBuffer` (0018) | every SubtleCrypto buffer RESULT - ciphertext/signature/digest as `crypto-out` spans; the edge that lets the content graph cross encryption (kind 11) |
+| `CSSComputedStyleDeclaration::GetPropertyCSSValue` (0019) | getComputedStyle per-property name + resolved VALUE - the funnel getPropertyValue/item()/camelCase-interceptor all converge on; the interceptor path is INVISIBLE to kind-29 (kind 16, 2M cap) |
+| `BaseRenderingContext2D::DrawTextInternal` (0019) | fillText/strokeText INPUT: text + font + xy - what was drawn to produce the canvas digest (kind 16) |
+| `FontFaceSet::check` (0019) | direct font enumeration: which font string was probed (kind 16) |
+| `Permissions::query` / `Notification::permission` (0019) | the headless mismatch tell: query NAME + permission VALUE, pairable by the filter (kind 16) |
+| `LocalDOMWindow::matchMedia` / `MediaQueryList::matches` (0019) | device/OS feature probes: query string + matches bit (kind 16) |
+
+### the v10 v8-depth pass - `0020` + `0021` + `0022`
+
+| funnel | covers |
+|---|---|
+| `AsyncStreamingProcessor::OnFinishedStream` (module-compiler.cc, 0020) | THE wasm-bytes funnel for streaming delivery - compileStreaming/instantiateStreaming modules materialize here, never crossing the 0003 Sync/AsyncCompile hooks (kind 3, same record shape) |
+| `AsyncStreamingProcessor::Deserialize` (0020) | wasm restored from the HTTP code cache - tag `cached` (kind 3) |
+| `RUNTIME_FUNCTION(Runtime_WasmCompileLazy)` (runtime-wasm.cc, 0020) | every lazily-compiled wasm function's FIRST execution = the execution trace (kind 31, `wasm-firstcall func_index= module=`); zero-alloc under the existing DisallowGC contract |
+| `ThrowWasmError` (0020) | every wasm trap - induced-trap environment probing (kind 31, `wasm-trap msg=`) |
+| `BUILTIN(JsonStringify)` (builtins-json.cc, 0021) | the assembled PLAINTEXT: result head (960 B) + replacer flag - the fingerprint object immediately before crypto/wire (kind 16, `json-stringify`). `AFEYE_TRACE_JSON=0` off, 2M cap |
+| `ErrorUtils::GetFormattedStack` (messages.cc, 0021) | EVERY materialized Error.stack head (960 B) - automation-harness detection + the only cheap JS->JS call-graph source (kind 38, `errstack`). Original renamed to Impl; the wrapper catches all four return paths. `AFEYE_TRACE_STACK=0` off, 2M cap |
+| `JSReceiver::GetOwnPropertyDescriptor` (js-objects.cc, 0022) | descriptor tamper-checks over DOM objects/proxies: holder type + key + RESULT attrs (data-vs-accessor, writable/enumerable/configurable) - the evidence that a patched property changes the token (kind 16, `gopd`). Reached only for special receivers/proxies - plain-object GOPD stays in the CSA fast path. `AFEYE_TRACE_GOPD=0` off, 2M cap |
+| `Compiler::Compile` lazy funnel (compiler.cc, 0022) | every JS function's FIRST execution: `lazy-compile name= script=:line` (kind 8) - dead-code evidence per chain, no-alloc (0003 pattern), 4M cap |
+| `Compiler::GetWrappedFunction` (compiler.cc, 0022) | the FOURTH compile funnel (CompileFunction API) - closes the last script-source gap (kind 1, name `wrapped`) |
+| `BUILTIN(DateConstructor)` (builtins-date.cc, 0022) | `Date()` / `new Date()` zero-arg clock reads join kind 33 (`clock date-ctor`) - the Date.now cross-check half |
 | `WebGLRenderingContextBase::ReadPixelsHelper` (0014) | the WebGL readback: ask (rect+fmt+type) + RESULT head-span (the rendered digest). Covers both WebGL1 and WebGL2 (single funnel). kind 16 |
 | `BaseRenderingContext2D::getImageDataInternal` (0014) | the canvas-2d readback RESULT: head-span of the filled pixel buffer (`RawByteSpan`). 0007 logged the ask; this is the digest the antifraud hashes. kind 16 |
 | `AnalyserNode::get*FrequencyData` / `get*TimeDomainData` (0014) | the realtime audio fingerprint: head-span of every frequency/time-domain buffer. 0007 covered the OFFLINE render; this is the realtime surface (per-frame polls, 2M cap). kind 16 |
@@ -247,8 +437,17 @@ types match - the thunk sees the slow path.
 | 0012 blink-clock-canvas | 2 (`performance.cc`, `html_canvas_element.cc`) | blink core |
 | 0013 blink-cookie-storage | 2 (`document.cc`, `storage_area.cc`) | blink core/modules |
 | 0014 blink-readback-results | 3 (`webgl_rendering_context_base.cc`, `base_rendering_context_2d.cc`, `analyser_node.cc`) | blink core/modules |
+| 0015 blink-input-master | 1 (`widget_event_handler.cc`) | blink core |
+| 0016 blink-taint-edges | 5 (`text_encoder.cc`, `text_decoder.cc`, `universal_global_scope.cc`, `form_data.cc`, `url_search_params.cc`) | blink core/modules |
+| 0017 net-ws-outbound | 0 new (`websocket.cc` already in 0011) | network service |
+| 0018 blink-crypto-out | 1 (`crypto_result_impl.cc`) | blink modules |
+| 0019 blink-fp-values | 7 (`css_computed_style_declaration.cc`, `font_face_set.cc`, `media_query_list.cc`, `local_dom_window.cc`, `base_rendering_context_2d.cc`*, `permissions.cc`, `notification.cc`) | blink core/modules |
+| 0020 v8-wasm-streaming-exec | 2 (`module-compiler.cc`, `runtime-wasm.cc`) | v8 |
+| 0021 v8-payload-stack | 2 + header (`builtins-json.cc`, `messages.cc`, `messages.h`) | v8 |
+| 0022 v8-introspection | 1 new + 2 existing (`js-objects.cc` new; `compiler.cc`*, `builtins-date.cc`* already patched) | v8 |
 
-~38 changed/new TUs total. The CI build (`scripts/build-chromium.sh`)
+~55 changed/new TUs total (*already-patched TUs - ccache miss only for the
+changed file). v8 relinks once for 0020-0022 combined. The CI build (`scripts/build-chromium.sh`)
 runs `ccache -z` before ninja and `ccache -s` after: on a warm cache
 only these TUs recompile - a series tweak costs minutes, not hours.
 First build chains across 4h30m windows under the 6h runner cap
@@ -272,17 +471,27 @@ is no libc stdio buffer to lose, and each process owns its own file
 (no cross-writer locking needed); a hard SIGKILL can still lose the
 last sub-millisecond of ring backlog (counted, see honest limits).
 
-Kinds after v8 (no new kinds - 0012/0013 emit into 16 and 33): 0
-sink-hello, 1 script-source (v8, `iso:` names),
-3 wasm-module, 8 call-origin, 11 crypto-op, 12 timer, 15
+Kinds after v10 (one new kind over v9 - 38 error-stack): 0
+sink-hello, 1 script-source (v8, `iso:` names, **four funnels: eval /
+streamed / buffered / wrapped, 0002+0022**),
+3 wasm-module (**+ streaming + code-cache paths, 0020**), 8 call-origin
+(**+ lazy-compile first-execution records, 0022**), 11 crypto-op (**+
+crypto-out result, 0018**), 12 timer, 15
 structured-clone, 16 fingerprint (device identities + webgl +
-**canvas export result + cookie/storage values**), 17
-net-request, 18 net-resp-body, 19 websocket, 23 input, 24
+**canvas export result + cookie/storage values** + **v8-layer:
+json-stringify plaintext, GOPD descriptor results, 0021/0022**), 17
+net-request, 18 net-resp-body, 19 websocket (**+ outbound frames,
+0017**), 23 input (**+ master funnel with dbg flag, 0015**), 24
 event-dispatch, 25 dom-metric, 26 audio, 27 webrtc, 28 fetch, **29
-dom-api**, **30 microtask**, **31 wasm-instance**, **32
-fn-tostring**, **33 clock (Date.now + performance.now)**, **34
+dom-api**, **30 microtask**, **31 wasm-instance (+ firstcall + trap
+records, 0020)**, **32
+fn-tostring**, **33 clock (Date.now + performance.now + Date
+constructor, 0012/0022)**, **34
 isolate**, **35 worker**, **36
-nav-start**. Silent (wire compat): 2, 4-7, 9-10, 13-14, 20-22.
+nav-start**, **37 taint-edge (0016: TextEncoder/TextDecoder/atob/
+btoa/FormData/URLSearchParams - the plaintext boundaries)**, **38
+error-stack (0021: every materialized Error.stack head)**. Silent
+(wire compat): 2, 4-7, 9-10, 13-14, 20-22.
 
 `tools/rec_census.py` parses this format standalone (with the same
 kind names as `src/collect.rs`) and carries `--expect layer:kind=MIN`
@@ -311,23 +520,51 @@ still holds every hash + ts + pid.
   (the eval-chunk-then-probe antifraud pattern). Chain entries carry
   the exact `fp_reads` list, `integrity_checks` (kind-32 samples),
   `clock_reads` cadence.
-- **dead-end classification (v7)** - every chain additionally gets
-  `token_forming` + the `signals` that fired:
+- **dead-end classification (v7, hardened v9)** - every chain
+  additionally gets `token_forming` + the `signals` that fired:
   `sink-call` (own code carries a collector/network sink call) |
-  `handler-born` (materialized in an event/timer window) |
+  `handler-born` (materialized in an event/timer window; v9: triggers
+  narrowed to CAUSAL kinds {input, event-dispatch, timer} - v7 counted
+  read-kinds, so the load-phase fp storm trigger-marked every early
+  chain and filtered==run; mousemove/pointer-move are ambient, not
+  triggers) |
   `fp-probes` (>=2 distinct fingerprint reads during materialization) |
   `integrity-check` (kind-32 self-checks in window) |
   `net-window` (materialized inside a network request's 5 s
-  payload-formation window - the backward slice from the send).
+  payload-formation window; v9: seeds narrowed to requests that CAN
+  carry a payload - non-GET/HEAD method, antifraud-vendor host, or a
+  req-body span - v7 seeded with every subresource GET) |
+  `content-sink` (v8: payload record sharing blake3 content-runs with
+  a crypto/upload sink, no timer; v9 sinks: crypto-out 0018,
+  ws-frame-out 0017; v9 carriers: taint-edge 0016) |
+  `send-initiator` / `token-access` / `fp-probes-entry` (v9 ENTRY-JOIN,
+  see below).
   No signal = **dead end**: the code ran but nothing it produced is
   observable in any token-feeding position.
+- **entry-join (v9)** - the kind-8 call-completed stream (0003 Invoke
+  funnel) is the ready-made caller identity: for every fetch
+  initiation (kind 28), cookie/storage access (kind 16, 0013) and
+  fingerprint read (kind 29) the last C++->JS entry at or before its
+  ts in the same pid (250 ms window) names the executing script, which
+  joins to a chain by display name. Signals: `send-initiator` (chain
+  really initiated a send - observed, beats the sink-call TEXT match),
+  `token-access` (chain read/wrote the stored token), `fp-probes-entry`
+  (>=2 distinct fp reads with this chain as the entry - immune to the
+  window false-positives). Honest limits: the entry is the nearest
+  C++->JS boundary, not the exact reader (JS->JS calls skip Invoke);
+  same-pid threads interleave (no tid in the wire format); main+worker
+  same-URL chains in one pid collide. All strictly better than window
+  guessing, all recomputable from the raw stream.
 - **two zips** - the run zip keeps the v6 keep rule (hot OR
   token-forming OR `AF_SINK_KEEP_COLD=1` OR `AF_KEEP_BIG=1`+big -
   at least as complete as v6, no downgrade); the filtered zip is cut
   on its own copy to **token-forming chains only** ("what actually
-  builds the challenge token"), via the `token_forming` flag in
-  `report.json`. Dead ends are dropped from the filtered zip but
-  stay whole in the run zip - nothing is lost, only sorted.
+  builds the challenge token"). v9 fix: the cut walks the UNCAPPED
+  `prune` list in report.json, not the 4000-entry `chains[]` cap -
+  before, chains past the cap silently escaped the cut and dead ends
+  leaked into the token-only zip (eval storms produce thousands).
+  Dead ends are dropped from the filtered zip but stay whole in the
+  run zip - nothing is lost, only sorted.
 - **payload formation** - every network request entry carries what fed
   it: trigger (closest preceding input/event/timer), the fingerprint
   reads in the preceding 5 s (`fp_reads_5s`), integrity checks and
@@ -336,14 +573,17 @@ still holds every hash + ts + pid.
   as resolved at instantiation** attached to the closest preceding
   module of the same pid.
 - attribution honesty: kind-29 reads have no JS-caller identity in C++
-  (no stack walk), so they are attributed BY TIME - documented, and
-  recomputable from the raw stream the index keeps.
+  (no stack walk). v9 recovers it EXTERNALLY via the entry-join above;
+  the time-window attribution remains as the secondary column for
+  records the entry-join cannot reach (no entry within 250 ms, native
+  entries, cross-thread interleave). Both recomputable from the raw
+  stream the index keeps.
 
 ## apply
 
 ```
 cd chromium/src
-git apply patches/0001-*.patch   # ... through 0011, in order
+git apply patches/0001-*.patch   # ... through 0018, in order
 ```
 
 GN args (the CI build uses exactly these - `scripts/build-chromium.sh`):
@@ -386,12 +626,44 @@ disables the call stream, `AFEYE_TRACE_CLOCK=0` the clock stream.
 
 ## honest limits
 
-- `WebAssembly.compileStreaming` decodes in chunks and never
-  materializes one buffer at Sync/AsyncCompile; those modules are
-  captured as network response bodies by the net-wire layer but not
-  re-tagged as `wasm-module` records. Buffered wasm (embedded in JS -
-  the antifraud case) is always captured whole; v6 additionally logs
-  the streaming case's resolved imports at instantiation.
+- ~~`WebAssembly.compileStreaming` decodes in chunks and never
+  materializes one buffer at Sync/AsyncCompile~~ **FIXED (0020)**: the
+  streaming wire bytes are captured at `AsyncStreamingProcessor::
+  OnFinishedStream` and the code-cache restore at `Deserialize` (tag
+  `cached`). What remains honestly out: per-call wasm export invocation
+  logging - dispatch is generated machine code (JSToWasm wrappers,
+  per-arch), no C++ funnel exists; the substitute is the firstcall
+  record (which function indices executed, once each).
+- **Intl resolvedOptions timeZone is NOT captured** (audit G8,
+  rejected): the value is ICU/CppGCManaged-backed - safe extraction
+  without a compile-verify loop was not achievable, and a half-hook
+  that looks complete is worse than none. The timeZone still leaves
+  the process through boundaries that ARE captured: it enters payload
+  strings via JSON.stringify (0021) / TextEncoder (0016) before the
+  wire. Locale-only capture was not shipped either - it would burn a
+  1511-line TU for a field that never stands alone in a token.
+- **Proxy birth/trap invocations are NOT captured** (audit R3):
+  allocation and the hot trap dispatch are CSA/Torque-generated; the
+  C++ fallbacks fire only on slow paths and would give a misleading
+  partial picture. Partial real coverage exists: proxy
+  getOwnPropertyDescriptor traps DO cross the 0022 GOPD hook (JS_PROXY
+  is a special receiver).
+- **defineProperty/defineOwnProperty is NOT captured** (audit R4,
+  deferred): the honest funnel is `JSReceiver::DefineOwnProperty`
+  (js-objects.cc, same TU as 0022 - zero marginal cost), but it needs a
+  noise filter first: Error construction itself defines properties
+  (the stack accessor), bootstrapper defines hundreds; an unfiltered
+  hook drowns the stream. Left as a follow-up with the filter designed
+  against real .rec volume, not guessed.
+- **G6 caller-edges are NOT walked at lazy-compile time.** The audit
+  proposed a JavaScriptStackFrameIterator walk in Compiler::Compile to
+  name caller->callee. Rejected for this pass: it runs on EVERY
+  function's first call, and a frame-walk bug I cannot compile-verify
+  risks bricking the whole capture. What ships instead: the callee
+  first-execution fact (lazy-compile records, 0022) + caller chains
+  from Error.stack materialization (0021) at the moments antifraud
+  introspects + C++->JS entries from Invoke (0003). The caller-frame
+  edge stays a follow-up to be landed with a compile loop available.
 - Fast-API overloads (`NoAllocDirectCall`) bypass the 0008 thunk when
   argument types match; the slow path always lands. `getParameter` and
   friends are NOT fast-API, so the fingerprint sweep is fully covered.

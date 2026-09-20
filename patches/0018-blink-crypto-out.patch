@@ -1,0 +1,43 @@
+--- a/third_party/blink/renderer/modules/crypto/crypto_result_impl.cc
++++ b/third_party/blink/renderer/modules/crypto/crypto_result_impl.cc
+@@ -30,6 +30,12 @@
+ 
+ #include "third_party/blink/renderer/modules/crypto/crypto_result_impl.h"
+ 
++#ifdef BLINK_AFEYE
++#include <atomic>
++
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
++
+ #include "base/compiler_specific.h"
+ #include "base/containers/span.h"
+ #include "third_party/blink/public/platform/platform.h"
+@@ -134,6 +140,27 @@ void CryptoResultImpl::CompleteWithBuffer(base::span<const uint8_t> bytes) {
+   if (!resolver_)
+     return;
+ 
++#ifdef BLINK_AFEYE
++  // afeye (0018): THE SubtleCrypto result boundary - every encrypt/sign/
++  // digest/deriveBits/wrapKey/exportKey promise resolves its ArrayBuffer
++  // here, on the origin thread. 0007 captures raw_data BEFORE BoringSSL; this
++  // captures the OUTPUT (ciphertext / signature / digest). Without it the
++  // backward slice dies exactly at the encryption boundary: req-body carries
++  // ciphertext, which content-matches NOTHING upstream. With it the Rust
++  // filter links crypto-out <-> req-body / ws-frame-out by identical bytes,
++  // and the graph crosses encryption. Op pairing in->out stays heuristic
++  // (pid + time order, documented) - threading an op-id through
++  // CryptoResultImpl would touch the class and all 14 creation sites for a
++  // transform edge the content match already gives for the sink side.
++  if (blink::afeye::Enabled() && !bytes.empty()) {
++    static std::atomic<uint64_t> g_afeye_cout{0};
++    if (g_afeye_cout.fetch_add(1, std::memory_order_relaxed) < 200000) {
++      blink::afeye::EmitSpan(blink::afeye::kCryptoOp, blink::afeye::NowNs(),
++                             "crypto-out", bytes.data(),
++                             static_cast<uint32_t>(bytes.size()));
++    }
++  }
++#endif
+   auto* buffer = DOMArrayBuffer::Create(bytes);
+   if (detailed_type_ == DetailedResolverType::kArrayBuffer) {
+     resolver_->DowncastTo<DOMArrayBuffer>()->Resolve(buffer);

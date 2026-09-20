@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000000..1111111111
 --- /dev/null
 +++ b/v8/src/afeye/sink.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,58 @@
 +#ifndef V8_AFEYE_SINK_H_
 +#define V8_AFEYE_SINK_H_
 +
@@ -33,6 +33,14 @@ index 0000000000..1111111111
 +  kFnToString = 32,
 +  kClock = 33,
 +  kIsolateBirth = 34,
++  // v9 additions (wire-compatible). kind 16 "fingerprint" already named by
++  // the collector for the blink layer; the v8 layer joins it for the
++  // in-engine fingerprint reads (JSON.stringify result, Intl resolved
++  // options, GOPD tamper-checks) that have no blink binding.
++  kFingerprint = 16,
++  // 38 error-stack: Error().stack / captureStackTrace materialization
++  // (0022) - the automation-detection surface AND the JS->JS edge source.
++  kErrorStack = 38,
 +};
 +
 +bool Enabled();

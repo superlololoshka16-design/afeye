@@ -61,6 +61,8 @@ KIND_NAMES = {
     34: "isolate",           # isolate birth (0003)
     35: "worker",
     36: "nav-start",
+    37: "taint-edge",
+    38: "error-stack",
 }
 
 HDR = struct.Struct("<IBHI")  # len, kind, flags, rsv

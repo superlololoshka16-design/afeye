@@ -2,7 +2,7 @@ diff --git a/third_party/blink/renderer/platform/afeye/sink.h b/third_party/blin
 new file mode 100644
 --- /dev/null
 +++ b/third_party/blink/renderer/platform/afeye/sink.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,68 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
 +#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
 +
@@ -34,8 +34,18 @@ new file mode 100644
 +  kFetch = 28,
 +  // v6 additions (wire-compatible, new records only)
 +  kDomApi = 29,
++  // v8 additions (wire-compatible; kind 33 already named "clock" by the
++  // collector - the blink layer joins the v8 clock stream: Date.now (v8)
++  // + performance.now (blink, 0012)
++  kClock = 33,
 +  kWorker = 35,
 +  kNavStart = 36,
++  // v9: the plaintext-boundary carriers (0016): TextEncoder/TextDecoder,
++  // atob/btoa, FormData entries, URLSearchParams. Body = <src_tag>\0<bytes>,
++  // EmitSpan convention - the exact bytes at each string->bytes boundary of
++  // the token pipeline, so the Rust filter can run content-runs across them
++  // (backward slice by DATA, not by timer).
++  kTaintEdge = 37,
 +};
 +
 +bool Enabled();

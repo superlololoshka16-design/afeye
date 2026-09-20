@@ -148,6 +148,59 @@ jobs:
             // eval + new Function: the GetFunctionFromEval funnel (0002)
             eval('1+1');
             new Function('return 2')();
+            // v9 smoke surfaces (0012-0019):
+            // clock: Date.now (v8 builtin 0004 -> v8:clock) and
+            // performance.now (blink 0012 -> blink:clock), both kind 33
+            Date.now();
+            performance.now();
+            // canvas export result (0012/0014) + draw-text input (0019)
+            try {
+              var cv = document.createElement('canvas');
+              cv.width = 16; cv.height = 16;
+              var cx = cv.getContext('2d');
+              cx.fillText('afeye', 1, 1);
+              cx.getImageData(0, 0, 4, 4);
+              cv.toDataURL('image/png');
+            } catch (e) {}
+            // cookie + storage VALUES (0013, kind 16)
+            document.cookie = 'afeye=smoke';
+            try {
+              localStorage.setItem('afeye', 'smoke');
+              localStorage.getItem('afeye');
+            } catch (e) {}
+            // taint edges (0016, kind 37): TE/btoa/FormData/USP
+            new TextEncoder().encode('afeye-taint');
+            btoa('afeye-b64');
+            try {
+              var fd = new FormData(); fd.append('afeye', 'smoke');
+              new URLSearchParams({afeye: 'smoke'}).toString();
+            } catch (e) {}
+            // fp VALUES (0019, kind 16): computed style, fonts.check,
+            // matchMedia + matches, permissions.query
+            try {
+              getComputedStyle(document.body).getPropertyValue('font-family');
+              getComputedStyle(document.body).fontFamily;
+              document.fonts.check('16px "Arial"');
+              var mql = matchMedia('(min-width: 1px)'); mql.matches;
+              navigator.permissions.query({name: 'notifications'});
+              Notification.permission;
+            } catch (e) {}
+            // v10 surfaces (0020-0022):
+            // JSON.stringify result (0021 -> kind 16 json-stringify)
+            JSON.stringify({afeye: 'smoke'});
+            // Error.stack materialization (0021 -> kind 38)
+            try { new Error('afeye-stack').stack; } catch (e) {}
+            // GOPD over a DOM object (0022 -> kind 16 gopd; navigator is a
+            // special receiver so it crosses the C++ funnel)
+            try { Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent'); } catch (e) {}
+            // lazy-compile firstcall (0022 -> kind 8 lazy-compile): the
+            // function below is first called here, inside the timer
+            (function afeyeLazy() { return 1; })();
+            // Date ctor clock (0022 -> kind 33 clock date-ctor)
+            new Date();
+            // wasm streaming path needs a network Response; smoke asserts
+            // buffered wasm only (0003) - streaming verified by census on
+            // real antifraud loads
           }, 30);
           EOF
           cat > /tmp/afeye-smoke/smoke.html <<'EOF'
@@ -173,10 +226,16 @@ jobs:
           python3 "$GITHUB_WORKSPACE/tools/rec_census.py" /tmp/afeye-smoke/rec \
             --expect v8:script-source=2 \
             --expect v8:call-completed=1 \
+            --expect v8:clock=1 \
+            --expect blink:clock=1 \
             --expect blink:event-dispatch=1 \
             --expect blink:timer=1 \
             --expect blink:fetch=1 \
             --expect blink:dom-api=1 \
+            --expect blink:fingerprint=1 \
+            --expect blink:taint-edge=1 \
+            --expect v8:fingerprint=1 \
+            --expect v8:error-stack=1 \
             --expect net:net-request=1
 
       - name: package + release

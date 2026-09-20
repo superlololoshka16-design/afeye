@@ -1,0 +1,43 @@
+--- a/services/network/websocket.cc
++++ b/services/network/websocket.cc
+@@ -1001,6 +1001,22 @@ bool WebSocket::ReadAndSendFrameFromDataPipe(DataFrame* data_frame) {
+       if (bytes_reassembled_ == data_frame->data_length) {
+         bytes_reassembled_ = 0;
+         blocked_on_websocket_channel_ = true;
++#ifdef NET_AFEYE
++        // afeye (0017): OUTBOUND ws frame, reassembled path. The inbound hook
++        // (0011) sits in WebSocketEventHandler::OnDataFrame and only ever sees
++        // channel->client frames; the token LEAVING over WS (Kasada/HUMAN
++        // telemetry channels) never crossed any sink before this. Symmetric
++        // record: "ws-frame-out" span, same head-cap as the inbound hook.
++        if (network::afeye::Enabled() && bytes_reassembled_ > 0) {
++          network::afeye::EmitSpan(
++              network::afeye::kWebSocket, network::afeye::NowNs(),
++              "ws-frame-out",
++              message_under_reassembly_->bytes(),
++              static_cast<uint32_t>(bytes_reassembled_ > 0x40000
++                                        ? 0x40000
++                                        : bytes_reassembled_));
++        }
++#endif
+         if (channel_->SendFrame(
+                 /*fin=*/true, MessageTypeToOpCode(data_frame->type),
+                 std::move(message_under_reassembly_),
+@@ -1020,6 +1036,17 @@ bool WebSocket::ReadAndSendFrameFromDataPipe(DataFrame* data_frame) {
+     auto data_to_pass =
+         base::MakeRefCounted<net::IOBufferWithSize>(size_to_send);
+     data_to_pass->span().copy_prefix_from(buffer.first(size_to_send));
++#ifdef NET_AFEYE
++    // afeye (0017): OUTBOUND ws frame, direct path - bytes just copied into
++    // data_to_pass; one span from the copy, no second buffer.
++    if (network::afeye::Enabled() && size_to_send > 0) {
++      network::afeye::EmitSpan(
++          network::afeye::kWebSocket, network::afeye::NowNs(), "ws-frame-out",
++          data_to_pass->bytes(),
++          static_cast<uint32_t>(size_to_send > 0x40000 ? 0x40000
++                                                       : size_to_send));
++    }
++#endif
+ 
+     const bool is_final = (size_to_send == data_frame->data_length);
+     blocked_on_websocket_channel_ = true;

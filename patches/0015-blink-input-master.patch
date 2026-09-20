@@ -1,0 +1,129 @@
+--- a/third_party/blink/renderer/core/input/widget_event_handler.cc
++++ b/third_party/blink/renderer/core/input/widget_event_handler.cc
+@@ -4,6 +4,19 @@
+ 
+ #include "third_party/blink/renderer/core/input/widget_event_handler.h"
+ 
++#ifdef BLINK_AFEYE
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++
++#include "third_party/blink/public/common/input/web_input_event.h"
++#include "third_party/blink/public/common/input/web_keyboard_event.h"
++#include "third_party/blink/public/common/input/web_mouse_event.h"
++#include "third_party/blink/public/common/input/web_mouse_wheel_event.h"
++#include "third_party/blink/public/common/input/web_pointer_event.h"
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
++
+ #include "third_party/blink/public/common/input/web_coalesced_input_event.h"
+ #include "third_party/blink/renderer/core/accessibility/ax_object_cache.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+@@ -17,10 +30,106 @@
+ 
+ namespace blink {
+ 
++#ifdef BLINK_AFEYE
++namespace {
++
++// afeye (0015): THE physical-input master funnel. Every WebInputEvent that
++// arrives at this frame passes HandleInputEvent exactly once - mouse, wheel,
++// keyboard, gesture, pointer (incl. touch/pen). This closes three blind
++// spots 0009 could not see:
++//   1. kFromDebugger (1<<23) - the ONLY provenance marker for CDP-injected
++//      input. isTrusted is TRUE for Playwright/Puppeteer Input.dispatch*
++//      events (they ride the real browser input pipeline), so the kind-24
++//      EventDispatcher flag cannot tell automation from human. The bit is
++//      set in devtools_input_handler.cc and survives the mojo round-trip.
++//   2. wheel raw deltas - scroll cadence, a first-class human-likeness
++//      signal, previously invisible.
++//   3. gesture types - tap/scroll/fling = the REAL mobile click/scroll.
++// Zero allocation: snprintf into stack scratch, same discipline as 0009.
++void AfeyeLogRawInput(const WebInputEvent& event) {
++  static std::atomic<uint64_t> g_afeye_rawin{0};
++  static bool g_afeye_rawin_off = []() {
++    const char* v = ::getenv("AFEYE_TRACE_INPUT");
++    return v != nullptr && *v != '\0' && v[0] == '0';
++  }();
++  if (g_afeye_rawin_off) return;
++  if (g_afeye_rawin.fetch_add(1, std::memory_order_relaxed) >= 4000000) {
++    return;
++  }
++  const int afeye_mods = static_cast<int>(event.GetModifiers());
++  const int afeye_dbg =
++      (afeye_mods & static_cast<int>(WebInputEvent::Modifiers::kFromDebugger))
++          ? 1
++          : 0;
++  char afeye_buf[224];
++  int afeye_n = std::snprintf(afeye_buf, sizeof(afeye_buf),
++                              "input/raw type=%.24s mods=%d dbg=%d",
++                              WebInputEvent::GetName(event.GetType()),
++                              afeye_mods, afeye_dbg);
++  if (afeye_n <= 0) return;
++  switch (event.GetType()) {
++    case WebInputEvent::Type::kMouseMove:
++    case WebInputEvent::Type::kMouseDown:
++    case WebInputEvent::Type::kMouseUp: {
++      const auto& afeye_m = static_cast<const WebMouseEvent&>(event);
++      std::snprintf(afeye_buf + afeye_n, sizeof(afeye_buf) - afeye_n,
++                    " x=%.1f y=%.1f sx=%.1f sy=%.1f btn=%d clicks=%d",
++                    afeye_m.PositionInWindow().x(),
++                    afeye_m.PositionInWindow().y(),
++                    afeye_m.PositionInScreen().x(),
++                    afeye_m.PositionInScreen().y(),
++                    static_cast<int>(afeye_m.button), afeye_m.ClickCount());
++      break;
++    }
++    case WebInputEvent::Type::kMouseWheel: {
++      const auto& afeye_w = static_cast<const WebMouseWheelEvent&>(event);
++      std::snprintf(afeye_buf + afeye_n, sizeof(afeye_buf) - afeye_n,
++                    " dx=%.1f dy=%.1f phase=%d",
++                    afeye_w.delta_x, afeye_w.delta_y,
++                    static_cast<int>(afeye_w.phase));
++      break;
++    }
++    case WebInputEvent::Type::kRawKeyDown:
++    case WebInputEvent::Type::kKeyDown:
++    case WebInputEvent::Type::kKeyUp:
++    case WebInputEvent::Type::kChar: {
++      const auto& afeye_k = static_cast<const WebKeyboardEvent&>(event);
++      std::snprintf(afeye_buf + afeye_n, sizeof(afeye_buf) - afeye_n,
++                    " vk=%d code=%d key=%u", afeye_k.windows_key_code,
++                    afeye_k.dom_code, static_cast<unsigned>(afeye_k.dom_key));
++      break;
++    }
++    case WebInputEvent::Type::kPointerDown:
++    case WebInputEvent::Type::kPointerUp:
++    case WebInputEvent::Type::kPointerMove: {
++      const auto& afeye_p = static_cast<const WebPointerEvent&>(event);
++      std::snprintf(afeye_buf + afeye_n, sizeof(afeye_buf) - afeye_n,
++                    " pid=%u ptype=%d x=%.1f y=%.1f pressure=%.2f",
++                    afeye_p.unique_pointer_id,
++                    static_cast<int>(afeye_p.pointer_type),
++                    afeye_p.PositionInWindow().x(),
++                    afeye_p.PositionInWindow().y(), afeye_p.pressure);
++      break;
++    }
++    default:
++      break;
++  }
++  blink::afeye::EmitStr(blink::afeye::kInput, blink::afeye::NowNs(),
++                        afeye_buf);
++}
++
++}  // namespace
++#endif
++
+ WebInputEventResult WidgetEventHandler::HandleInputEvent(
+     const WebCoalescedInputEvent& coalesced_event,
+     LocalFrame* root) {
+   const WebInputEvent& event = coalesced_event.Event();
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    AfeyeLogRawInput(event);
++  }
++#endif
+   if (root) {
+     Document* document = root->GetDocument();
+     DCHECK(document);
