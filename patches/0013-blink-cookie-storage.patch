@@ -1,0 +1,115 @@
+--- a/third_party/blink/renderer/core/dom/document.cc
++++ b/third_party/blink/renderer/core/dom/document.cc
+@@ -29,6 +29,12 @@
+ 
+ #include "third_party/blink/renderer/core/dom/document.h"
+ 
++#ifdef BLINK_AFEYE
++#include <cstdio>
++
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
++
+ #include <algorithm>
+ #include <memory>
+ #include <optional>
+@@ -6844,7 +6850,21 @@ String Document::cookie(ExceptionState& exception_state) const {
+     CountUse(WebFeature::kFileAccessedCookies);
+   }
+ 
+-  return cookie_jar_->Cookies();
++  String afeye_cookies = cookie_jar_->Cookies();
++#ifdef BLINK_AFEYE
++  // afeye (0013): document.cookie READ. kind-29 logs the call by name; this
++  // captures the VALUE - the cookie jar the challenge token (cf_clearance,
++  // DataDome, Kasada) lives in. Capped to the head of the string (the token
++  // names+values are what matter, not a multi-KB analytics tail).
++  if (blink::afeye::Enabled() && !afeye_cookies.empty()) {
++    char afeye_buf[1024];
++    std::snprintf(afeye_buf, sizeof(afeye_buf), "cookie-get len=%u %.960s",
++                  afeye_cookies.length(), afeye_cookies.Utf8().c_str());
++    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
++  return afeye_cookies;
+ }
+ 
+ void Document::setCookie(const String& value, ExceptionState& exception_state) {
+@@ -6869,6 +6889,17 @@ void Document::setCookie(const String& value, ExceptionState& exception_state) {
+     UseCounter::Count(*this, WebFeature::kFileAccessedCookies);
+   }
+ 
++#ifdef BLINK_AFEYE
++  // afeye (0013): document.cookie WRITE - the set-cookie the page itself
++  // plants (challenge ack, first-party token). Head-capped like the getter.
++  if (blink::afeye::Enabled() && !value.empty()) {
++    char afeye_buf[1024];
++    std::snprintf(afeye_buf, sizeof(afeye_buf), "cookie-set len=%u %.960s",
++                  value.length(), value.Utf8().c_str());
++    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
+   if (cookie_jar_->SetCookie(value)) {
+     IncrementCookieModificationCount();
+   }
+--- a/third_party/blink/renderer/modules/storage/storage_area.cc
++++ b/third_party/blink/renderer/modules/storage/storage_area.cc
+@@ -25,6 +25,12 @@
+ 
+ #include "third_party/blink/renderer/modules/storage/storage_area.h"
+ 
++#ifdef BLINK_AFEYE
++#include <cstdio>
++
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
++
+ #include "base/feature_list.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/trace_event/trace_event.h"
+@@ -116,7 +122,22 @@ String StorageArea::getItem(const String& key,
+     exception_state.ThrowSecurityError(StorageArea::kAccessDeniedMessage);
+     return String();
+   }
+-  return cached_area_->GetItem(key);
++  String afeye_item = cached_area_->GetItem(key);
++#ifdef BLINK_AFEYE
++  // afeye (0013): localStorage/sessionStorage getItem VALUE - antifraud parks
++  // the base fingerprint, the eval-chunk closure, or the challenge token here
++  // at init and reads it back at send time (the store-then-send pattern the
++  // fixed net-window drops). kind-29 names the call; this captures key+value.
++  if (blink::afeye::Enabled() && !key.empty()) {
++    char afeye_buf[1024];
++    std::snprintf(afeye_buf, sizeof(afeye_buf), "storage-get key=%.128s vlen=%u %.800s",
++                  key.Utf8().c_str(), afeye_item.length(),
++                  afeye_item.Utf8().c_str());
++    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
++  return afeye_item;
+ }
+ 
+ NamedPropertySetterResult StorageArea::setItem(
+@@ -127,6 +148,19 @@ NamedPropertySetterResult StorageArea::setItem(
+     exception_state.ThrowSecurityError(StorageArea::kAccessDeniedMessage);
+     return NamedPropertySetterResult::kIntercepted;
+   }
++#ifdef BLINK_AFEYE
++  // afeye (0013): localStorage/sessionStorage setItem VALUE - the store half
++  // of store-then-send. Captures key + value head so the content-slice
++  // backward pass can link this stored blob to the later crypto/send that
++  // consumed it.
++  if (blink::afeye::Enabled() && !key.empty()) {
++    char afeye_buf[1024];
++    std::snprintf(afeye_buf, sizeof(afeye_buf), "storage-set key=%.128s vlen=%u %.800s",
++                  key.Utf8().c_str(), value.length(), value.Utf8().c_str());
++    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
+   if (!cached_area_->SetItem(key, value, this)) {
+     QuotaExceededError::Throw(
+         exception_state,

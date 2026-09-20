@@ -56,7 +56,7 @@
 //! stream; the index keeps every ts.
 
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -84,6 +84,7 @@ pub struct SinkFilterStats {
     pub token_chains: u64,
     pub dead_end_chains: u64,
     pub net_adjacent_chains: u64,
+    pub content_sink_chains: u64,
 }
 
 /// sink calls that mark a chain as reaching the collector / the network
@@ -185,6 +186,43 @@ const NET_FP_WINDOW_NS: u64 = 5_000_000_000;
 /// lookback for a wasm-instantiate to still belong to a module
 const WASM_INST_WINDOW_NS: u64 = 5_000_000_000;
 
+// --- v8 content-based backward slice (the net-window fix) -----------------
+// The v7 `net-window` signal is a FIXED 5 s timer before a send. That drops
+// the fp-init phase: Cloudflare/DataDome/Kasada collect the base fingerprint
+// in the first ~200 ms, stash it (IndexedDB via structured-clone, or a
+// closure), and only encrypt+send it 10-30 s later on a focus/mousemove/
+// captcha-decision event. A timer window throws that init chain into the
+// dead-end bucket.
+//
+// Encryption destroys content (ciphertext != plaintext), but the PLAINTEXT
+// records still match byte-for-byte across the gap: the IDB put payload
+// (kind-15 structured-clone, "ssv") IS the same bytes the later
+// SubtleCrypto.encrypt/sign raw_data (kind-11 crypto-op) carries, and the
+// net req-body span (kind-17) is the upload that left. So we link payload
+// records by CONTENT (blake3 over fixed windows), not by clock: any payload
+// record sharing a content-run with a SINK record (payload-forming crypto
+// or an upload body) is "sink-linked", no matter how far apart in time. A
+// chain that materialized while a sink-linked payload was written feeds the
+// token -> `content-sink` signal. This is the backward slice the fixed timer
+// could not express.
+/// content-run window: blake3 over this many bytes of a payload
+const CONTENT_RUN_BYTES: usize = 32;
+/// content-run stride (< window -> overlapping runs survive byte-offset
+/// between the stored blob and the re-read plaintext)
+const CONTENT_RUN_STEP: usize = 16;
+/// hard cap on runs per record (bounded memory on big blobs)
+const CONTENT_MAX_RUNS: usize = 8192;
+/// grace around a sink-linked payload's timestamp within which a chain that
+/// materialized counts as feeding it
+const CONTENT_LINK_GRACE_NS: u64 = 200_000_000;
+/// hard bound on payload records walked for the content slice (memory)
+const CONTENT_MAX_RECORDS: usize = 50_000;
+/// hard bound on distinct sink runs retained (32 B each -> ~128 MB ceiling)
+const CONTENT_MAX_TOTAL_RUNS: usize = 4_000_000;
+/// crypto-op tags whose raw_data is payload-forming for the outbound token
+/// (decrypt is inbound; getRandomValues is a nonce source, not the payload)
+const SINK_CRYPTO_OPS: &[&str] = &["encrypt", "sign", "deriveBits", "digest"];
+
 #[derive(Debug)]
 struct Rec {
     ts: u64,
@@ -270,10 +308,52 @@ fn overlaps_net_window(net_ts: &[u64], first_ts: u64, last_ts: u64) -> bool {
     a < net_ts.len() && net_ts[a] <= hi
 }
 
+/// v8 content-sink: does this chain's materialization window overlap any
+/// SINK-LINKED payload's timestamp? Unlike overlaps_net_window the link is
+/// by CONTENT (a payload that shares bytes with a crypto/upload sink), so
+/// the chain is credited no matter how long before the actual send it ran.
+/// Chain window: [first_ts - grace, last_ts + FP_GRACE + grace].
+fn overlaps_content_bridge(content_ts: &[u64], first_ts: u64, last_ts: u64) -> bool {
+    let lo = first_ts.saturating_sub(CONTENT_LINK_GRACE_NS);
+    let hi = last_ts
+        .saturating_add(FP_GRACE_NS)
+        .saturating_add(CONTENT_LINK_GRACE_NS);
+    let a = content_ts.partition_point(|t| *t < lo);
+    a < content_ts.len() && content_ts[a] <= hi
+}
+
+/// true when every byte is identical (zero runs, padding) - such runs collide
+/// across unrelated records and would create false content links.
+fn is_monotone(b: &[u8]) -> bool {
+    !b.is_empty() && b.iter().all(|&x| x == b[0])
+}
+
+/// blake3 content-runs of a payload body: fixed windows, overlapping stride,
+/// monotone windows skipped. Two records sharing a run carry the same bytes
+/// somewhere in their body - the data-dependency the backward slice follows.
+fn content_runs(body: &[u8]) -> Vec<[u8; 32]> {
+    let mut out: Vec<[u8; 32]> = Vec::new();
+    if body.len() < CONTENT_RUN_BYTES {
+        if !is_monotone(body) && !body.is_empty() {
+            out.push(*blake3::hash(body).as_bytes());
+        }
+        return out;
+    }
+    let mut off = 0usize;
+    while off + CONTENT_RUN_BYTES <= body.len() && out.len() < CONTENT_MAX_RUNS {
+        let win = &body[off..off + CONTENT_RUN_BYTES];
+        if !is_monotone(win) {
+            out.push(*blake3::hash(win).as_bytes());
+        }
+        off += CONTENT_RUN_STEP;
+    }
+    out
+}
+
 /// v7: the token-forming signals of a chain (why it is NOT a dead end).
 /// Empty result = dead end: the code executed, but nothing it produced is
 /// observable in any challenge-token-feeding position.
-fn chain_signals(c: &Chain, net_ts: &[u64]) -> (Vec<String>, bool) {
+fn chain_signals(c: &Chain, net_ts: &[u64], content_ts: &[u64]) -> (Vec<String>, bool, bool) {
     let mut signals: Vec<String> = Vec::new();
     if c.hot_pattern {
         signals.push("sink-call".into());
@@ -291,7 +371,15 @@ fn chain_signals(c: &Chain, net_ts: &[u64]) -> (Vec<String>, bool) {
     if net_adjacent {
         signals.push("net-window".into());
     }
-    (signals, net_adjacent)
+    // v8: content-linked backward slice - the chain materialized while a
+    // payload that shares bytes with a crypto/upload sink was written. Catches
+    // the fp-init -> IDB/closure -> encrypt -> send-30s-later chain the fixed
+    // net-window drops.
+    let content_sink = overlaps_content_bridge(content_ts, c.first_ts, c.last_ts);
+    if content_sink {
+        signals.push("content-sink".into());
+    }
+    (signals, net_adjacent, content_sink)
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +545,7 @@ struct Chain {
     token_forming: bool,
     signals: Vec<String>,
     net_adjacent: bool,
+    content_sink: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -498,6 +587,127 @@ fn latest_trigger_before(recs: &[Rec], ts: u64, window_ns: u64) -> Option<Trigge
 /// first FP_API_NEEDLES substring the kind-29 "what" carries, if any
 fn fp_needle_of(txt: &str) -> Option<&'static str> {
     FP_API_NEEDLES.iter().copied().find(|n| txt.contains(n))
+}
+
+/// v8: one kind-23 input record -> (event type, optional widget coords).
+/// Formats (0009): "input/mouse <type> x=.. y=.. sx=.. sy=.. btn=.. clicks=..
+/// mods=.." and "input/key type=.. vk=.. code=.. key=.. mods=..". Coord parse
+/// is lossy-tolerant: any unparseable value yields None, never a wrong point.
+fn parse_input_rec(txt: &str) -> Option<(&str, Option<(f64, f64)>)> {
+    if let Some(rest) = txt.strip_prefix("input/mouse ") {
+        let etype = rest.split(' ').next().unwrap_or("?");
+        let mut x = None;
+        let mut y = None;
+        for tok in rest.split(' ') {
+            if let Some(v) = tok.strip_prefix("x=") {
+                x = v.parse::<f64>().ok();
+            } else if let Some(v) = tok.strip_prefix("y=") {
+                y = v.parse::<f64>().ok();
+            }
+        }
+        Some((etype, match (x, y) {
+            (Some(x), Some(y)) => Some((x, y)),
+            _ => None,
+        }))
+    } else if txt.starts_with("input/key ") {
+        Some(("key", None))
+    } else {
+        None
+    }
+}
+
+fn median_of(mut v: Vec<u64>) -> Option<u64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    Some(v[v.len() / 2])
+}
+
+/// v8: the mouse/keyboard cadence summary - "how often input went, where,
+/// and when". Built from the kind-23 stream (0009, at the source, before any
+/// DOM decision), so it reflects what the OS pipeline delivered, not what JS
+/// happened to log.
+struct InputCadence {
+    total: u64,
+    per_type: BTreeMap<String, u64>,
+    median_delta_us: Option<u64>,
+    p90_delta_us: Option<u64>,
+    path_px: u64,
+    span_ms: u64,
+    /// ts-sorted (ts, type, Option<(x,y)>) for per-request correlation
+    events: Vec<(u64, &'static str, Option<(f64, f64)>)>,
+}
+
+fn build_input_cadence(recs: &[Rec]) -> InputCadence {
+    let mut per_type: BTreeMap<String, u64> = BTreeMap::new();
+    let mut deltas: Vec<u64> = Vec::new();
+    let mut path_px = 0.0f64;
+    let mut prev_xy: Option<(f64, f64)> = None;
+    let mut prev_ts = 0u64;
+    let mut first_ts = 0u64;
+    let mut last_ts = 0u64;
+    let mut events: Vec<(u64, &'static str, Option<(f64, f64)>)> = Vec::new();
+    let mut total = 0u64;
+    for r in recs {
+        if r.kind != "input" {
+            continue;
+        }
+        let txt = r.txt.as_deref().unwrap_or("");
+        let (etype, xy) = match parse_input_rec(txt) {
+            Some(v) => v,
+            None => continue,
+        };
+        total += 1;
+        *per_type.entry(etype.to_string()).or_insert(0) += 1;
+        if first_ts == 0 {
+            first_ts = r.ts;
+        }
+        if prev_ts != 0 && r.ts > prev_ts {
+            deltas.push((r.ts - prev_ts) / 1000); // us
+        }
+        prev_ts = r.ts;
+        last_ts = r.ts;
+        if let Some((x, y)) = xy {
+            if let Some((px, py)) = prev_xy {
+                path_px += ((x - px) * (x - px) + (y - py) * (y - py)).sqrt();
+            }
+            prev_xy = Some((x, y));
+        }
+        // static etype keys: the two formats are closed ("input/mouse X"
+        // types are browser-fixed; anything else falls to "other")
+        let key: &'static str = match etype {
+            "mousemove" => "mousemove",
+            "mousedown" => "mousedown",
+            "mouseup" => "mouseup",
+            "click" => "click",
+            "wheel" => "wheel",
+            "key" => "key",
+            _ => "other",
+        };
+        events.push((r.ts, key, xy));
+    }
+    let n = deltas.len();
+    let p90 = if n > 0 {
+        let mut d = deltas.clone();
+        d.sort_unstable();
+        Some(d[((n as f64) * 0.9) as usize])
+    } else {
+        None
+    };
+    InputCadence {
+        total,
+        per_type,
+        median_delta_us: median_of(deltas),
+        p90_delta_us: p90,
+        path_px: path_px as u64,
+        span_ms: if first_ts != 0 && last_ts >= first_ts {
+            (last_ts - first_ts) / 1_000_000
+        } else {
+            0
+        },
+        events,
+    }
 }
 
 pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
@@ -644,6 +854,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                         token_forming: false,
                         signals: Vec::new(),
                         net_adjacent: false,
+                        content_sink: false,
                     };
                     chain_list.push(c);
                     chains.insert(key, idx);
@@ -804,10 +1015,83 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         .filter(|r| r.kind == "net-request")
         .map(|r| r.ts)
         .collect();
+
+    // ---- v8 content-based backward slice -----------------------------------
+    // Build the set of content-runs that belong to SINK records (payload-forming
+    // crypto: encrypt/sign/deriveBits/digest raw_data, and upload bodies), then
+    // credit every payload record that shares a run with that set. A chain that
+    // materialized while a credited payload was written feeds the token even
+    // when the actual send is 10-30 s later - the case the fixed net-window
+    // drops. Payload kinds read here (per-record .bin, never batched):
+    //   crypto-op (kind 11)      - "encrypt"/"sign"/... + NUL + raw_data
+    //   structured-clone (kind 15)- "ssv" + NUL + IDB/postMessage payload
+    //   net-request (kind 17)     - "req-body" + NUL + upload bytes
+    let payload_kinds = ["crypto-op", "structured-clone", "net-request"];
+    let mut sink_runs: HashSet<[u8; 32]> = HashSet::new();
+    let mut carriers: Vec<(u64, Vec<[u8; 32]>)> = Vec::new();
+    let mut payload_records = 0usize;
+    let mut total_runs = 0usize;
+    let mut sink_full = false;
+    for r in &recs {
+        if !payload_kinds.contains(&r.kind.as_str()) {
+            continue;
+        }
+        if payload_records >= CONTENT_MAX_RECORDS {
+            break;
+        }
+        let payload = match read_payload(raw_dir, r) {
+            Some(p) => p,
+            None => continue,
+        };
+        let (tag, body) = name_of(&payload);
+        if body.is_empty() {
+            continue;
+        }
+        payload_records += 1;
+        let is_crypto_sink =
+            r.kind == "crypto-op" && SINK_CRYPTO_OPS.iter().any(|o| tag.contains(o));
+        let is_upload = r.kind == "net-request" && tag == "req-body";
+        // runs are retained for the carrier pass ONLY while the global
+        // budget lasts - past CONTENT_MAX_TOTAL_RUNS total retained runs
+        // later records contribute nothing (empty vec), keeping memory
+        // bounded at ~128 MB regardless of blob sizes.
+        let mut runs = Vec::new();
+        if total_runs < CONTENT_MAX_TOTAL_RUNS {
+            runs = content_runs(&body);
+            if runs.len() > CONTENT_MAX_TOTAL_RUNS - total_runs {
+                runs.truncate(CONTENT_MAX_TOTAL_RUNS - total_runs);
+            }
+            total_runs += runs.len();
+        }
+        if (is_crypto_sink || is_upload) && !sink_full {
+            for h in &runs {
+                if sink_runs.len() >= CONTENT_MAX_TOTAL_RUNS {
+                    sink_full = true;
+                    break;
+                }
+                sink_runs.insert(*h);
+            }
+        }
+        carriers.push((r.ts, runs));
+    }
+    // carriers sharing >=1 run with the sink set are "sink-linked": their
+    // timestamp marks a position where token-feeding bytes were handled.
+    let mut content_ts: Vec<u64> = Vec::new();
+    for (ts, runs) in &carriers {
+        if runs.iter().any(|h| sink_runs.contains(h)) {
+            content_ts.push(*ts);
+        }
+    }
+    content_ts.sort_unstable();
+    content_ts.dedup();
+
     for c in &mut chain_list {
-        let (signals, net_adjacent) = chain_signals(c, &net_ts);
+        let (signals, net_adjacent, content_sink) = chain_signals(c, &net_ts, &content_ts);
         if net_adjacent {
             stats.net_adjacent_chains += 1;
+        }
+        if content_sink {
+            stats.content_sink_chains += 1;
         }
         if !signals.is_empty() {
             c.token_forming = true;
@@ -817,6 +1101,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         }
         c.signals = signals;
         c.net_adjacent = net_adjacent;
+        c.content_sink = content_sink;
     }
 
     let mut hot = 0usize;
@@ -868,6 +1153,9 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         if !c.signals.is_empty() {
             entry["signals"] = json!(c.signals);
         }
+        if c.content_sink {
+            entry["content_sink"] = json!(true);
+        }
         if let Some(t) = &c.trigger {
             entry["trigger"] = json!({
                 "kind": t.kind,
@@ -900,6 +1188,9 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         }
         chain_report.push(entry);
     }
+
+    // ---- v8 input cadence: how often the mouse went, where, when -----------
+    let cadence = build_input_cadence(&recs);
 
     // ---- 4: timing chains: trigger -> network ------------------------------
     // recs are ts-sorted; a moving cursor finds, for every network request,
@@ -956,6 +1247,28 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         if cb > ca {
             entry["clock_5s"] = json!((cb - ca) as u64);
         }
+        // v8: the human-input fact feeding THIS send - how many mouse/key
+        // events landed in the 5 s window before it, how many were moves,
+        // and the median inter-event gap. A send with zero input behind it
+        // is a bot-shaped cadence; a dense mousemove storm is a bot-shaped
+        // the other way. Both readable here without the raw stream.
+        let ia = cadence.events.partition_point(|e| e.0 < lo);
+        let ib = cadence.events.partition_point(|e| e.0 <= r.ts);
+        if ib > ia {
+            let slice = &cadence.events[ia..ib];
+            let mut deltas: Vec<u64> = Vec::new();
+            for w in slice.windows(2) {
+                if w[1].0 > w[0].0 {
+                    deltas.push((w[1].0 - w[0].0) / 1000);
+                }
+            }
+            entry["input_5s"] = json!({
+                "n": slice.len(),
+                "moves": slice.iter().filter(|e| e.1 == "mousemove").count(),
+                "keys": slice.iter().filter(|e| e.1 == "key").count(),
+                "median_delta_us": median_of(deltas),
+            });
+        }
         if let Some(t0) = nav_start {
             if r.ts >= t0 {
                 entry["t_net_rel_ms"] = json!((r.ts - t0) / 1_000_000);
@@ -989,7 +1302,8 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "token_forming": stats.token_chains,
             "dead_end": stats.dead_end_chains,
             "net_adjacent": stats.net_adjacent_chains,
-            "rule": "token-forming = sink-call | handler-born | fp-probes>=2 | integrity-check | net-window; dead ends stay whole in the raw run zip",
+            "content_sink": stats.content_sink_chains,
+            "rule": "token-forming = sink-call | handler-born | fp-probes>=2 | integrity-check | net-window | content-sink; content-sink is the v8 data-dependency backward slice (payload records sharing content-runs with a crypto/upload sink, no timer) - dead ends stay whole in the raw run zip",
         },
         "taint": {
             "fp_reads": stats.fp_reads,
@@ -997,6 +1311,14 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "integrity_checks": stats.integrity_checks,
             "integrity_chains": stats.integrity_chains,
             "clock_reads": clock_ts.len(),
+        },
+        "input_cadence": {
+            "total": cadence.total,
+            "per_type": cadence.per_type,
+            "median_delta_us": cadence.median_delta_us,
+            "p90_delta_us": cadence.p90_delta_us,
+            "path_px": cadence.path_px,
+            "span_ms": cadence.span_ms,
         },
         "wasm": {
             "modules": stats.wasm_modules,
@@ -1215,6 +1537,7 @@ mod tests {
             token_forming: false,
             signals: Vec::new(),
             net_adjacent: false,
+            content_sink: false,
         }
     }
 
@@ -1222,38 +1545,39 @@ mod tests {
     fn dead_end_classification() {
         // no signals anywhere: dead end
         let c = chain_with(false, false, 0, 0);
-        let (s, net) = chain_signals(&c, &[]);
+        let (s, net, content) = chain_signals(&c, &[], &[]);
         assert!(s.is_empty());
         assert!(!net);
+        assert!(!content);
 
         // sink-call in the chain's own code
         let c = chain_with(true, false, 0, 0);
-        let (s, _) = chain_signals(&c, &[]);
+        let (s, _, _) = chain_signals(&c, &[], &[]);
         assert_eq!(s, vec!["sink-call".to_string()]);
 
         // handler-born (compiled inside an event/timer)
         let c = chain_with(false, true, 0, 0);
-        let (s, _) = chain_signals(&c, &[]);
+        let (s, _, _) = chain_signals(&c, &[], &[]);
         assert_eq!(s, vec!["handler-born".to_string()]);
 
         // two distinct fingerprint probes during materialization
         let c = chain_with(false, false, 2, 0);
-        let (s, _) = chain_signals(&c, &[]);
+        let (s, _, _) = chain_signals(&c, &[], &[]);
         assert_eq!(s, vec!["fp-probes".to_string()]);
         // ONE probe alone is not enough (analytics reads one field too)
         let c = chain_with(false, false, 1, 0);
-        let (s, _) = chain_signals(&c, &[]);
+        let (s, _, _) = chain_signals(&c, &[], &[]);
         assert!(s.is_empty());
 
         // integrity self-checks in the window
         let c = chain_with(false, false, 0, 3);
-        let (s, _) = chain_signals(&c, &[]);
+        let (s, _, _) = chain_signals(&c, &[], &[]);
         assert_eq!(s, vec!["integrity-check".to_string()]);
 
         // net-window: chain materialized right before a send
         let c = chain_with(false, false, 0, 0);
         let net_ts = vec![100_000]; // FP_GRACE_NS + NET_FP_WINDOW_NS spans it
-        let (s, net) = chain_signals(&c, &net_ts);
+        let (s, net, _) = chain_signals(&c, &net_ts, &[]);
         assert_eq!(s, vec!["net-window".to_string()]);
         assert!(net);
     }

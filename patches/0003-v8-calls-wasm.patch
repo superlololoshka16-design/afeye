@@ -11,7 +11,7 @@
  #include "src/objects/value-serializer.h"
  #include "src/parsing/parse-info.h"
  #include "src/parsing/parser.h"
-@@ -5718,6 +5722,10 @@
+@@ -5718,6 +5722,10 @@ MaybeLocal<Object> Function::NewInstanceWithSideEffectType(
        Utils::ToMaybeLocal(i::Execution::New(i_isolate, self, self, args)));
  }
  
@@ -22,7 +22,7 @@
  MaybeLocal<v8::Value> Function::Call(v8::Isolate* isolate,
                                       Local<Context> context,
                                       v8::Local<v8::Value> recv, int argc,
-@@ -10363,6 +10371,15 @@
+@@ -10363,6 +10371,15 @@ Isolate* Isolate::New(const IsolateGroup& group,
                        const Isolate::CreateParams& params) {
    Isolate* v8_isolate = Allocate(group);
    Initialize(v8_isolate, params);
@@ -38,91 +38,9 @@
    return v8_isolate;
  }
  
---- a/v8/src/wasm/wasm-engine.cc
-+++ b/v8/src/wasm/wasm-engine.cc
-@@ -3,6 +3,9 @@
- // found in the LICENSE file.
- 
- #include "src/wasm/wasm-engine.h"
-+#ifdef V8_AFEYE
-+#include "src/afeye/sink.h"
-+#endif
- 
- #include <optional>
- 
-@@ -613,6 +616,14 @@
-     base::Vector<const char> source_url) {
-   int compilation_id = next_compilation_id_.fetch_add(1);
-   TRACE_EVENT("v8.wasm", "wasm.SyncCompile", "id", compilation_id);
-+#ifdef V8_AFEYE
-+  if (v8::afeye::Enabled() && bytes.size() > 0) {
-+    const uint8_t* p = bytes.begin();
-+    uint32_t n = static_cast<uint32_t>(
-+        bytes.size() > 0xFFFFF0 ? 0xFFFFF0 : bytes.size());
-+    v8::afeye::Emit(v8::afeye::kWasmModule, v8::afeye::NowNs(), p, n);
-+  }
-+#endif
-   v8::metrics::Recorder::ContextId context_id =
-       isolate->GetOrRegisterRecorderContextId(isolate->native_context());
-   std::shared_ptr<WasmModule> module;
-@@ -730,6 +741,14 @@
-     const char* api_method_name_for_errors) {
-   int compilation_id = next_compilation_id_.fetch_add(1);
-   TRACE_EVENT("v8.wasm", "wasm.AsyncCompile", "id", compilation_id);
-+#ifdef V8_AFEYE
-+  if (v8::afeye::Enabled() && bytes.size() > 0) {
-+    const uint8_t* p = bytes.begin();
-+    uint32_t n = static_cast<uint32_t>(
-+        bytes.size() > 0xFFFFF0 ? 0xFFFFF0 : bytes.size());
-+    v8::afeye::Emit(v8::afeye::kWasmModule, v8::afeye::NowNs(), p, n);
-+  }
-+#endif
- 
-   if (v8_flags.wasm_jitless) {
-     // Asynchronous compilation disabled; fall back on synchronous compilation.
---- a/v8/src/wasm/module-instantiate.cc
-+++ b/v8/src/wasm/module-instantiate.cc
-@@ -3,6 +3,10 @@
- // found in the LICENSE file.
- 
- #include "src/wasm/module-instantiate.h"
-+#ifdef V8_AFEYE
-+#include <cstdio>
-+#include "src/afeye/sink.h"
-+#endif
- 
- #include <inttypes.h>
- #include <stdint.h>
-@@ -2003,8 +2007,26 @@
-   const WellKnownImportsList& preknown_imports =
-       module_->type_feedback.well_known_imports;
-   int num_imports = static_cast<int>(module_->import_table.size());
-+#ifdef V8_AFEYE
-+  if (v8::afeye::Enabled()) {
-+    char afeye_buf[96];
-+    std::snprintf(afeye_buf, sizeof(afeye_buf), "wasm-instantiate imports=%d",
-+                  num_imports);
-+    v8::afeye::EmitStr(v8::afeye::kWasmInstance, v8::afeye::NowNs(),
-+                       afeye_buf);
-+  }
-+#endif
-   for (int index = 0; index < num_imports; ++index) {
-     const WasmImport& import = module_->import_table[index];
-+#ifdef V8_AFEYE
-+    if (v8::afeye::Enabled()) {
-+      char afeye_ib[160];
-+      std::snprintf(afeye_ib, sizeof(afeye_ib), "wasm-import %s kind=%d",
-+                    ImportName(index).c_str(), static_cast<int>(import.kind));
-+      v8::afeye::EmitStr(v8::afeye::kWasmInstance, v8::afeye::NowNs(),
-+                         afeye_ib);
-+    }
-+#endif
- 
-     DirectHandle<Object> value = sanitized_imports_[index];
- 
 --- a/v8/src/execution/execution.cc
 +++ b/v8/src/execution/execution.cc
-@@ -4,6 +4,15 @@
+@@ -4,6 +4,13 @@
  
  #include "src/execution/execution.h"
  
@@ -130,15 +48,29 @@
 +#include <atomic>
 +#include <cstdio>
 +#include <cstdlib>
-+#include <cstring>
-+#include <string>
 +#include "src/afeye/sink.h"
 +#endif
 +
  #include "include/cppgc/macros.h"
  #include "src/api/api-inl.h"
  #include "src/debug/debug.h"
-@@ -302,9 +311,67 @@
+@@ -12,6 +19,15 @@
+ #include "src/execution/vm-state-inl.h"
+ #include "src/logging/runtime-call-stats-scope.h"
+ 
++#ifdef V8_AFEYE
++// no-alloc heap-object reads for the Invoke funnel: script name + line come
++// straight off the Tagged<> heap objects under DisallowGarbageCollection, so
++// these inline accessor definitions must be visible. Placed AFTER the core
++// -inl.h chain above to keep V8 include order valid.
++#include "src/objects/script-inl.h"
++#include "src/objects/string-inl.h"
++#endif
++
+ #if V8_ENABLE_WEBASSEMBLY
+ #include "src/wasm/code-space-access.h"
+ #include "src/wasm/wasm-code-manager.h"
+@@ -302,9 +318,97 @@ MaybeDirectHandle<Context> NewScriptContext(
    return result;
  }
  
@@ -166,29 +98,59 @@
 +                              static_cast<unsigned>(params.args.size()),
 +                              params.is_construct ? " c=1" : "");
 +  if (afeye_n > 0 && IsJSFunction(*params.target)) {
-+    v8::Local<v8::Value> afeye_rv = v8::Utils::ToLocal(params.target);
-+    if (!afeye_rv.IsEmpty() && afeye_rv->IsFunction()) {
-+      v8::Local<v8::Function> afeye_fn = afeye_rv.As<v8::Function>();
-+      v8::ScriptOrigin afeye_origin = afeye_fn->GetScriptOrigin();
-+      v8::Local<v8::Value> afeye_rn = afeye_origin.ResourceName();
-+      int afeye_line = afeye_fn->GetScriptLineNumber();
++    // NO-ALLOC (v8): the previous body built a v8::ScriptOrigin, a
++    // v8::String::Utf8Value (heap) and a std::string PER Invoke. Invoke is
++    // THE C++->JS funnel - every Script::Run, microtask, reviver, comparator
++    // and v8-internal call crosses it, including callers running under GC.
++    // Reading script name + line through the internal Tagged<> objects under
++    // DisallowGarbageCollection touches only stack scratch: no Local, no
++    // HandleScope, no heap buffer, no isolate re-entry. Script::GetLineNumber
++    // (the member, not the DirectHandle static) runs under DisallowGC too -
++    // fast path reads the cached line_ends, slow path iterates the flat
++    // source; neither allocates.
++    DisallowGarbageCollection no_gc;
++    Tagged<JSFunction> afeye_fn = Cast<JSFunction>(*params.target);
++    Tagged<SharedFunctionInfo> afeye_sfi = afeye_fn->shared();
++    int afeye_line = 0;
++    const char* afeye_name = "native";
++    int afeye_name_len = 6;
++    char afeye_namebuf[201];
++    if (IsScript(afeye_sfi->script())) {
++      Tagged<Script> afeye_script = Cast<Script>(afeye_sfi->script());
++      afeye_line = afeye_script->GetLineNumber(afeye_sfi->StartPosition());
 +      if (afeye_line < 0) afeye_line = 0;
-+      std::string afeye_script;
-+      if (!afeye_rn.IsEmpty() && afeye_rn->IsString()) {
-+        v8::Local<v8::String> afeye_s = afeye_rn.As<v8::String>();
-+        v8::Isolate* afeye_api = reinterpret_cast<v8::Isolate*>(isolate);
-+        v8::String::Utf8Value afeye_uv(afeye_api, afeye_s);
-+        if (*afeye_uv) {
-+          size_t afeye_len = std::strlen(*afeye_uv);
++      Tagged<Object> afeye_nm = afeye_script->name();
++      if (IsString(afeye_nm)) {
++        String::FlatContent afeye_flat =
++            Cast<String>(afeye_nm)->GetFlatContent(no_gc);
++        if (afeye_flat.IsFlat()) {
++          uint32_t afeye_len = afeye_flat.length();
 +          if (afeye_len > 200) afeye_len = 200;
-+          afeye_script.assign(*afeye_uv, afeye_len);
++          if (afeye_flat.IsOneByte()) {
++            const uint8_t* afeye_p = afeye_flat.ToOneByteVector().begin();
++            for (uint32_t afeye_k = 0; afeye_k < afeye_len; ++afeye_k) {
++              uint8_t afeye_c = afeye_p[afeye_k];
++              afeye_namebuf[afeye_k] = (afeye_c >= 0x20 && afeye_c < 0x7f)
++                                           ? static_cast<char>(afeye_c)
++                                           : '?';
++            }
++          } else {
++            const base::uc16* afeye_p = afeye_flat.ToUC16Vector().begin();
++            for (uint32_t afeye_k = 0; afeye_k < afeye_len; ++afeye_k) {
++              base::uc16 afeye_c = afeye_p[afeye_k];
++              afeye_namebuf[afeye_k] = (afeye_c >= 0x20 && afeye_c < 0x7f)
++                                           ? static_cast<char>(afeye_c)
++                                           : '?';
++            }
++          }
++          afeye_namebuf[afeye_len] = '\0';
++          afeye_name = afeye_namebuf;
++          afeye_name_len = static_cast<int>(afeye_len);
 +        }
 +      }
-+      std::snprintf(afeye_buf + afeye_n, sizeof(afeye_buf) - afeye_n,
-+                    " script=%s:%d",
-+                    afeye_script.empty() ? "native" : afeye_script.c_str(),
-+                    afeye_line);
 +    }
++    std::snprintf(afeye_buf + afeye_n, sizeof(afeye_buf) - afeye_n,
++                  " script=%.*s:%d", afeye_name_len, afeye_name, afeye_line);
 +  }
 +  v8::afeye::EmitStr(v8::afeye::kCallCompleted, v8::afeye::NowNs(),
 +                     afeye_buf);
@@ -206,3 +168,85 @@
    DCHECK(!IsJSGlobalObject(*params.receiver));
    DCHECK_LE(params.args.size(), FixedArray::kMaxLength);
    DCHECK(!isolate->has_exception());
+--- a/v8/src/wasm/module-instantiate.cc
++++ b/v8/src/wasm/module-instantiate.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include "src/wasm/module-instantiate.h"
++#ifdef V8_AFEYE
++#include <cstdio>
++#include "src/afeye/sink.h"
++#endif
+ 
+ #include <inttypes.h>
+ #include <stdint.h>
+@@ -2003,8 +2007,26 @@ bool InstanceBuilder::ProcessImports() {
+   const WellKnownImportsList& preknown_imports =
+       module_->type_feedback.well_known_imports;
+   int num_imports = static_cast<int>(module_->import_table.size());
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled()) {
++    char afeye_buf[96];
++    std::snprintf(afeye_buf, sizeof(afeye_buf), "wasm-instantiate imports=%d",
++                  num_imports);
++    v8::afeye::EmitStr(v8::afeye::kWasmInstance, v8::afeye::NowNs(),
++                       afeye_buf);
++  }
++#endif
+   for (int index = 0; index < num_imports; ++index) {
+     const WasmImport& import = module_->import_table[index];
++#ifdef V8_AFEYE
++    if (v8::afeye::Enabled()) {
++      char afeye_ib[160];
++      std::snprintf(afeye_ib, sizeof(afeye_ib), "wasm-import %s kind=%d",
++                    ImportName(index).c_str(), static_cast<int>(import.kind));
++      v8::afeye::EmitStr(v8::afeye::kWasmInstance, v8::afeye::NowNs(),
++                         afeye_ib);
++    }
++#endif
+ 
+     DirectHandle<Object> value = sanitized_imports_[index];
+ 
+--- a/v8/src/wasm/wasm-engine.cc
++++ b/v8/src/wasm/wasm-engine.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "src/wasm/wasm-engine.h"
++#ifdef V8_AFEYE
++#include "src/afeye/sink.h"
++#endif
+ 
+ #include <optional>
+ 
+@@ -613,6 +616,14 @@ MaybeDirectHandle<WasmModuleObject> WasmEngine::SyncCompile(
+     base::Vector<const char> source_url) {
+   int compilation_id = next_compilation_id_.fetch_add(1);
+   TRACE_EVENT("v8.wasm", "wasm.SyncCompile", "id", compilation_id);
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled() && bytes.size() > 0) {
++    const uint8_t* p = bytes.begin();
++    uint32_t n = static_cast<uint32_t>(
++        bytes.size() > 0xFFFFF0 ? 0xFFFFF0 : bytes.size());
++    v8::afeye::Emit(v8::afeye::kWasmModule, v8::afeye::NowNs(), p, n);
++  }
++#endif
+   v8::metrics::Recorder::ContextId context_id =
+       isolate->GetOrRegisterRecorderContextId(isolate->native_context());
+   std::shared_ptr<WasmModule> module;
+@@ -730,6 +741,14 @@ void WasmEngine::AsyncCompile(
+     const char* api_method_name_for_errors) {
+   int compilation_id = next_compilation_id_.fetch_add(1);
+   TRACE_EVENT("v8.wasm", "wasm.AsyncCompile", "id", compilation_id);
++#ifdef V8_AFEYE
++  if (v8::afeye::Enabled() && bytes.size() > 0) {
++    const uint8_t* p = bytes.begin();
++    uint32_t n = static_cast<uint32_t>(
++        bytes.size() > 0xFFFFF0 ? 0xFFFFF0 : bytes.size());
++    v8::afeye::Emit(v8::afeye::kWasmModule, v8::afeye::NowNs(), p, n);
++  }
++#endif
+ 
+   if (v8_flags.wasm_jitless) {
+     // Asynchronous compilation disabled; fall back on synchronous compilation.

@@ -1,11 +1,70 @@
-# afeye chromium patch series v7
+# afeye chromium patch series v8
 
-**11 patches** against **Chromium 153.0.8010.52** (v8 rev
+**14 patches** against **Chromium 153.0.8010.52** (v8 rev
 `d1fed5cd7e3b114dea70f18b20d26f816322833d`). The whole series is
 re-verified to apply cumulatively with plain `git apply` against a
 pristine tree assembled from sources fetched at that tag
-(11/11; v7 hunks re-validated on freshly fetched pristine files for
-0001/0003/0006).
+(14/14; v8 hunks re-validated on freshly fetched pristine files for
+0001/0003/0004/0012/0013/0014).
+
+v8 is the **latency + blind-spot pass over v7**, four changes:
+
+1. **no-alloc hot hooks.** v7 logged the `Invoke` funnel (every C++->JS
+   entry - scripts, microtasks, revivers, comparators) and the
+   `FunctionPrototypeToString` integrity builtin through the PUBLIC v8
+   API: `GetScriptOrigin()` + `v8::String::Utf8Value` + `std::string`
+   per call. That is heap allocation + V8 handle creation inside the
+   hottest funnels in the engine, exactly where V8 internals run under
+   `DisallowGarbageCollection` / during GC bookkeeping - the class of
+   hook that costs milliseconds per page and can deadlock or OOM the
+   isolate. v8 rewrites both hooks onto the internal `Tagged<>` object
+   graph: `JSFunction -> shared() -> script()` name via
+   `String::GetFlatContent(no_gc)` copied into stack scratch, line via
+   the member `Script::GetLineNumber(pos)` (runs under DisallowGC:
+   cached `line_ends` fast path, flat-source slow path - no
+   allocation). Zero heap, zero handles, zero isolate re-entry; record
+   format unchanged (`call argc=N script=name:line` / `fnts name=..
+   script=..:N`). Bound functions now unwrap to their target in the
+   toString hook, so integrity probes of `bound(f)` name the real
+   callee instead of `?`.
+2. **the blind spots: performance.now(), canvas export, cookie values,
+   storage values.** Four surfaces antifraud actually uses were name-
+   only or invisible:
+   - `performance.now()` (0012): the high-resolution clock every PoW
+     loop and timing check reads. kind-33 only caught `Date.now()`.
+     Same env switch (`AFEYE_TRACE_CLOCK`), same 2M cap, same kind.
+   - `canvas.toDataURL` / `toBlob` (0012): THE canvas-fingerprint
+     readback. Hooked at `ToDataURLInternal` - the single funnel where
+     the encoded data URL materializes - logging mime + encoded length
+     (the result digest; no second render, the string already exists).
+     `toBlob` logs the ask (mime + geometry).
+   - `document.cookie` get/set VALUES (0013): the challenge token
+     store (cf_clearance and friends). kind-29 named the call; the
+     value was invisible. Head-capped at 960 bytes per record.
+   - `StorageArea` getItem/setItem VALUES (0013): localStorage /
+     sessionStorage - where antifraud parks the fingerprint at init
+     and reads it back at send time. Key + value head, kind 16.
+3. **content-based backward slice (the net-window fix, `src/sinkfilter.rs`).**
+   v7's `net-window` signal is a FIXED 5 s timer before a send.
+   Cloudflare/DataDome/Kasada collect the base fingerprint in the
+   first ~200 ms, stash it (IndexedDB via structured-clone, storage,
+   or a closure), and encrypt+send it 10-30 s later on a
+   focus/mousemove/captcha-decision event. The timer dropped that init
+   chain into the dead-end bucket. v8 links payload records BY
+   CONTENT: blake3 runs (32 B windows, 16 B stride, monotone windows
+   skipped) over crypto-op raw_data / structured-clone blobs /
+   req-body uploads; any record sharing a run with a SINK record
+   (payload-forming crypto encrypt/sign/deriveBits/digest, or an
+   upload body) is sink-linked regardless of the clock gap, and a
+   chain materialized within 200 ms grace of a sink-linked payload
+   gets the `content-sink` signal. Bounded: 50k payload records,
+   4M runs, 8k runs/record.
+4. **input cadence in the report** - the kind-23 stream (0009) now
+   gets summarized: per-type counts, median/p90 inter-event delta,
+   path length in px, span; every net-request entry carries its own
+   `input_5s` window (n / moves / keys / median delta). "How often the
+   mouse went, where, and when" - readable per send without the raw
+   stream.
 
 v7 is the **honesty pass over v6**, driven by a code review that found
 the v6 series silently dead in three places:
@@ -85,7 +144,7 @@ one renderer process.
 
 | funnel | covers |
 |---|---|
-| `Invoke` (execution.cc:305) | **THE C++ -> JS funnel** (v7, replaces the api.cc hook): every entry - `v8::Function::Call`, `Script::Run`/`RunModule`, `Execution::New`, microtask callbacks, JSON revivers, comparators, v8-internal callers. Callee script:line. `AFEYE_TRACE_CALLS=0` off, 4M cap |
+| `Invoke` (execution.cc:305) | **THE C++ -> JS funnel** (v7, replaces the api.cc hook): every entry - `v8::Function::Call`, `Script::Run`/`RunModule`, `Execution::New`, microtask callbacks, JSON revivers, comparators, v8-internal callers. Callee script:line. v8: NO-ALLOC - name via `GetFlatContent(no_gc)` into stack scratch, line via member `Script::GetLineNumber` (DisallowGC-safe); the v7 public-API body heap-allocated per call. `AFEYE_TRACE_CALLS=0` off, 4M cap |
 | `Isolate::New` (api.cc) | isolate birth record (kind 34) - the join key for `iso:` chains |
 | `WasmEngine::SyncCompile` / `AsyncCompile` | full wasm module bytes (buffered `new WebAssembly.Module` / `compile` / `instantiate`) |
 | `InstanceBuilder::ProcessImports` (module-instantiate.cc) | **the imports as RESOLVED at instantiation** - every `wasm-import <module.field> kind=` record, plus the instantiate header with the import count |
@@ -94,7 +153,7 @@ one renderer process.
 
 | funnel | covers |
 |---|---|
-| `BUILTIN(FunctionPrototypeToString)` (builtins-function.cc) | WHO was toString-inspected: receiver name + script:line (kind 32) - the native-code integrity probe, pure observation, no result tampering. 2M cap |
+| `BUILTIN(FunctionPrototypeToString)` (builtins-function.cc) | WHO was toString-inspected: receiver name + script:line (kind 32) - the native-code integrity probe, pure observation, no result tampering. v8: NO-ALLOC (internal Tagged<> reads under DisallowGarbageCollection; bound functions unwrapped to the real target). 2M cap |
 | `BUILTIN(DateNow)` (builtins-date.cc) | every `Date.now()` read (kind 33) - the clock cadence all timing checks run on. `AFEYE_TRACE_CLOCK=0` disables, 2M cap |
 | `MicrotaskQueue::RunMicrotasks` (microtask-queue.cc) | drain start/end brackets with pending + ran counts per isolate (kind 30) |
 
@@ -157,6 +216,19 @@ types match - the thunk sees the slow path.
 | `URLLoader::ScheduleStart` / `SetUpUpload` / `ContinueOnResponseStarted` / `DidRead` / `NotifyCompleted` | method + url, request headers, **upload bodies before TLS**, response headers/mime, response body spans, completion |
 | `WebSocket` frame handler | WS frames both directions |
 
+### the v8 blind spots - `0012` + `0013` + `0014`
+
+| funnel | covers |
+|---|---|
+| `Performance::now` (performance.cc, 0012) | every `performance.now()` read (kind 33, `clock performance-now`) - the high-resolution clock all PoW/timing checks run on; `Date.now()` was only half the stream. `AFEYE_TRACE_CLOCK=0` off, 2M cap |
+| `HTMLCanvasElement::ToDataURLInternal` (0012) | the canvas-fingerprint readback RESULT: mime + encoded data-URL length (kind 16) - hooked where the string materializes, no second render |
+| `HTMLCanvasElement::toBlob` (0012) | the async export ask: mime + geometry (kind 16) |
+| `Document::cookie` / `setCookie` (document.cc, 0013) | cookie-jar VALUES both directions (kind 16, head-capped 960 B) - the cf_clearance / challenge-token store |
+| `StorageArea::getItem` / `setItem` (storage_area.cc, 0013) | localStorage/sessionStorage key+value head (kind 16) - the store-then-send pattern: fingerprint parked at init, read back at send time |
+| `WebGLRenderingContextBase::ReadPixelsHelper` (0014) | the WebGL readback: ask (rect+fmt+type) + RESULT head-span (the rendered digest). Covers both WebGL1 and WebGL2 (single funnel). kind 16 |
+| `BaseRenderingContext2D::getImageDataInternal` (0014) | the canvas-2d readback RESULT: head-span of the filled pixel buffer (`RawByteSpan`). 0007 logged the ask; this is the digest the antifraud hashes. kind 16 |
+| `AnalyserNode::get*FrequencyData` / `get*TimeDomainData` (0014) | the realtime audio fingerprint: head-span of every frequency/time-domain buffer. 0007 covered the OFFLINE render; this is the realtime surface (per-frame polls, 2M cap). kind 16 |
+
 ## compile cost (what "only the changed files compile" means here)
 
 | patch | Chromium TUs touched | libraries that relink |
@@ -172,8 +244,11 @@ types match - the thunk sees the slow path.
 | 0009 blink-input | 2 (`mouse_event_manager.cc`, `keyboard_event_manager.cc`) | blink core |
 | 0010 blink-context | 2 (`document_load_timing.cc`, `worker_or_worklet_global_scope.cc`) | blink core |
 | 0011 net-wire | 3 (`url_loader.cc`, `websocket.cc`, + sink TU + BUILD.gn) | network service |
+| 0012 blink-clock-canvas | 2 (`performance.cc`, `html_canvas_element.cc`) | blink core |
+| 0013 blink-cookie-storage | 2 (`document.cc`, `storage_area.cc`) | blink core/modules |
+| 0014 blink-readback-results | 3 (`webgl_rendering_context_base.cc`, `base_rendering_context_2d.cc`, `analyser_node.cc`) | blink core/modules |
 
-~31 changed/new TUs total. The CI build (`scripts/build-chromium.sh`)
+~38 changed/new TUs total. The CI build (`scripts/build-chromium.sh`)
 runs `ccache -z` before ninja and `ccache -s` after: on a warm cache
 only these TUs recompile - a series tweak costs minutes, not hours.
 First build chains across 4h30m windows under the 6h runner cap
@@ -197,13 +272,16 @@ is no libc stdio buffer to lose, and each process owns its own file
 (no cross-writer locking needed); a hard SIGKILL can still lose the
 last sub-millisecond of ring backlog (counted, see honest limits).
 
-Kinds after v6: 0 sink-hello, 1 script-source (v8, `iso:` names),
+Kinds after v8 (no new kinds - 0012/0013 emit into 16 and 33): 0
+sink-hello, 1 script-source (v8, `iso:` names),
 3 wasm-module, 8 call-origin, 11 crypto-op, 12 timer, 15
-structured-clone, 16 fingerprint (device identities + webgl), 17
+structured-clone, 16 fingerprint (device identities + webgl +
+**canvas export result + cookie/storage values**), 17
 net-request, 18 net-resp-body, 19 websocket, 23 input, 24
 event-dispatch, 25 dom-metric, 26 audio, 27 webrtc, 28 fetch, **29
 dom-api**, **30 microtask**, **31 wasm-instance**, **32
-fn-tostring**, **33 clock**, **34 isolate**, **35 worker**, **36
+fn-tostring**, **33 clock (Date.now + performance.now)**, **34
+isolate**, **35 worker**, **36
 nav-start**. Silent (wire compat): 2, 4-7, 9-10, 13-14, 20-22.
 
 `tools/rec_census.py` parses this format standalone (with the same
