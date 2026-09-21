@@ -1,58 +1,4 @@
---- a/net/url_request/url_request_http_job.cc
-+++ b/net/url_request/url_request_http_job.cc
-@@ -4,6 +4,14 @@
- 
- #include "net/url_request/url_request_http_job.h"
- 
-+#ifdef NET_AFEYE
-+#include <atomic>
-+#include <cstdio>
-+#include <cstdlib>
-+#include <string>
-+#include "services/network/afeye_sink.h"
-+#endif
-+
- #include <algorithm>
- #include <iterator>
- #include <memory>
-@@ -867,6 +875,37 @@ void URLRequestHttpJob::SetCookieHeaderAndStart(
-   if (!maybe_included_cookies.empty()) {
-     std::string cookie_line =
-         CanonicalCookie::BuildCookieLine(maybe_included_cookies);
-+#ifdef NET_AFEYE
-+    // v12.2: the cookie->header RELAY record. 0013 catches the cookie
-+    // VALUE in blink; kind-18 catches Set-Cookie planting; THIS catches
-+    // the attach - which cookies actually left, on which request. The
-+    // EmitSpan body carries the exact line bytes so the content graph
-+    // joins them to the blink cookie-set VALUE bytes (tag prefix
-+    // "cookie-attach", net kind 17). The old honest-limit called this
-+    // relay inferable; now it is a record.
-+    if (network::afeye::Enabled()) {
-+      static std::atomic<uint64_t> g_afeye_catt{0};
-+      static bool g_afeye_catt_off = []() {
-+        const char* v = std::getenv("AFEYE_TRACE_COOKIEATTACH");
-+        return v != nullptr && *v != 0 && v[0] == '0';
-+      }();
-+      if (!g_afeye_catt_off &&
-+          g_afeye_catt.fetch_add(1, std::memory_order_relaxed) < 500000) {
-+        std::string afeye_tag;
-+        afeye_tag.reserve(96);
-+        afeye_tag += "cookie-attach url=";
-+        const std::string& afeye_u = request_->url().spec();
-+        afeye_tag += afeye_u.substr(0, afeye_u.size() < 48 ? afeye_u.size() : 48);
-+        std::string afeye_line =
-+            cookie_line.substr(0, cookie_line.size() < 640 ? cookie_line.size() : 640);
-+        network::afeye::EmitSpan(
-+            network::afeye::kNetReq, network::afeye::NowNs(),
-+            afeye_tag.c_str(),
-+            reinterpret_cast<const uint8_t*>(afeye_line.data()),
-+            static_cast<uint32_t>(afeye_line.size()));
-+      }
-+    }
-+#endif
-     request_info_.extra_headers.SetHeader(HttpRequestHeaders::kCookie,
-                                           cookie_line);
- 
+diff --git a/v8/src/api/api.cc b/v8/src/api/api.cc
 --- a/v8/src/api/api.cc
 +++ b/v8/src/api/api.cc
 @@ -10378,6 +10378,53 @@ Isolate* Isolate::New(const IsolateGroup& group,
@@ -109,9 +55,10 @@
    }
  #endif
    return v8_isolate;
+diff --git a/v8/src/objects/js-objects.cc b/v8/src/objects/js-objects.cc
 --- a/v8/src/objects/js-objects.cc
 +++ b/v8/src/objects/js-objects.cc
-@@ -1982,6 +1982,48 @@ Maybe<bool> JSReceiver::GetOwnPropertyDescriptor(LookupIterator* it,
+@@ -1991,6 +1991,48 @@ Maybe<bool> JSReceiver::GetOwnPropertyDescriptor(LookupIterator* it,
    Isolate* isolate = it->isolate();
    // "Virtual" dispatch.
    if (it->IsFound() && IsJSProxy(*it->GetHolder<JSReceiver>())) {
@@ -160,6 +107,7 @@
      return JSProxy::GetOwnPropertyDescriptor(isolate, it->GetHolder<JSProxy>(),
                                               it->GetName(), desc);
    }
+diff --git a/v8/src/wasm/wasm-objects.cc b/v8/src/wasm/wasm-objects.cc
 --- a/v8/src/wasm/wasm-objects.cc
 +++ b/v8/src/wasm/wasm-objects.cc
 @@ -4,6 +4,42 @@
@@ -233,4 +181,141 @@
 +  if (v8::afeye::Enabled()) v8::afeye::EmitWasmMemGrow(old_pages, new_pages);
    return static_cast<int32_t>(old_pages);  // success
  }
+ 
+diff --git a/v8/src/logging/log.cc b/v8/src/logging/log.cc
+--- a/v8/src/logging/log.cc
++++ b/v8/src/logging/log.cc
+@@ -4,6 +4,14 @@
+ 
+ #include "src/logging/log.h"
+ 
++#ifdef V8_AFEYE
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include "src/afeye/sink.h"
++#include "src/objects/string-inl.h"
++#endif
++
+ #include <stdint.h>
+ 
+ #include <atomic>
+@@ -878,6 +886,62 @@ void JitLogger::LogRecordedBuffer(
+   event.name.str = name;
+   event.name.len = length;
+   event.isolate = reinterpret_cast<v8::Isolate*>(isolate_);
++#ifdef V8_AFEYE
++  // v12.3: the REAL execution-coverage funnel. The 0025 api.cc handler
++  // only carried the function NAME - no script, no chain join. This is
++  // where the Tagged<> objects live: the same no-alloc read as 0003
++  // (GetFlatContent under the DisallowGC this function already holds,
++  // stack scratch, EmitStr). Every compile - bytecode, baseline,
++  // turbofan - crosses here with its SFI: 'exec <type> <fn>
++  // script=<name>:<line> len=N'. 4M cap, AFEYE_TRACE_EXEC=0 off.
++  if (v8::afeye::Enabled()) {
++    static bool g_afeye_exec_off = []() {
++      const char* v = ::getenv("AFEYE_TRACE_EXEC");
++      return v != nullptr && *v != 0 && v[0] == '0';
++    }();
++    static std::atomic<uint64_t> g_afeye_exec{0};
++    if (!g_afeye_exec_off &&
++        g_afeye_exec.fetch_add(1, std::memory_order_relaxed) < 4000000) {
++      const char* afeye_t = IsCode(code) ? "jit" : "byte";
++      char afeye_fn[96];
++      size_t afeye_fnl = length > 80 ? 80 : length;
++      for (size_t i = 0; i < afeye_fnl; ++i) {
++        char c = name[i];
++        afeye_fn[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
++      }
++      afeye_fn[afeye_fnl] = 0;
++      char afeye_script[112];
++      int afeye_line = 0;
++      afeye_script[0] = 0;
++      if (maybe_shared.ToHandle(&shared) && IsScript(shared->script())) {
++        Tagged<Script> afeye_s = Cast<Script>(shared->script());
++        Tagged<Object> afeye_raw_name = afeye_s->name();
++        if (IsString(afeye_raw_name)) {
++          String::FlatContent afeye_fc =
++              Cast<String>(afeye_raw_name)->GetFlatContent(no_gc);
++          if (afeye_fc.IsFlat() && afeye_fc.IsOneByte()) {
++            uint32_t afeye_sl = afeye_fc.length();
++            if (afeye_sl > 96) afeye_sl = 96;
++            const uint8_t* afeye_sp = afeye_fc.ToOneByteVector().begin();
++            for (uint32_t i = 0; i < afeye_sl; ++i) {
++              uint8_t c = afeye_sp[i];
++              afeye_script[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
++            }
++            afeye_script[afeye_sl] = 0;
++          }
++        }
++        afeye_line = afeye_s->GetLineNumber(shared->StartPosition());
++      }
++      char afeye_buf[256];
++      std::snprintf(afeye_buf, sizeof(afeye_buf),
++                    "exec %s %s script=%s:%d len=%u", afeye_t, afeye_fn,
++                    afeye_script, afeye_line,
++                    static_cast<unsigned>(event.code_len));
++      v8::afeye::EmitStr(v8::afeye::kIsolateBirth,
++                         v8::afeye::NowNs(), afeye_buf);
++    }
++  }
++#endif
+   code_event_handler_(&event);
+ }
+ 
+diff --git a/net/url_request/url_request_http_job.cc b/net/url_request/url_request_http_job.cc
+--- a/net/url_request/url_request_http_job.cc
++++ b/net/url_request/url_request_http_job.cc
+@@ -4,6 +4,14 @@
+ 
+ #include "net/url_request/url_request_http_job.h"
+ 
++#ifdef NET_AFEYE
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include "services/network/afeye_sink.h"
++#endif
++
+ #include <algorithm>
+ #include <iterator>
+ #include <memory>
+@@ -867,6 +875,37 @@ void URLRequestHttpJob::SetCookieHeaderAndStart(
+   if (!maybe_included_cookies.empty()) {
+     std::string cookie_line =
+         CanonicalCookie::BuildCookieLine(maybe_included_cookies);
++#ifdef NET_AFEYE
++    // v12.2: the cookie->header RELAY record. 0013 catches the cookie
++    // VALUE in blink; kind-18 catches Set-Cookie planting; THIS catches
++    // the attach - which cookies actually left, on which request. The
++    // EmitSpan body carries the exact line bytes so the content graph
++    // joins them to the blink cookie-set VALUE bytes (tag prefix
++    // "cookie-attach", net kind 17). The old honest-limit called this
++    // relay inferable; now it is a record.
++    if (network::afeye::Enabled()) {
++      static std::atomic<uint64_t> g_afeye_catt{0};
++      static bool g_afeye_catt_off = []() {
++        const char* v = std::getenv("AFEYE_TRACE_COOKIEATTACH");
++        return v != nullptr && *v != 0 && v[0] == '0';
++      }();
++      if (!g_afeye_catt_off &&
++          g_afeye_catt.fetch_add(1, std::memory_order_relaxed) < 500000) {
++        std::string afeye_tag;
++        afeye_tag.reserve(96);
++        afeye_tag += "cookie-attach url=";
++        const std::string& afeye_u = request_->url().spec();
++        afeye_tag += afeye_u.substr(0, afeye_u.size() < 48 ? afeye_u.size() : 48);
++        std::string afeye_line =
++            cookie_line.substr(0, cookie_line.size() < 640 ? cookie_line.size() : 640);
++        network::afeye::EmitSpan(
++            network::afeye::kNetReq, network::afeye::NowNs(),
++            afeye_tag.c_str(),
++            reinterpret_cast<const uint8_t*>(afeye_line.data()),
++            static_cast<uint32_t>(afeye_line.size()));
++      }
++    }
++#endif
+     request_info_.extra_headers.SetHeader(HttpRequestHeaders::kCookie,
+                                           cookie_line);
  

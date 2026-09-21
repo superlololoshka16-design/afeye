@@ -109,15 +109,20 @@ pristine tree assembled from sources fetched at that tag
 v12.2 is ONE patch, **0025 - the total-capture pass**. It closes the four
 honest-limit holes that made the capture selective instead of total:
 
-1. **EXECUTION COVERAGE (api.cc):** every isolate installs a
-   `JitCodeEventHandler` at birth. CODE_ADDED events name EVERY function
-   as it is compiled - bytecode, baseline, turbofan, wasm (`exec <type>
-   <name> len=N`, kind 34). The lazy-compile hook (0022) only saw a
-   function's FIRST run; tier-up and recompile were invisible. The
-   handler is sink-only (plain C struct, no v8 API, no handles - safe on
-   the logger thread), one install per process, 4M cap,
-   `AFEYE_TRACE_EXEC=0` off. The filter reports the tier distribution
-   (exec_jit / exec_byte / exec_wasm_code) in v8_depth.
+1. **EXECUTION COVERAGE (log.cc - the real funnel):**
+   `JitLogger::LogRecordedBuffer` is where every compile crosses with its
+   Tagged SFI: bytecode, baseline, turbofan, wasm. The hook reads the
+   script name + function line NO-ALLOC (GetFlatContent under the
+   DisallowGC the function already holds, the 0003 pattern) and emits
+   `exec <type> <fn> script=<name>:<line> len=N` (kind 34). The
+   lazy-compile hook (0022) only saw a function's FIRST run; tier-up and
+   recompile were invisible. The script= field joins every compile to its
+   CHAIN (exec_per_name - executed_funcs takes the max, so tier-up counts
+   too); the filter reports the tier distribution (exec_jit / exec_byte /
+   exec_wasm_code) in v8_depth. 4M cap, `AFEYE_TRACE_EXEC=0` off. The
+   handler installed at Isolate::New (api.cc) stays as the
+   logger-registration belt - the RECORD comes from log.cc where the
+   Tagged objects live.
 2. **WASM LINEAR MEMORY (wasm-objects.cc):** `WasmMemoryObject::Grow` emits
    `wasm-mem grow old=N new=N` (kind 31) at all three success exits.
    PoW-style wasm antifraud (Kasada) allocates and grows in deterministic

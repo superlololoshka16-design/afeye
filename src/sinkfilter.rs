@@ -1312,6 +1312,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     let mut wasm_firstcalls = 0u64;
     let mut wasm_mem_grows = 0u64;  // v12.2 (0025): linear-memory grow events
     let mut exec_compiles = 0u64;  // v12.2 (0025): all compiled functions
+    let mut exec_per_name: HashMap<String, u64> = HashMap::new();  // v12.3: per-chain compiles
     let mut exec_jit = 0u64;
     let mut exec_byte = 0u64;
     let mut exec_wasm_code = 0u64;
@@ -1345,13 +1346,12 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                     }
                 }
             }
-            // v12.2 (0025): kind-34 'exec <type> <name> len=N' - every
-            // function AS COMPILED (bytecode, baseline, turbofan, wasm):
-            // the full execution surface beyond lazy-first. Tier-up
-            // compiles land here. Counted in v8_depth; per-chain
-            // attribution joins by script name (the exec name is the
-            // FUNCTION name - the chain attribution stays lazy-compile's
-            // job; here we keep the totals + the tier distribution).
+            // v12.2/3 (0025): kind-34 'exec <type> <fn> script=<name>:<line>
+            // len=N' - every function AS COMPILED (bytecode, baseline,
+            // turbofan, wasm): the full execution surface beyond
+            // lazy-first, INCLUDING tier-up. Attributed per-chain by the
+            // script= field (exec_per_name; executed_funcs takes the max
+            // with lazy-compile) and counted in v8_depth.
             "isolate" => {
                 if txt.starts_with("exec ") {
                     exec_compiles += 1;
@@ -1361,6 +1361,24 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                         exec_byte += 1;
                     } else if txt.starts_with("exec wasm ") {
                         exec_wasm_code += 1;
+                    }
+                    // v12.3: the 0025 log.cc funnel carries
+                    // 'script=<name>:<line>' - attribute the compile to its
+                    // chain (the same bare-name join as lazy-compile; the
+                    // exec name is the FUNCTION, the script names the file).
+                    if let Some(sp) = txt.find(" script=") {
+                        let script_part = &txt[sp + 8..];
+                        let end = script_part.find(" len=").unwrap_or(script_part.len());
+                        let script_name = &script_part[..end];
+                        // strip the trailing :<line>
+                        let bare = match script_name.rfind(':') {
+                            Some(c) if script_name[c + 1..]
+                                .chars()
+                                .all(|d| d.is_ascii_digit()) => &script_name[..c],
+                            _ => script_name,
+                        };
+                        let (_, bare) = split_iso(bare);
+                        *exec_per_name.entry(bare.to_string()).or_insert(0u64) += 1;
                     }
                 }
             }
@@ -2212,6 +2230,14 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         if !c.name.is_empty() {
             if let Some(n) = lazy_per_name.get(c.name.as_str()) {
                 c.executed_funcs = *n;
+            }
+            // v12.3: the exec stream counts EVERY compile (tier-up
+            // included) - take the max with lazy-compile so executed_funcs
+            // reflects the true execution surface.
+            if let Some(n) = exec_per_name.get(c.name.as_str()) {
+                if *n > c.executed_funcs {
+                    c.executed_funcs = *n;
+                }
             }
         }
     }
