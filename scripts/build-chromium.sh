@@ -56,35 +56,14 @@ export PATH="$WORK/depot_tools:$PATH"
 gclient --version >/dev/null 2>&1 || true
 
 # ---- 2. source, pinned to the tag, no history, single sync
-# v12.4 (the 6h-build fix): a cached .git object store (restored by the
-# workflow into $WORK/src/.git) turns the full gclient fetch into a
-# materialize+verify. git checkout is NOT enough by itself - gclient
-# owns DEPS (v8 third_party, clang toolchain, etc.) - but with .git
-# present the sync walks the object store instead of the network. The
-# working tree materializes first, then gclient verifies.
 mkdir -p "$WORK/src"
 cd "$WORK"
-if [ -d src/.git ] && [ ! -f src/.gclient-afeye-materialized ]; then
-  # the workflow restored a bare .git from cache: materialize the tree
-  # at the pinned tag (local objects only - no network), then let the
-  # gclient sync below verify DEPS and fill any missing submodule bits.
-  (cd src && git checkout -q --force "refs/tags/$CHROMIUM_REF" -- . 2>/dev/null || \
-              git reset -q --hard "refs/tags/$CHROMIUM_REF" 2>/dev/null || true)
-  touch src/.gclient-afeye-materialized
-fi
 if [ ! -f .gclient ]; then
   gclient config --name=src "https://chromium.googlesource.com/chromium/src.git"
 fi
 if [ ! -d src/.git ] || [ "$(cd src && git describe --tags --exact-match 2>/dev/null)" != "$CHROMIUM_REF" ]; then
   gclient sync --no-history --with_branch_heads --delete_unversioned_trees \
     -r "src@refs/tags/$CHROMIUM_REF"
-else
-  # v12.4: tree present at the tag - still run gclient for the DEPS side
-  # (hooks + third_party), but WITHOUT deleting the unversioned trees
-  # (the materialized checkout has no gclient state; --delete would wipe
-  # it) and with --no-history to keep the fetch shallow.
-  gclient sync --no-history --with_branch_heads \
-    -r "src@refs/tags/$CHROMIUM_REF" || true
 fi
 cd "$WORK/src"
 git rev-parse HEAD
@@ -111,13 +90,7 @@ done
 
 # ---- 5. ccache
 export CCACHE_DIR
-# v12.4 (the 6h-build fix): 5G, not 9G. The repo cache cap is 10GB TOTAL
-# and the srcgit entry (the chromium .git store, ~4G repacked) now lives
-# next to it - at 9G+9G the cap silently evicted one of the two mid-chain
-# and re-runs recompiled/refetched. 5G of ccache carries every TU the
-# patch series touches plus the shared cold-miss headroom; the src store
-# is immutable and repacked, so 4G is stable.
-ccache -M 5G >/dev/null 2>&1 || ccache --max-size=5G >/dev/null || true
+ccache -M 9G >/dev/null 2>&1 || ccache --max-size=9G >/dev/null || true
 # zero the counters so the stats printed after the build describe THIS run:
 # hits = files that did NOT recompile (unchanged vs the cache), misses = the
 # files we actually changed. "Only the files we patch compile" - here it is
