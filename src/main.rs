@@ -232,6 +232,25 @@ async fn run() -> Result<(), String> {
     // a PREVIOUS run's records (pid reuse even re-opens them for append).
     let raw_dir = std::env::var("AF_RAW_DIR").unwrap_or_else(|_| "/tmp/afeye-raw".into());
     let _ = std::fs::create_dir_all(&raw_dir);
+    // v12.4 (the empty-collect fix): main runs as root (sudo -E in CI) while
+    // tunnel chrome runs as `fxN` inside a netns. create_dir_all honors the
+    // root umask (typically 022 -> 0755 root:root): the sinks inside fxN
+    // chrome then CANNOT create <layer>-<pid>.rec (EACCES), every open()
+    // fails, and the whole capture dies silently - stats.json records=0,
+    // sink_alive=false, an empty collect/, and a filtered zip with zero
+    // chains. The C++ sinks chmod 0777 on THEIR init, but init never runs
+    // when the sink can't even open the dir for writing... actually it CAN
+    // (mkdir/chmod succeed on an existing dir only with write perms).
+    // Widen here, owner-agnostic, BEFORE any chrome exists.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&raw_dir) {
+            let mut perm = meta.permissions();
+            perm.set_mode(0o777);
+            let _ = std::fs::set_permissions(&raw_dir, perm);
+        }
+    }
     if let Ok(rd) = std::fs::read_dir(&raw_dir) {
         for e in rd.flatten() {
             if e.path().extension().map(|x| x == "rec").unwrap_or(false) {

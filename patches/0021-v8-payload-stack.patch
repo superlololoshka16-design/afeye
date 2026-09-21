@@ -27,8 +27,9 @@
 +  DisallowGarbageCollection no_gc;
 +  String::FlatContent flat = str->GetFlatContent(no_gc);
 +  if (!flat.IsFlat()) {
++    // v12.4 (N7): -1 = non-flat marker, see the stack variant above.
 +    dst[0] = '\0';
-+    return 0;
++    return -1;
 +  }
 +  uint32_t len = flat.length();
 +  if (len > cap) len = cap;
@@ -90,7 +91,8 @@
 +      // (VALUE_TAGS prefix match; the prose form was skipped at
 +      // sinkfilter.rs:1575, so the advertised stringify->req-body content
 +      // edge never existed). Metadata rides in the tag; body = head bytes.
-+      if (afeye_n > 0) {
++      // v12.4 (N7): -1 = non-flat marker survives (was: silently skipped)
++      if (afeye_n != 0) {
 +        char afeye_tag[64];
 +        std::snprintf(afeye_tag, sizeof(afeye_tag),
 +                      "json-stringify len=%d replacer=%d", afeye_n,
@@ -98,7 +100,7 @@
 +        v8::afeye::EmitSpan(v8::afeye::kFingerprint, v8::afeye::NowNs(),
 +                            afeye_tag,
 +                            reinterpret_cast<const uint8_t*>(afeye_head),
-+                            static_cast<uint32_t>(afeye_n));
++                            static_cast<uint32_t>(afeye_n > 0 ? afeye_n : 0));
 +      }
 +    }
 +  }
@@ -137,8 +139,13 @@
 +  DisallowGarbageCollection no_gc;
 +  String::FlatContent flat = str->GetFlatContent(no_gc);
 +  if (!flat.IsFlat()) {
++    // v12.4 (N7): a cons/sliced string returns a MARKER, not a silent
++    // empty record - "errstack len=0 head=" was indistinguishable from
++    // "stack was empty". -1 = non-flat (a real stack is virtually always
++    // flat; a marker keeps the data-gap visible in the stream instead of
++    // folding it into nothing.
 +    dst[0] = '\0';
-+    return 0;
++    return -1;
 +  }
 +  uint32_t len = flat.length();
 +  if (len > cap) len = cap;

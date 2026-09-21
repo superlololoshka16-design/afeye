@@ -17,8 +17,6 @@
  #include <optional>
 @@ -75,6 +83,53 @@ namespace internal {
  
- namespace {
- 
 +// afeye (v6): raw script-source dumper. ONE definition, placed before every
 +// call site - the three compilation funnels below (eval, streamed, buffered)
 +// all reach it. DirectHandle<String> accepts both Handle<String> and
@@ -26,6 +24,14 @@
 +// iso-prefixed ("iso:<isolate> <name>") so the external filter can group
 +// eval-chains per isolate/session - a dedicated worker's stream never mixes
 +// with the main thread even though both live in the same renderer process.
++// v12.4 (N8, documented invariant): this body ALLOCATES (String::Utf8Value
++// may Flatten -> GC, std::string for the name). It is legal ONLY because
++// every call site (the compile funnels: eval / streamed / buffered /
++// wrapped) is an allocating compilation context that already owns handles
++// and can absorb a GC - it is NOT no-alloc and must never be moved into
++// Invoke / GC-active / DisallowGarbageCollection callers. The sink itself
++// (EmitTwoStr path after this) copies into the ring under the spin lock
++// with no allocation.
 +static void AfeyeDumpScriptSource(Isolate* isolate,
 +                                  DirectHandle<String> source,
 +                                  const char* fallback_name,

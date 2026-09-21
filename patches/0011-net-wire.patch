@@ -41,7 +41,7 @@ index 0000000000..1111111111
 +
 +#endif
 +
-
++
 diff --git a/services/network/afeye_sink.cc b/services/network/afeye_sink.cc
 new file mode 100644
 index 0000000000..1111111111
@@ -82,7 +82,7 @@ index 0000000000..1111111111
 +std::atomic<bool> g_on{false};
 +std::atomic<uint64_t> g_dropped{0};
 +std::once_flag g_init_once;
-+pid_t g_pid = 0;  // v12.1: fork safety - see Enabled()
++std::atomic<pid_t> g_pid{0};  // v12.4: atomic + CAS - see Enabled()
 +
 +struct Ring {
 +  std::atomic_flag lock = ATOMIC_FLAG_INIT;
@@ -112,12 +112,17 @@ index 0000000000..1111111111
 +  return kDir;
 +}
 +
++// v12.4 (0001 pattern): write errors are COUNTED and folded into the
++// drop witness - a silent return made ENOSPC/EIO invisible loss.
++std::atomic<uint64_t> g_write_err{0};
++
 +void WriteAll(int fd, const uint8_t* p, size_t n) {
 +  size_t off = 0;
 +  while (off < n) {
 +    ssize_t w = ::write(fd, p + off, n - off);
 +    if (w < 0) {
 +      if (errno == EINTR) continue;
++      g_write_err.fetch_add(1, std::memory_order_relaxed);
 +      return;
 +    }
 +    if (w == 0) return;
@@ -149,11 +154,19 @@ index 0000000000..1111111111
 +  std::string path = std::string(RawDir()) + "/" + kLayer + "-" + pid + ".rec";
 +  int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
 +  if (fd >= 0) EmitHello(fd);
-+  std::vector<uint8_t> buf;
++  // v12.4 (N6, 0001 pattern): pre-sized buffer, memcpy under lock, write
++  // outside it - buf.assign() malloc'd up to 1 MiB INSIDE the ring lock.
++  static thread_local std::vector<uint8_t> buf;
++  buf.resize(kMaxRecord);
 +  for (;;) {
 +    size_t len = 0;
 +    bool have = false;
++    uint32_t spin = 0;
 +    while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
++      if (++spin >= 64) {
++        spin = 0;
++        std::this_thread::yield();
++      }
 +    }
 +    if (g_ring.tail != g_ring.head) {
 +      uint32_t len32;
@@ -162,8 +175,7 @@ index 0000000000..1111111111
 +      if (len < 16 || len > kMaxRecord) {
 +        g_ring.tail = g_ring.head;
 +      } else {
-+        buf.assign(g_ring.data + g_ring.tail,
-+                   g_ring.data + g_ring.tail + len);
++        std::memcpy(buf.data(), g_ring.data + g_ring.tail, len);
 +        size_t nt = g_ring.tail + len;
 +        if (nt >= kRingBytes) nt -= kRingBytes;
 +        g_ring.tail = nt;
@@ -171,10 +183,17 @@ index 0000000000..1111111111
 +      }
 +    }
 +    g_ring.lock.clear(std::memory_order_release);
++    uint64_t werr_before = g_write_err.load(std::memory_order_relaxed);
 +    if (have) {
 +      if (fd >= 0) {
 +        WriteAll(fd, buf.data(), len);
-+      } else {
++        // v12.4 (0001 pattern): failed write -> force reopen next cycle.
++        if (g_write_err.load(std::memory_order_relaxed) != werr_before) {
++          ::close(fd);
++          fd = -1;
++        }
++      }
++      if (fd < 0) {
 +        fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
 +        if (fd >= 0) EmitHello(fd);
 +      }
@@ -187,13 +206,15 @@ index 0000000000..1111111111
 +// v12.1: fork safety (see 0001 for the rationale). The network service
 +// utility process also forks (e.g. crashpad helpers); same re-init rule.
 +void ReinitAfterFork() {
-+  while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
-+  }
++  // v12.4 (0001 pattern hardened): clear the lock unconditionally - the
++  // dead parent thread may have held it at fork time and test_and_set
++  // would spin forever. Race-free: in the fresh child only the calling
++  // thread exists.
++  g_ring.lock.clear(std::memory_order_release);
 +  g_ring.tail = 0;
 +  g_ring.head = 0;
-+  g_ring.lock.clear(std::memory_order_release);
 +  g_dropped.store(0, std::memory_order_relaxed);
-+  g_pid = ::getpid();
++  g_pid.store(::getpid(), std::memory_order_release);
 +  std::thread(DrainLoop).detach();
 +}
 +
@@ -202,7 +223,7 @@ index 0000000000..1111111111
 +  ::mkdir(RawDir(), 0777);
 +  ::chmod(RawDir(), 0777);
 +  g_on.store(true, std::memory_order_release);
-+  g_pid = ::getpid();
++  g_pid.store(::getpid(), std::memory_order_release);
 +  std::thread(DrainLoop).detach();
 +  std::atexit([] { Flush(500); });
 +}
@@ -211,7 +232,16 @@ index 0000000000..1111111111
 +
 +bool Enabled() {
 +  std::call_once(g_init_once, InitOnce);
-+  if (::getpid() != g_pid) ReinitAfterFork();
++  // v12.4: CAS so concurrent child threads admit exactly ONE reinit (two
++  // drain threads would interleave WriteAll chunks into one file); a
++  // disabled sink never spawns a drain thread or a .rec file (N4).
++  pid_t me = ::getpid();
++  if (g_pid.load(std::memory_order_acquire) != me) {
++    pid_t old = g_pid.load(std::memory_order_acquire);
++    if (g_pid.compare_exchange_strong(old, me, std::memory_order_acq_rel)) {
++      ReinitAfterFork();
++    }
++  }
 +  return g_on.load(std::memory_order_acquire);
 +}
 +
@@ -305,7 +335,11 @@ index 0000000000..1111111111
 +            static_cast<uint32_t>(buf.size()));
 +}
 +
-+uint64_t SinkDropped() { return g_dropped.load(std::memory_order_relaxed); }
++// v12.4 (0001 pattern): ring drops AND write errors - see SinkDropped.
++uint64_t SinkDropped() {
++  return g_dropped.load(std::memory_order_relaxed) +
++         g_write_err.load(std::memory_order_relaxed);
++}
 +
 +bool Flush(uint32_t timeout_ms) {
 +  if (!g_on.load(std::memory_order_acquire)) return true;
@@ -328,7 +362,7 @@ index 0000000000..1111111111
 +
 +#endif
 +
-
++
 --- a/services/network/BUILD.gn
 +++ b/services/network/BUILD.gn
 @@ -8,6 +325,11 @@

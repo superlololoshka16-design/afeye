@@ -51,11 +51,15 @@
 +    if (now_dropped != reported_drops) {
 +      const uint64_t now_ns = MonoNs();
 +      if (now_ns - last_report_ns >= 100ull * 1000ull * 1000ull) {
++        // v12.4: only advance the bookkeeping after a real write - at
++        // fd<0 (open failed) WriteDropReport is a no-op and marking the
++        // drops as reported would erase the witness forever.
 +        WriteDropReport(fd, now_dropped);
-+        reported_drops = now_dropped;
-+        last_report_ns = now_ns;
++        if (fd >= 0) {
++          reported_drops = now_dropped;
++          last_report_ns = now_ns;
++        }
 +      }
-+    }
    }
  }
  
@@ -128,8 +132,10 @@
 +      const uint64_t now_ns = MonoNs();
 +      if (now_ns - last_report_ns >= 100ull * 1000ull * 1000ull) {
 +        WriteDropReport(fd, now_dropped);
-+        reported_drops = now_dropped;
-+        last_report_ns = now_ns;
++        if (fd >= 0) {
++          reported_drops = now_dropped;
++          last_report_ns = now_ns;
++        }
 +      }
 +    }
    }
@@ -204,8 +210,10 @@
 +      const uint64_t now_ns = MonoNs();
 +      if (now_ns - last_report_ns >= 100ull * 1000ull * 1000ull) {
 +        WriteDropReport(fd, now_dropped);
-+        reported_drops = now_dropped;
-+        last_report_ns = now_ns;
++        if (fd >= 0) {
++          reported_drops = now_dropped;
++          last_report_ns = now_ns;
++        }
 +      }
 +    }
    }

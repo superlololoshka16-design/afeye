@@ -50,6 +50,7 @@ index 0000000000..1111111111
 +void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
 +void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s);
 +void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b);
++void EmitWasmMemGrow(size_t old_pages, size_t new_pages);
 +void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
 +              const uint8_t* bytes, uint32_t n);
 +uint64_t SinkDropped();
@@ -102,7 +103,15 @@ index 0000000000..1111111111
 +std::atomic<bool> g_on{false};
 +std::atomic<uint64_t> g_dropped{0};
 +std::once_flag g_init_once;
-+pid_t g_pid = 0;  // v12.1: fork safety - see Enabled()
++// v12.4: atomic + CAS so two child threads post-fork cannot both run
++// ReinitAfterFork and spawn two drain threads on one file.
++std::atomic<pid_t> g_pid{0};  // fork safety - see Enabled()
++// v12.4: getpid() is a REAL syscall on modern glibc (the pid cache was
++// removed in 2.25) - Enabled() sits in the hottest funnel (Invoke, every
++// C++->JS entry), so the pid is cached per thread and re-checked only
++// against the atomic (vDSO-priced load). A fork changes the pid, the
++// thread-local is refreshed then - one syscall per fork, zero per call.
++thread_local pid_t t_pid = 0;
 +
 +struct Ring {
 +  std::atomic_flag lock = ATOMIC_FLAG_INIT;
@@ -132,12 +141,22 @@ index 0000000000..1111111111
 +  return kDir;
 +}
 +
++// v12.4: write errors are COUNTED, not swallowed. The chunk is already
++// out of the ring, g_dropped does not move, and the 0023 drop witness
++// watches ring overflow only - a silent return made ENOSPC/EIO invisible
++// loss (exactly the class of hidden gap the witness exists to close).
++// The drain loop reads the counter, folds it into its sink-drop report,
++// and reopens the fd so a transient failure (full disk, then space) does
++// not silently kill every subsequent record forever.
++std::atomic<uint64_t> g_write_err{0};
++
 +void WriteAll(int fd, const uint8_t* p, size_t n) {
 +  size_t off = 0;
 +  while (off < n) {
 +    ssize_t w = ::write(fd, p + off, n - off);
 +    if (w < 0) {
 +      if (errno == EINTR) continue;
++      g_write_err.fetch_add(1, std::memory_order_relaxed);
 +      return;
 +    }
 +    if (w == 0) return;
@@ -169,11 +188,25 @@ index 0000000000..1111111111
 +  std::string path = std::string(RawDir()) + "/" + kLayer + "-" + pid + ".rec";
 +  int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
 +  if (fd >= 0) EmitHello(fd);
-+  std::vector<uint8_t> buf;
++  // v12.4 (N6): fixed stack-of-heap buffer, NOT a std::vector. The old
++  // buf.assign() ran a malloc + memcpy of up to 1 MiB INSIDE the ring lock
++  // - if the drain thread descheduled mid-copy, every JS thread in the
++  // process spun on test_and_set for the whole copy (the v8 ring is one
++  // per process; main thread + every worker isolate contend on it).
++  // Now: copy under lock into a pre-sized buffer, write outside it.
++  static thread_local std::vector<uint8_t> buf;
++  buf.resize(kMaxRecord);
 +  for (;;) {
 +    size_t len = 0;
 +    bool have = false;
++    uint32_t spin = 0;
 +    while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
++      // bounded spin then yield: an unbounded test_and_set on a contended
++      // cache line burns the whole timeslice without progress
++      if (++spin >= 64) {
++        spin = 0;
++        std::this_thread::yield();
++      }
 +    }
 +    if (g_ring.tail != g_ring.head) {
 +      uint32_t len32;
@@ -182,8 +215,8 @@ index 0000000000..1111111111
 +      if (len < 16 || len > kMaxRecord) {
 +        g_ring.tail = g_ring.head;
 +      } else {
-+        buf.assign(g_ring.data + g_ring.tail,
-+                   g_ring.data + g_ring.tail + len);
++        // single memcpy under the lock - no allocation, no syscalls
++        std::memcpy(buf.data(), g_ring.data + g_ring.tail, len);
 +        size_t nt = g_ring.tail + len;
 +        if (nt >= kRingBytes) nt -= kRingBytes;
 +        g_ring.tail = nt;
@@ -191,10 +224,19 @@ index 0000000000..1111111111
 +      }
 +    }
 +    g_ring.lock.clear(std::memory_order_release);
++    uint64_t werr_before = g_write_err.load(std::memory_order_relaxed);
 +    if (have) {
 +      if (fd >= 0) {
 +        WriteAll(fd, buf.data(), len);
-+      } else {
++        // v12.4: a failed write (ENOSPC/EIO) leaves a live fd that would
++        // keep swallowing records - force the reopen path below so the
++        // next cycle retries a FRESH open (disk-full-then-space, etc.).
++        if (g_write_err.load(std::memory_order_relaxed) != werr_before) {
++          ::close(fd);
++          fd = -1;
++        }
++      }
++      if (fd < 0) {
 +        fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
 +        if (fd >= 0) EmitHello(fd);
 +      }
@@ -211,13 +253,16 @@ index 0000000000..1111111111
 +// everything, and never create its <layer>-<pid>.rec. getpid is vDSO (no
 +// syscall) so the check is free in the hot path.
 +void ReinitAfterFork() {
-+  while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
-+  }
++  // v12.4: the parent's drain thread may have HELD the ring lock at fork
++  // time - the (dead) holder never clears it, and the first child Enabled()
++  // would spin forever on a test_and_set owned by nobody. In the fresh
++  // child only the calling thread exists, so an unconditional clear is
++  // race-free by definition.
++  g_ring.lock.clear(std::memory_order_release);
 +  g_ring.tail = 0;
 +  g_ring.head = 0;
-+  g_ring.lock.clear(std::memory_order_release);
 +  g_dropped.store(0, std::memory_order_relaxed);
-+  g_pid = ::getpid();
++  g_pid.store(::getpid(), std::memory_order_release);
 +  std::thread(DrainLoop).detach();
 +}
 +
@@ -226,7 +271,7 @@ index 0000000000..1111111111
 +  ::mkdir(RawDir(), 0777);
 +  ::chmod(RawDir(), 0777);
 +  g_on.store(true, std::memory_order_release);
-+  g_pid = ::getpid();
++  g_pid.store(::getpid(), std::memory_order_release);
 +  std::thread(DrainLoop).detach();
 +  std::atexit([] { Flush(500); });
 +}
@@ -235,7 +280,24 @@ index 0000000000..1111111111
 +
 +bool Enabled() {
 +  std::call_once(g_init_once, InitOnce);
-+  if (::getpid() != g_pid) ReinitAfterFork();
++  // v12.4: no raw getpid() here - it is a real syscall on glibc >= 2.25 and
++  // this sits in the Invoke funnel (every C++->JS entry). The thread-local
++  // cache holds the last observed pid; only a mismatch (a fork happened on
++  // THIS thread) pays the syscall + the CAS-reinit. The CAS admits exactly
++  // one winner when several threads race post-fork; the losers just
++  // refresh their cache. Sink-off early-exit: a disabled build never spawns
++  // a drain thread, never leaves a .rec file (the v12.4 N4 fix).
++  pid_t me = t_pid;
++  if (me == 0) {
++    me = ::getpid();
++    t_pid = me;
++  }
++  if (g_pid.load(std::memory_order_acquire) != me) {
++    pid_t old = g_pid.load(std::memory_order_acquire);
++    if (g_pid.compare_exchange_strong(old, me, std::memory_order_acq_rel)) {
++      ReinitAfterFork();
++    }
++  }
 +  return g_on.load(std::memory_order_acquire);
 +}
 +
@@ -250,7 +312,16 @@ index 0000000000..1111111111
 +    flags |= 1;
 +  }
 +  const size_t need = 16 + static_cast<size_t>(len);
++  uint32_t afeye_spin = 0;
 +  while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
++    // v12.4 (N6): emit hot path - every Invoke crosses here. Unbounded
++    // test_and_set against a descheduled holder burns a full timeslice;
++    // 64 spins then yield keeps the latency bounded for the holder's
++    // cache-line release.
++    if (++afeye_spin >= 64) {
++      afeye_spin = 0;
++      std::this_thread::yield();
++    }
 +  }
 +  const size_t h = g_ring.head;
 +  const size_t t = g_ring.tail;
@@ -328,8 +399,32 @@ index 0000000000..1111111111
 +  EmitFlags(kind, ts_ns, trunc ? 1 : 0, buf.data(),
 +            static_cast<uint32_t>(buf.size()));
 +}
++// v12.4 (N9): the DEFINITION lives here (was 0025 wasm-objects.cc-only) -
++// the sink.h declaration alone left every other TU calling it with an
++// undefined symbol. Same body as 0025; the 0025 copy is removed.
++void EmitWasmMemGrow(size_t old_pages, size_t new_pages) {
++  static std::atomic<uint64_t> g_afeye_wmem{0};
++  static bool g_afeye_wmem_off = []() {
++    const char* v = ::getenv("AFEYE_TRACE_WASMMEM");
++    return v != nullptr && *v != '\0' && v[0] == '0';
++  }();
++  if (g_afeye_wmem_off) return;
++  if (g_afeye_wmem.fetch_add(1, std::memory_order_relaxed) >= 100000)
++    return;
++  char afeye_buf[128];
++  std::snprintf(afeye_buf, sizeof(afeye_buf), "wasm-mem grow old=%u new=%u",
++                static_cast<unsigned>(old_pages),
++                static_cast<unsigned>(new_pages));
++  EmitStr(kWasmInstance, NowNs(), afeye_buf);
++}
 +
-+uint64_t SinkDropped() { return g_dropped.load(std::memory_order_relaxed); }
++
++// v12.4: ring drops AND write errors - the 0023 witness must see both or
++// ENOSPC is an invisible gap the graph then misreads as dead-end evidence.
++uint64_t SinkDropped() {
++  return g_dropped.load(std::memory_order_relaxed) +
++         g_write_err.load(std::memory_order_relaxed);
++}
 +
 +bool Flush(uint32_t timeout_ms) {
 +  if (!g_on.load(std::memory_order_acquire)) return true;

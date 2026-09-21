@@ -131,12 +131,23 @@ pub async fn launch_chrome(ctx: &Ctx, t: &Tunnel) -> Result<Child, String> {
         .arg(format!("DISPLAY={}", ctx.display));
     // afeye: the sinks read AFEYE_SINK / AFEYE_RAW_DIR at process start;
     // runuser strips the parent environment, so pass them explicitly.
-    for k in ["AFEYE_SINK", "AFEYE_RAW_DIR"] {
-        if let Ok(v) = std::env::var(k) {
-            if !v.is_empty() {
-                c.arg(format!("{}={}", k, v));
-            }
-        }
+    // v12.4 (the empty-collect fix): pass ALWAYS, with the collector's own
+    // defaults when the parent does not set them. Before, a scrubbed
+    // parent (CI sudo -E carries AFEYE_SINK but not AFEYE_RAW_DIR) meant
+    // the sinks wrote to THEIR default /tmp/afeye-raw while main.rs's
+    // collector tailed AF_RAW_DIR... also /tmp/afeye-raw - the SAME dir,
+    // so this pair accidentally worked, but only by default-coincidence.
+    // Making it explicit closes the whole class: any AF_RAW_DIR override
+    // now reaches the chrome side too (before it silently DIDN'T - the
+    // collector tailed the override dir, the sinks kept writing the
+    // default, zero records, empty collect, empty filtered zip).
+    {
+        let raw_dir = std::env::var("AFEYE_RAW_DIR").unwrap_or_else(|_| {
+            std::env::var("AF_RAW_DIR").unwrap_or_else(|_| "/tmp/afeye-raw".into())
+        });
+        let sink = std::env::var("AFEYE_SINK").unwrap_or_else(|_| "1".into());
+        c.arg(format!("AFEYE_SINK={}", sink));
+        c.arg(format!("AFEYE_RAW_DIR={}", raw_dir));
     }
     c.arg(&ctx.chrome);
     for f in &flags {
@@ -168,6 +179,19 @@ pub async fn launch_chrome_local(ctx: &Ctx, port: u16) -> Result<Child, String> 
         headless_shell: is_headless_shell(&ctx.chrome),
     });
     let mut c = Command::new(&ctx.chrome);
+    // v12.4 (the empty-collect fix): the sinks inside chrome activate on
+    // AFEYE_SINK and write to AFEYE_RAW_DIR - the SAME vars main.rs's
+    // collector reads (AF_RAW_DIR for the tail side). A plain spawn
+    // inherits the parent env, but a scrubbed parent (CI, systemd) meant
+    // the sinks stayed OFF, chrome ran stock, and the capture died at the
+    // very first record: collect/stats.json records=0, sink_alive=false,
+    // filtered zip empty of chains. Force-inject the pair with the same
+    // defaults the collector uses - the tunnel path (run_tunnel) has
+    // passed them explicitly since v6; the local path simply forgot.
+    let raw_dir = std::env::var("AFEYE_RAW_DIR")
+        .unwrap_or_else(|_| std::env::var("AF_RAW_DIR").unwrap_or_else(|_| "/tmp/afeye-raw".into()));
+    c.env("AFEYE_SINK", std::env::var("AFEYE_SINK").unwrap_or_else(|_| "1".into()));
+    c.env("AFEYE_RAW_DIR", raw_dir);
     for f in &flags {
         c.arg(f);
     }

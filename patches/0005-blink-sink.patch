@@ -123,6 +123,14 @@ new file mode 100644
 +std::atomic<bool> g_on{false};
 +std::atomic<uint64_t> g_dropped{0};
 +std::once_flag g_init_once;
++// v12.4: fork safety - see Enabled(). Blink lives in zygote-forked
++// renderers; without this check the child inherits a completed once_flag,
++// fills the 8 MiB ring with no drain thread, and every blink record is
++// dropped (the exact bug v12.1 fixed for v8/net but missed here).
++// atomic + CAS: two child threads entering Enabled() concurrently must
++// not both spawn DrainLoop - two writers interleave WriteAll chunks and
++// the collector resyncs them away as corrupt bytes.
++std::atomic<pid_t> g_pid{0};
 +
 +struct Ring {
 +  std::atomic_flag lock = ATOMIC_FLAG_INIT;
@@ -152,12 +160,17 @@ new file mode 100644
 +  return kDir;
 +}
 +
++// v12.4 (0001 pattern): write errors are COUNTED and folded into the
++// drop witness - a silent return made ENOSPC/EIO invisible loss.
++std::atomic<uint64_t> g_write_err{0};
++
 +void WriteAll(int fd, const uint8_t* p, size_t n) {
 +  size_t off = 0;
 +  while (off < n) {
 +    ssize_t w = ::write(fd, p + off, n - off);
 +    if (w < 0) {
 +      if (errno == EINTR) continue;
++      g_write_err.fetch_add(1, std::memory_order_relaxed);
 +      return;
 +    }
 +    if (w == 0) return;
@@ -189,11 +202,19 @@ new file mode 100644
 +  std::string path = std::string(RawDir()) + "/" + kLayer + "-" + pid + ".rec";
 +  int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
 +  if (fd >= 0) EmitHello(fd);
-+  std::vector<uint8_t> buf;
++  // v12.4 (N6, 0001 pattern): pre-sized buffer, memcpy under lock, write
++  // outside it - buf.assign() malloc'd up to 1 MiB INSIDE the ring lock.
++  static thread_local std::vector<uint8_t> buf;
++  buf.resize(kMaxRecord);
 +  for (;;) {
 +    size_t len = 0;
 +    bool have = false;
++    uint32_t spin = 0;
 +    while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
++      if (++spin >= 64) {
++        spin = 0;
++        std::this_thread::yield();
++      }
 +    }
 +    if (g_ring.tail != g_ring.head) {
 +      uint32_t len32;
@@ -202,8 +223,7 @@ new file mode 100644
 +      if (len < 16 || len > kMaxRecord) {
 +        g_ring.tail = g_ring.head;
 +      } else {
-+        buf.assign(g_ring.data + g_ring.tail,
-+                   g_ring.data + g_ring.tail + len);
++        std::memcpy(buf.data(), g_ring.data + g_ring.tail, len);
 +        size_t nt = g_ring.tail + len;
 +        if (nt >= kRingBytes) nt -= kRingBytes;
 +        g_ring.tail = nt;
@@ -211,10 +231,17 @@ new file mode 100644
 +      }
 +    }
 +    g_ring.lock.clear(std::memory_order_release);
++    uint64_t werr_before = g_write_err.load(std::memory_order_relaxed);
 +    if (have) {
 +      if (fd >= 0) {
 +        WriteAll(fd, buf.data(), len);
-+      } else {
++        // v12.4 (0001 pattern): failed write -> force reopen next cycle.
++        if (g_write_err.load(std::memory_order_relaxed) != werr_before) {
++          ::close(fd);
++          fd = -1;
++        }
++      }
++      if (fd < 0) {
 +        fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
 +        if (fd >= 0) EmitHello(fd);
 +      }
@@ -229,14 +256,45 @@ new file mode 100644
 +  ::mkdir(RawDir(), 0777);
 +  ::chmod(RawDir(), 0777);
 +  g_on.store(true, std::memory_order_release);
++  g_pid.store(::getpid(), std::memory_order_release);
 +  std::thread(DrainLoop).detach();
 +  std::atexit([] { Flush(500); });
++}
++
++// v12.4: fork safety, 0001 pattern hardened. The child of a zygote fork
++// inherits the ring and a COMPLETED once_flag but not the drain thread.
++// CAS on the atomic g_pid guarantees exactly ONE reinit wins the race when
++// several child threads hit Enabled() at once; the lock is cleared
++// unconditionally first because the (dead) parent thread may have held it
++// at fork time - in the fresh child only one thread exists at that moment,
++// so the clear cannot race. Early-exit when the sink is off: a disabled
++// build must never spawn a drain thread or leave a .rec file behind.
++void ReinitAfterFork() {
++  if (!g_on.load(std::memory_order_acquire)) {
++    g_pid.store(::getpid(), std::memory_order_release);
++    return;
++  }
++  g_ring.lock.clear(std::memory_order_release);
++  g_ring.tail = 0;
++  g_ring.head = 0;
++  g_dropped.store(0, std::memory_order_relaxed);
++  g_pid.store(::getpid(), std::memory_order_release);
++  std::thread(DrainLoop).detach();
 +}
 +
 +}  // namespace
 +
 +bool Enabled() {
 +  std::call_once(g_init_once, InitOnce);
++  pid_t me = ::getpid();
++  if (g_pid.load(std::memory_order_acquire) != me) {
++    pid_t old = g_pid.load(std::memory_order_acquire);
++    // CAS: the winner re-inits, the losers fall through - two threads
++    // post-fork must never both spawn DrainLoop on one file.
++    if (g_pid.compare_exchange_strong(old, me, std::memory_order_acq_rel)) {
++      ReinitAfterFork();
++    }
++  }
 +  return g_on.load(std::memory_order_acquire);
 +}
 +
@@ -330,7 +388,11 @@ new file mode 100644
 +            static_cast<uint32_t>(buf.size()));
 +}
 +
-+uint64_t SinkDropped() { return g_dropped.load(std::memory_order_relaxed); }
++// v12.4 (0001 pattern): ring drops AND write errors - see SinkDropped.
++uint64_t SinkDropped() {
++  return g_dropped.load(std::memory_order_relaxed) +
++         g_write_err.load(std::memory_order_relaxed);
++}
 +
 +bool Flush(uint32_t timeout_ms) {
 +  if (!g_on.load(std::memory_order_acquire)) return true;

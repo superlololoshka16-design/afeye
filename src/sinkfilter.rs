@@ -112,6 +112,7 @@ pub struct SinkFilterStats {
     pub graph_hop1: u64,
     pub graph_deep: u64,
     pub graph_chains: u64,
+    pub graph_entry_chains: u64,
     pub provenance_parents: u64,
     pub fetched_url_chains: u64,
     pub proven_chains: u64,
@@ -624,9 +625,27 @@ fn run_keys(body: &[u8]) -> Vec<u64> {
         u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
     };
     let mut out: Vec<u64> = Vec::new();
-    if body.len() < CONTENT_RUN_BYTES {
-        if !body.is_empty() && !is_monotone(body) {
-            out.push(key(body));
+    // Short-body linking (cookies, short tokens, query values):
+    // a <32 B body got ONE key over the whole body while a larger carrier
+    // emits 32 B windows - different key lengths never match, so a short
+    // value embedded anywhere in a request body was unlinkable. And 32-63 B
+    // bodies emit windows only at offsets 0, 16, ... on both sides, so a
+    // match required the embedding offset to be divisible by 16 (p~1/16).
+    // Fix: short bodies (< 2 * CONTENT_RUN_BYTES) emit a key at EVERY byte
+    // offset - a 63 B body yields <=63 cheap keys, and an embedded short
+    // value at any phase now shares a window with its carrier.
+    if body.len() < 2 * CONTENT_RUN_BYTES {
+        if body.is_empty() {
+            return out;
+        }
+        if is_monotone(body) {
+            return out;
+        }
+        for off in 0..body.len() {
+            let win = &body[off..];
+            if !is_monotone(win) {
+                out.push(key(win));
+            }
         }
         return out;
     }
@@ -649,6 +668,92 @@ fn hex_bytes(b: &[u8]) -> Vec<u8> {
     for &x in b {
         out.push(H[(x >> 4) as usize]);
         out.push(H[(x & 0xf) as usize]);
+    }
+    out
+}
+
+/// v12.4: custom-alphabet envelope decode. Cloudflare wraps its wire
+/// bodies in a 64-symbol permutation alphabet shipped as a string constant
+/// inside the challenge script (verified against this repo's own capture:
+/// the freebuff challenge script carries
+/// `y1+jUndxLt$pzuJcoK3k7hCqWBi2Ofsl-MQT0wXRaIgPENrVFSbAm6eG5HZvYD498`,
+/// which covers the d1e8be/5c72c1 wire charsets byte-for-byte; the x.ai
+/// script carries a different 65-char constant covering c0d1757). Decoding
+/// maps each wire byte to its 6-bit value and packs the stream back into
+/// the bytes the carrier held BEFORE the envelope wrapped them - so the
+/// 32 B run windows match the plaintext/crypto-out side of the graph.
+fn decode_custom_alphabet(body: &[u8], alpha: &[u8]) -> Option<Vec<u8>> {
+    if alpha.len() < 64 || body.len() < VARIANT_MIN_BYTES {
+        return None;
+    }
+    let mut tbl = [255u8; 256];
+    for (i, &c) in alpha[..64].iter().enumerate() {
+        if tbl[c as usize] != 255 {
+            return None; // duplicate symbol - not a permutation
+        }
+        tbl[c as usize] = i as u8;
+    }
+    if !body.iter().all(|&b| tbl[b as usize] != 255) {
+        return None; // wire uses symbols outside the alphabet
+    }
+    let mut out = Vec::with_capacity(body.len() * 3 / 4 + 8);
+    let mut acc: u32 = 0;
+    let mut nbits: u32 = 0;
+    for &b in body {
+        acc = (acc << 6) | tbl[b as usize] as u32;
+        nbits += 6;
+        while nbits >= 8 {
+            nbits -= 8;
+            out.push(((acc >> nbits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// v12.4: find candidate permutation alphabets in captured script text.
+/// The pattern: a quoted 60..=72-char string over the wire symbol class
+/// [A-Za-z0-9+$-/=] with >=60 distinct symbols - the base64-style alphabet
+/// constant the obfuscator installs. Both alphabets from the real capture
+/// (65 chars, 64+terminator) land in this window.
+fn extract_alphabets(script: &[u8]) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let len = script.len();
+    let mut i = 0usize;
+    while i + 60 <= len {
+        let q = match script[i] {
+            b'"' | b'\'' | b'`' => script[i],
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let start = i + 1;
+        let mut j = start;
+        while j < len && (j - start) < 72 {
+            let c = script[j];
+            if c == q {
+                break;
+            }
+            if !(c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'=' | b'$' | b'-')) {
+                break;
+            }
+            j += 1;
+        }
+        let l = j - start;
+        if j < len && script[j] == q && (60..=72).contains(&l) {
+            let mut seen = [false; 256];
+            let mut distinct = 0usize;
+            for &c in &script[start..j] {
+                if !seen[c as usize] {
+                    seen[c as usize] = true;
+                    distinct += 1;
+                }
+            }
+            if distinct >= 60 {
+                out.push(script[start..j].to_vec());
+            }
+        }
+        i = j + 1;
     }
     out
 }
@@ -718,6 +823,13 @@ fn chain_signals(c: &Chain, net_ts: &[u64], content_ts: &[u64]) -> (Vec<String>,
         // deobfuscator evals both the token pipeline and piles of library
         // code), so this marks the parent only.
         signals.push("spawned-proven".into());
+    }
+    if let Some(h) = c.graph_entry {
+        // v12: PROVEN double fact - this chain was the active C++->JS entry
+        // when a graph-tainted payload (byte-identity path to a sink) was
+        // written. Covers the late assembler/encryptor and worker-PoW glue
+        // whose tainted record sits OUTSIDE the chain's materialization window.
+        signals.push(format!("graph-entry@{h}"));
     }
     if let Some(h) = c.graph_hops {
         // v11: PROVEN byte-identity path to a sink record, h hops away.
@@ -927,6 +1039,12 @@ struct Chain {
     /// v11: minimum hop distance from this chain's window to a sink record in
     /// the byte-identity graph. None = not connected by byte identity.
     graph_hops: Option<u32>,
+    /// v12 graph-entry: this chain was the active C++->JS entry (kind-8) when
+    /// a GRAPH-TAINTED payload record was written - so its bytes are on a
+    /// byte-identity path to a sink AND this chain handled them. Closes the
+    /// late-assembler / late-encryptor / worker-PoW cases the window-based
+    /// graph-sink misses. Carries the min hop distance.
+    graph_entry: Option<u32>,
     /// v11: an observed FACT (byte-identity path, initiated send, or
     /// cookie/storage access) - not a heuristic. Drives AF_STRICT_GRAPH.
     proven: bool,
@@ -1510,6 +1628,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                         executed_funcs: 0,
                         fetched_url: false,
                         graph_hops: None,
+                        graph_entry: None,
                         proven: false,
                         dead_end_proven: false,
                         spawned_proven: Vec::new(),
@@ -1773,8 +1892,28 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
 
     struct GraphNode {
         ts: u64,
+        pid: u64,
         sink: bool,
         keys: Vec<u64>,
+    }
+
+    // v12.4: gather permutation alphabets from every script-source body
+    // (the chain materialization pass above already wrote them to
+    // filtered/scripts/, but the graph runs before that on the same recs -
+    // re-read via the payload path here). The alphabet constant lives in
+    // the SAME challenge script whose wire bodies it wraps, so pid-scoped
+    // matching is the honest join: cross-pid alphabets would be a guess.
+    let mut alphabets_by_pid: HashMap<u64, Vec<Vec<u8>>> = HashMap::new();
+    for r in recs.iter().filter(|r| r.kind == "script-source") {
+        if let Some(p) = read_payload(&raw_dir, r) {
+            let (_, body) = name_of(&p);
+            for alpha in extract_alphabets(&body) {
+                alphabets_by_pid
+                    .entry(r.pid)
+                    .or_default()
+                    .push(alpha);
+            }
+        }
     }
 
     let mut nodes: Vec<GraphNode> = Vec::new();
@@ -1826,9 +1965,16 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             .position(|&c| c == b'?')
             .map(|q| body.len() - q - 1)
             .unwrap_or(0);
+        // Vendor beacons (DataDome/px pixels) carry the token in a query as
+        // short as 40-80 B - far under QUERY_SINK_MIN_BYTES. The timer
+        // signal's net_ts seeds on vendor hosts (v9); the graph seed must
+        // too, or a send that left over a vendor query is invisible to the
+        // byte-identity slice. Same rule as net_ts: vendor GETs ARE payload
+        // formation regardless of length.
         let is_query_sink = r.kind == "net-request"
             && HTTP_METHODS.contains(&tag.as_str())
-            && query_len >= QUERY_SINK_MIN_BYTES;
+            && (query_len >= QUERY_SINK_MIN_BYTES
+                || af_vendor_of_url(&String::from_utf8_lossy(&body)).is_some());
         // 0017: only the OUTBOUND ws frame sinks; inbound tags stay carriers
         // (a challenge response can be re-sent verbatim later).
         let is_ws_sink = r.kind == "websocket" && tag == "ws-frame-out";
@@ -1852,22 +1998,22 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             // upstream chain's provenness silently. Empty keys = hop-0
             // taint at its own ts; the edge budget only bounds adjacency,
             // never the seed set itself.
-            nodes.push(GraphNode { ts: r.ts, sink: true, keys: Vec::new() });
+            nodes.push(GraphNode { ts: r.ts, pid: r.pid, sink: true, keys: Vec::new() });
             continue;
         }
 
         let mut keys = run_keys(&body);
         // variant runs: only sinks pay for them, bounded by VARIANT_MAX_SINKS.
         // These cover the STANDARD encodings only: base64 (RFC 4648) and
-        // lowercase hex. HONEST LIMIT, proven against this repo's own capture
-        // (afeye-20260918-144834.zip, the 4 Cloudflare .post bodies): their
-        // wire charset is "$+,-./0-9:A-Za-z{}" with NO "=" padding at all, so
-        // it is a vendor-specific alphabet, not base64. A sink whose bytes are
-        // wrapped in a custom alphabet will NOT match these variant runs and
-        // the graph reports the chain as unresolved rather than guessing.
-        // Fixing that needs the alphabet extracted from the captured
-        // script-source and a parameterized decoder - not another encoding
-        // guess.
+        // lowercase hex. v12.4: PLUS the decoded 6-bit stream under every
+        // permutation alphabet extracted from this pid's script-source -
+        // the honest fix for the honest limit below: Cloudflare wire
+        // bodies (verified: 4 .post bodies in this repo's own capture)
+        // carry a 64-symbol custom alphabet; the decoded stream is the
+        // exact byte sequence the carrier (crypto-out / TextEncoder /
+        // json-stringify) held before the envelope wrapped it, so its
+        // 32 B run windows link the last hop of the collector->token
+        // chain instead of dropping it to unresolved.
         if sink && body.len() >= VARIANT_MIN_BYTES && sinks_seen < VARIANT_MAX_SINKS {
             sinks_seen += 1;
             let room = GRAPH_MAX_EDGES.saturating_sub(total_keys);
@@ -1878,6 +2024,19 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                     .into_bytes();
                 let mut vk = run_keys(&b64);
                 vk.extend(run_keys(&hex_bytes(&body)));
+                // v12.4: custom-alphabet decoded runs - try every alphabet
+                // found in this pid's scripts; a decode only succeeds when
+                // the WHOLE body is over the alphabet's symbols, so a
+                // wrong alphabet costs one linear scan, never a false link
+                // (a wrong permutation decodes to garbage that shares no
+                // 32 B window with any carrier).
+                if let Some(alphas) = alphabets_by_pid.get(&r.pid) {
+                    for alpha in alphas {
+                        if let Some(decoded) = decode_custom_alphabet(&body, alpha) {
+                            vk.extend(run_keys(&decoded));
+                        }
+                    }
+                }
                 vk.truncate(room.min(vk.len()));
                 total_keys += vk.len();
                 keys.extend(vk);
@@ -1895,7 +2054,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         keys.sort_unstable();
         keys.dedup();
         total_keys += keys.len();
-        nodes.push(GraphNode { ts: r.ts, sink, keys });
+        nodes.push(GraphNode { ts: r.ts, pid: r.pid, sink, keys });
     }
 
     // ---- CSR adjacency (compressed sparse row) --------------------------------
@@ -1999,12 +2158,21 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     // tainted payload positions: (ts, hops) sorted by ts - the chain marker
     // takes the MINIMUM hop distance inside its window
     let mut graph_ts: Vec<(u64, u32)> = Vec::new();
+    // v12 graph-entry: every tainted node's (pid, ts, hop) so the chain whose
+    // ENTRY was active when the node's bytes were written gets a proven fact.
+    // This closes the late-assembler / late-encryptor / worker-PoW cases where
+    // the tainted record sits OUTSIDE the chain's materialization window (so
+    // graph-sink misses) but the chain WAS the active C++->JS entry that wrote
+    // it. Double fact: byte-identity to a sink (the node is tainted) AND entry
+    // attribution (kind-8) - not a timer guess.
+    let mut tainted_positions: Vec<(u64, u64, u32)> = Vec::new(); // (pid, ts, hop)
     let mut tainted_nodes = 0usize;
     let mut hop_hist: BTreeMap<u32, u64> = BTreeMap::new();
     for (ni, n) in nodes.iter().enumerate() {
         if dist[ni] != u32::MAX {
             tainted_nodes += 1;
             graph_ts.push((n.ts, dist[ni]));
+            tainted_positions.push((n.pid, n.ts, dist[ni]));
             *hop_hist.entry(dist[ni]).or_insert(0) += 1;
         }
     }
@@ -2079,6 +2247,30 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                 .or_insert(idx);
         }
     }
+    // v12 graph-entry: attribute every tainted graph node to the chain that
+    // was the active C++->JS entry when its bytes were written. Double fact:
+    // byte-identity path to a sink (the node is tainted) AND this chain
+    // handled it (kind-8 entry). This is the proven signal for the late
+    // assembler/encryptor and worker-PoW glue whose tainted record sits
+    // OUTSIDE the chain's own materialization window (so graph-sink misses it).
+    let mut graph_entry_hops: HashMap<usize, u32> = HashMap::new();
+    for (pid, ts, hop) in &tainted_positions {
+        if let Some(script) = entry_index.script_at(&recs, *pid, *ts) {
+            let (_, bare) = split_iso(script);
+            // v12.1 parity: key by (pid, canon) exactly like the other
+            // entry-join lookups - a bare-name key would attribute pid B's
+            // tainted record to pid A's same-URL chain (false PROVEN), and
+            // un-canonicalized names miss the 200/160-char truncation the
+            // kind-8 stream carries.
+            if let Some(idx) = name_to_chain.get(&(*pid, canon_name(&bare))) {
+                let e = graph_entry_hops.entry(*idx).or_insert(*hop);
+                if *hop < *e {
+                    *e = *hop;
+                }
+            }
+        }
+    }
+
     // per-chain accumulators keyed by idx
     let mut send_init: HashSet<usize> = HashSet::new();
     let mut tok_access: HashSet<usize> = HashSet::new();
@@ -2247,6 +2439,17 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         c.graph_hops = graph_hops_for(&graph_ts, c.first_ts, c.last_ts);
     }
 
+    // fold graph-entry onto chains (a proven fact, like graph_hops)
+    for (idx, hop) in graph_entry_hops {
+        if let Some(c) = chain_list.get_mut(idx) {
+            match c.graph_entry {
+                Some(h) if h <= hop => {}
+                _ => c.graph_entry = Some(hop),
+            }
+            stats.graph_entry_chains += 1;
+        }
+    }
+
     // ---- v11 honest classification, three ordered passes -------------------
     // PROVEN      : an observed FACT - a byte-identity path to a sink
     //               (graph-sink), an entry that initiated a fetch/XHR/beacon
@@ -2268,7 +2471,10 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     //
     // PASS 1 - the per-chain facts that need no other chain.
     for c in &mut chain_list {
-        c.proven = c.graph_hops.is_some() || c.send_initiator || c.token_access;
+        c.proven = c.graph_hops.is_some()
+            || c.graph_entry.is_some()
+            || c.send_initiator
+            || c.token_access;
     }
 
     // ---- PASS 1b: URL-identity (structural, zero-risk) ---------------------
@@ -2413,20 +2619,25 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     // chains ONLY, on its own copy of this directory (report.json carries
     // the token_forming flag per chain).
     let keep_big = std::env::var("AF_KEEP_BIG").map(|v| v == "1").unwrap_or(false);
+    // v12 RECALL FIX (was a real data-loss bug): cold chain files used to be
+    // deleted from disk HERE, inside sinkfilter::run on stage_run - BEFORE
+    // either zip was packed. So the run-zip lost them too, and SERIES.md's
+    // "dead ends stay whole in the run zip" was simply false. Any
+    // classification mistake was irreversible. Now EVERY chain file stays on
+    // disk in stage_run (the run-zip = complete executed-code set; raw/ is
+    // still deleted in main.rs, that is the real space win). The filtered-zip
+    // cut is the ONLY place cold chains are removed, via the prune list below
+    // applied to the filtered copy. token_forming/hot are now stats + the
+    // filtered-cut driver, never a disk-deletion driver.
     for c in &mut chain_list {
         let keep = c.hot || c.token_forming || stats.keep_cold || (keep_big && c.bytes as usize >= big_keep);
         if keep {
             hot += 1;
-            if let Some(f) = c.file.as_mut() {
-                let _ = f.sync_all();
-            }
         } else {
             cold += 1;
-            let rel = c.path.strip_prefix("filtered/").map(|x| x.to_string());
-            if let Some(rel) = rel {
-                let _ = fs::remove_file(collect_dir.join(&rel));
-            }
-            c.path = String::new();
+        }
+        if let Some(f) = c.file.as_mut() {
+            let _ = f.sync_all();
         }
         stats.chain_bytes += c.bytes;
     }
@@ -2507,6 +2718,9 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         }
         if let Some(h) = c.graph_hops {
             entry["graph_hops"] = json!(h);
+        }
+        if let Some(h) = c.graph_entry {
+            entry["graph_entry"] = json!(h);
         }
         if !c.spawned_proven.is_empty() {
             entry["spawned_proven"] = json!(c.spawned_proven);
@@ -2699,6 +2913,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "hop1": stats.graph_hop1,
             "hop2_plus": stats.graph_deep,
             "chains_linked": stats.graph_chains,
+            "chains_entry_linked": stats.graph_entry_chains,
             "max_hops": GRAPH_MAX_HOPS,
             "rule": "nodes = payload records (crypto-op/structured-clone/net-request/taint-edge/websocket); edges = shared 32B blake3 run (stride 16, monotone skipped); seeds = req-body + ws-frame-out + payload-forming crypto raw_data + crypto-out; BFS backwards, hop-capped; sinks also carry base64/hex variant runs so an envelope step still matches. A chain is graph-sink@N when a tainted record falls in its materialization window - N hops of DEMONSTRATED byte identity to the wire, not a timer guess.",
         },
@@ -2710,7 +2925,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "unresolved": stats.unresolved_chains,
             "provenance_parents": stats.provenance_parents,
             "fetched_url_chains": stats.fetched_url_chains,
-            "rule": "proven = graph-sink | send-initiator | token-access | spawned-proven (observed facts: byte identity to a sink, an entry that initiated the send, an entry that touched the stored token, an entry that compiled proven code); heuristic = token_forming without a fact (sink-call text, handler-born window, fp-probes, integrity, net-window); unresolved = no observable connection. Unresolved is NOT claimed to be a proven dead end: in-memory dataflow (fingerprint -> closure -> sent later by another chain) crosses no C++ boundary, so boundary-level capture cannot prove the negative. AF_STRICT_GRAPH=1 cuts the filtered zip to proven only.",
+            "rule": "proven = graph-sink | graph-entry | send-initiator | token-access | spawned-proven (observed facts: byte identity to a sink within the window, byte identity + entry attribution when the tainted record is outside the window, an entry that initiated the send, an entry that touched the stored token, an entry that compiled proven code); heuristic = token_forming without a fact (sink-call text, handler-born window, fp-probes, integrity, net-window); dead-end-proven = no link AND a completeness witness (zero sink-ring drops in this pid, 0023 kind 39); unresolved = no link and NO witness - capture may have dropped the evidence. In-memory dataflow (fingerprint -> closure -> sent later by another chain) crosses no C++ boundary, so it can never be linked by bytes: such chains stay unresolved or dead-end-proven, never silently dropped as fact. AF_STRICT_GRAPH=1 cuts the filtered zip to proven only.",
         },
         "v8_depth": {
             "lazy_funcs": stats.lazy_funcs,
@@ -2979,6 +3194,7 @@ mod tests {
             executed_funcs: 0,
             fetched_url: false,
             graph_hops: None,
+            graph_entry: None,
             proven: false,
             dead_end_proven: false,
             spawned_proven: Vec::new(),
@@ -3162,6 +3378,108 @@ mod tests {
             .unwrap()
             .next()
             .is_none());
+    }
+
+    /// v12.4: the custom-alphabet envelope bridge. Reproduces the exact
+    /// Cloudflare shape from this repo's own capture: a script-source body
+    /// carrying the 64-symbol permutation alphabet constant, a wire sink
+    /// whose bytes are all over that alphabet (the envelope), and a carrier
+    /// holding the DECODED byte stream (what crypto-out/TextEncoder saw
+    /// before the wrap). The graph must taint the carrier through the
+    /// decoded variant runs - the chain must not fall to unresolved.
+    #[test]
+    fn e2e_custom_alphabet_bridge() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let raw_dir = tmp.path().join("raw-src");
+        let collect_dir = tmp.path().join("collect");
+        std::fs::create_dir_all(&raw_dir).unwrap();
+
+        // alphabet from the real capture (freebuff challenge script):
+        // 65 chars - 64-symbol permutation + terminator-ish tail.
+        let alpha: &[u8] =
+            b"y1+jUndxLt$pzuJcoK3k7hCqWBi2Ofsl-MQT0wXRaIgPENrVFSbAm6eG5HZvYD498";
+        assert_eq!(alpha.len(), 65);
+        let a64 = &alpha[..64];
+
+        // the plaintext the collector assembled (the carrier-side bytes):
+        // 96 B of non-monotone payload (>= 3 x CONTENT_RUN_BYTES, so the
+        // carrier emits 32 B windows).
+        let mut plain: Vec<u8> = Vec::with_capacity(96);
+        let mut x: u32 = 0x12345678;
+        for _ in 0..96 {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            plain.push((x >> 24) as u8);
+        }
+        // encode into the alphabet: 6-bit groups -> symbols
+        let mut wire: Vec<u8> = Vec::new();
+        let mut acc: u32 = 0;
+        let mut nbits: u32 = 0;
+        for &b in &plain {
+            acc = (acc << 8) | b as u32;
+            nbits += 8;
+            while nbits >= 6 {
+                nbits -= 6;
+                wire.push(a64[((acc >> nbits) & 63) as usize]);
+            }
+        }
+        if nbits > 0 {
+            wire.push(a64[((acc << (6 - nbits)) & 63) as usize]);
+        }
+        assert!(wire.len() >= VARIANT_MIN_BYTES);
+
+        // the wire stream: hello + script-source (alphabet constant) +
+        // carrier (crypto-op raw_data = the plaintext) + sink (req-body =
+        // the ENVELOPE - shares no bytes with the plaintext by design)
+        let mut rec: Vec<u8> = Vec::new();
+        let t0: u64 = 2_000_000_000;
+        {
+            let mut w = std::io::Cursor::new(&mut rec);
+            let mut put = |kind: u8, ts: u64, payload: &[u8]| {
+                let total: u32 = (16 + payload.len()) as u32;
+                w.write_all(&total.to_le_bytes()).unwrap();
+                w.write_all(&[kind, 0]).unwrap();
+                w.write_all(&[0u8, 0]).unwrap();
+                w.write_all(&ts.to_le_bytes()).unwrap();
+                w.write_all(payload).unwrap();
+            };
+            put(0, t0, b"afeye-sink/v8 v2 pid=7");
+            // script-source carrying the alphabet constant (quoted)
+            let mut script: Vec<u8> = Vec::new();
+            script.extend_from_slice(b"https://cf.io/challenge.js\x00var A=\"");
+            script.extend_from_slice(alpha);
+            script.extend_from_slice(b"\";var s=1;");
+            put(1, t0 + 1_000_000, &script);
+            // carrier: crypto-op raw_data = the plaintext BEFORE the wrap
+            let mut co: Vec<u8> = Vec::new();
+            co.extend_from_slice(b"encrypt\x00");
+            co.extend_from_slice(&plain);
+            put(11, t0 + 2_000_000, &co);
+            // sink: req-body = the ENVELOPE (custom-alphabet wire bytes)
+            let mut rb: Vec<u8> = Vec::new();
+            rb.extend_from_slice(b"req-body\x00");
+            rb.extend_from_slice(&wire);
+            put(17, t0 + 3_000_000, &rb);
+        }
+
+        std::env::set_var("AF_RAW_DIR", &raw_dir);
+        std::fs::write(raw_dir.join("v8-777.rec"), &rec).unwrap();
+        let collector = crate::collect::Collector::spawn_dirs(raw_dir.clone(), collect_dir.clone());
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let stats = collector.stop();
+        assert!(stats.records >= 4, "records: {}", stats.records);
+
+        let sf = run(&collect_dir).expect("sinkfilter run");
+        // the envelope sink is admitted and the carrier is TAINTED through
+        // the decoded variant runs - the whole point of the bridge
+        assert!(sf.graph_sinks >= 1, "sinks: {}", sf.graph_sinks);
+        assert!(
+            sf.graph_tainted >= 1,
+            "carrier not tainted: sinks={} tainted={} - alphabet bridge failed",
+            sf.graph_sinks,
+            sf.graph_tainted
+        );
     }
 
 }

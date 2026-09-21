@@ -24,32 +24,16 @@ diff --git a/v8/src/api/api.cc b/v8/src/api/api.cc
 +            [](const v8::JitCodeEvent* event) {
 +              if (event == nullptr) return;
 +              if (event->type != v8::JitCodeEvent::CODE_ADDED) return;
-+              static std::atomic<uint64_t> g_afeye_exec{0};
-+              if (g_afeye_exec.fetch_add(1, std::memory_order_relaxed) >=
-+                  4000000) {
-+                return;
-+              }
-+              const char* afeye_t = "byte";
-+              switch (event->code_type) {
-+                case v8::JitCodeEvent::JIT_CODE: afeye_t = "jit"; break;
-+                case v8::JitCodeEvent::WASM_CODE: afeye_t = "wasm"; break;
-+                default: break;
-+              }
-+              char afeye_name[96];
-+              size_t afeye_l = event->name.len;
-+              if (afeye_l > 80) afeye_l = 80;
-+              for (size_t i = 0; i < afeye_l; ++i) {
-+                char c = event->name.str[i];
-+                afeye_name[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
-+              }
-+              afeye_name[afeye_l] = 0;
-+              char afeye_buf[128];
-+              std::snprintf(afeye_buf, sizeof(afeye_buf),
-+                            "exec %s %s len=%u", afeye_t, afeye_name,
-+                            static_cast<unsigned>(event->code_len));
-+              v8::afeye::EmitStr(v8::afeye::kIsolateBirth,
-+                                 v8::afeye::NowNs(), afeye_buf);
-+            });
++              // v12.4 (N2): NO EMIT here. The v12.3 log.cc hook
++              // (LogRecordedBuffer) is the record source - it runs where
++              // the Tagged<> objects live and emits the full
++              // 'exec <t> <fn> script=<name>:<line> len=N' record. This
++              // handler firing too meant TWO kind-34 records per compile
++              // in two formats with no dedup field. What stays: the
++              // registration itself (belt - keeps the logger path warm
++              // for isolates whose compile never crosses LogRecordedBuffer)
++              // and the counter shared with the log.cc hook so the 4M
++              // cap stays ONE budget across both.
 +      }
 +    }
    }
@@ -127,29 +111,11 @@ diff --git a/v8/src/wasm/wasm-objects.cc b/v8/src/wasm/wasm-objects.cc
 +// pattern is now a record (kind 31). Memory CONTENTS stay a black box:
 +// per-access capture needs CSA hooks that do not exist (honest limit).
 +// All three Grow exits share this helper.
-+namespace v8 {
-+namespace afeye {
-+void EmitWasmMemGrow(size_t old_pages, size_t new_pages) {
-+  static std::atomic<uint64_t> g_afeye_wmem{0};
-+  static bool g_afeye_wmem_off = []() {
-+    const char* v = ::getenv("AFEYE_TRACE_WASMMEM");
-+    return v != nullptr && *v != 0 && v[0] == '0';
-+  }();
-+  if (g_afeye_wmem_off) return;
-+  if (g_afeye_wmem.fetch_add(1, std::memory_order_relaxed) >= 100000)
-+    return;
-+  char afeye_buf[128];
-+  std::snprintf(afeye_buf, sizeof(afeye_buf),
-+                "wasm-mem grow old=%u new=%u",
-+                static_cast<unsigned>(old_pages),
-+                static_cast<unsigned>(new_pages));
-+  v8::afeye::EmitStr(v8::afeye::kWasmInstance, v8::afeye::NowNs(),
-+                     afeye_buf);
-+}
-+}  // namespace afeye
-+}  // namespace v8
++// v12.4 (N9): the DEFINITION moved to 0001 sink.cc (the sink.h
++// declaration alone left every other TU with an undefined symbol);
++// this TU keeps only the include and the calls below.
 +#endif
-+
+
  #if V8_TARGET_OS_LINUX
  #include <sys/mman.h>
  #include <sys/stat.h>
@@ -231,7 +197,18 @@ diff --git a/v8/src/logging/log.cc b/v8/src/logging/log.cc
 +      char afeye_script[112];
 +      int afeye_line = 0;
 +      afeye_script[0] = 0;
-+      if (maybe_shared.ToHandle(&shared) && IsScript(shared->script())) {
++      // v12.4 (N1): JitLogger can be invoked from BACKGROUND compile
++      // threads (wasm tier-up). Raw Tagged<> heap reads without a
++      // safepoint chase a moving GC into stale pointers - silently
++      // corrupt names, worst case a crash inside the cage. The extern
++      // name/length above are plain C data (safe anywhere); the
++      // script/line enrichment below reads the HEAP and is only valid
++      // when this thread is the isolate's main thread. Everyone else
++      // gets the name-only record - honest, not garbage.
++      bool afeye_main = v8::internal::IsMainThread(0) &&
++                        reinterpret_cast<uintptr_t>(isolate_) != 0;
++      if (afeye_main && maybe_shared.ToHandle(&shared) &&
++          IsScript(shared->script())) {
 +        Tagged<Script> afeye_s = Cast<Script>(shared->script());
 +        Tagged<Object> afeye_raw_name = afeye_s->name();
 +        if (IsString(afeye_raw_name)) {
