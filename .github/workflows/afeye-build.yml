@@ -63,21 +63,50 @@ jobs:
 
       - name: workspace
         run: |
-          sudo mkdir -p /mnt/chromium /mnt/ccache
-          sudo chown -R runner: /mnt/chromium /mnt/ccache
+          sudo mkdir -p /mnt/chromium /mnt/ccache /mnt/srcgit
+          sudo chown -R runner: /mnt/chromium /mnt/ccache /mnt/srcgit
           sudo apt-get update -qq
           sudo apt-get install -y -qq ccache >/dev/null
+          # v12.4: restore the chromium .git store from the src cache (if
+          # present) into the working dir BEFORE the build script runs -
+          # gclient sync then verifies/updates instead of full-fetching.
+          if [ -d /mnt/srcgit/src/.git ] && [ ! -d /mnt/chromium/src/.git ]; then
+            mkdir -p /mnt/chromium/src
+            cp -a /mnt/srcgit/src/.git /mnt/chromium/src/.git
+          fi
+          if [ -f /mnt/srcgit/.gclient ] && [ ! -f /mnt/chromium/.gclient ]; then
+            cp -a /mnt/srcgit/.gclient /mnt/chromium/.gclient
+          fi
           df -h / /mnt | sed 's/^/  /'
 
+      # v12.4 (the 6h-build fix): the old key carried github.run_id, so
+      # EVERY chained run saved a NEW 9GB entry while the old ones still
+      # counted against the 10GB repo cap - the oldest got evicted
+      # mid-chain, the cache silently shrank, and re-runs recompiled more
+      # than they should. Stable key + explicit gh cache delete of the
+      # previous entry: one entry alive at any time, full budget preserved,
+      # restore is a prefix hit, never a partial eviction victim.
+      # v12.4 (the 6h-build fix, part 2): the chromium SOURCE TREE was never
+      # cached - every chained run paid a fresh gclient sync (20-40 min and
+      # several GB of network) before a single TU compiled. Budget: the repo
+      # cache cap is 10GB TOTAL; ccache holds the compiled objects (the
+      # expensive compute) and the .git store holds the fetched source (the
+      # expensive network). Split 5GB/4GB (ccache -M 4G in the build script,
+      # srcgit repacked below): together they stay under the cap, so NEITHER
+      # is ever the eviction victim, and both survive the whole chain.
+      # Keyed by the pinned REF (immutable content), stable across runs.
+      - name: src-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: /mnt/srcgit
+          key: afeye-srcgit-${{ env.CHROMIUM_REF }}
       - name: ccache-restore
         uses: actions/cache/restore@v4
         with:
           path: /mnt/ccache
-          key: afeye-ccache-${{ env.CHROMIUM_REF }}-${{ github.run_id }}
+          key: afeye-ccache-${{ env.CHROMIUM_REF }}
           restore-keys: |
-            afeye-ccache-${{ env.CHROMIUM_REF }}-
             afeye-ccache-
-
       - name: build
         id: build
         run: |
@@ -86,14 +115,62 @@ jobs:
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           exit $rc
         continue-on-error: true
-
+      - name: ccache-evict-stale
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # drop every OTHER afeye-ccache entry (old run_id keys included):
+          # the 10GB repo cap evicts LRU-oldest silently, so leaving stale
+          # entries around is what starved the chain before.
+          gh cache list --key afeye-ccache- --json key,createdAt 2>/dev/null | \
+            jq -r ".[] | select(.key != \"afeye-ccache-${CHROMIUM_REF}\") | .key" | \
+            xargs -r -n1 gh cache delete 2>/dev/null || true
       - name: ccache-save
         if: always()
         uses: actions/cache/save@v4
         with:
           path: /mnt/ccache
-          key: afeye-ccache-${{ env.CHROMIUM_REF }}-${{ github.run_id }}
+          key: afeye-ccache-${{ env.CHROMIUM_REF }}
         continue-on-error: true
+      # v12.4: persist the synced chromium .git store for the next chained
+      # run - the working tree rebuilds cheaply from it, gclient sync turns
+      # into a no-op verify. Same always() discipline as ccache: a window
+      # that dies mid-build still carries the source forward.
+      - name: src-save
+        if: always()
+        run: |
+          if [ -d /mnt/chromium/src/.git ]; then
+            rm -rf /mnt/srcgit/src
+            mkdir -p /mnt/srcgit/src
+            # .git only: the working tree re-materializes from the object
+            # store; carrying both would double the entry past the cap.
+            cp -a /mnt/chromium/src/.git /mnt/srcgit/src/.git
+            # v12.4: repack the store hard - a --no-history checkout still
+            # carries loose objects and pack fragments; a single aggressive
+            # repack roughly halves it, keeping the pair (ccache 5G +
+            # srcgit ~4G) under the 10GB repo cap.
+            (cd /mnt/srcgit/src && \
+              git reflog expire --expire=now --all 2>/dev/null; \
+              git gc --aggressive --prune=now 2>/dev/null) || true
+            [ -f /mnt/chromium/.gclient ] && cp -a /mnt/chromium/.gclient /mnt/srcgit/.gclient || true
+          fi
+        continue-on-error: true
+      - name: src-save-cache
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/cache/save@v4
+        with:
+          path: /mnt/srcgit
+          key: afeye-srcgit-${{ env.CHROMIUM_REF }}
+        continue-on-error: true
+      - name: src-evict-stale
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list --key afeye-srcgit- --json key,createdAt 2>/dev/null | \
+            jq -r ".[] | .key" | sort | head -n -1 | \
+            xargs -r -n1 gh cache delete 2>/dev/null || true
 
       - name: result
         id: result
