@@ -121,6 +121,16 @@ pub struct SinkFilterStats {
     pub dead_end_proven: u64,
     /// v12.5 DTT: chains with an entry-joined "taint-sink" record (0027/0032)
     pub taint_sink_chains: u64,
+    /// v12.5 DTT (0032): OR of tags on heap-shadow entries swept by a
+    /// compacting GC ("taint-swept tag=" prose, run-level - GC has no active
+    /// JS entry to attribute a chain to). Which fingerprint sources were
+    /// live in-heap at some collection.
+    pub taint_swept_union: u64,
+    /// v12.5 DTT (0032): OR of "taint-deadend tag=" unions - sources swept
+    /// WITHOUT ever reaching an in-renderer sink (live & ~sunk). The
+    /// conservative in-renderer dead-end FACT; cross-process proven is the
+    /// byte-content match of req-body-stream against renderer taint captures.
+    pub taint_deadend_union: u64,
     pub graph_distinct_keys: u64,
     pub graph_fanout_dropped: u64,
     pub strict_graph: bool,
@@ -1477,6 +1487,8 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     let mut exec_wasm_code = 0u64;
     let mut wasm_traps = 0u64;
     let mut automation_tells: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut taint_swept_union: u64 = 0;
+    let mut taint_deadend_union: u64 = 0;
     let mut drop_events: Vec<(u64, u64, u64)> = Vec::new(); // (ts, pid, total)
     let mut nav_start: Option<u64> = None;
     for r in &recs {
@@ -1502,6 +1514,24 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                 if let Some(n) = txt.split("dropped=").nth(1) {
                     if let Ok(n) = n.trim().parse::<u64>() {
                         drop_events.push((r.ts, r.pid, n));
+                    }
+                }
+            }
+            // v12.5 DTT (0032): GC-epilogue witness prose, kind-16. Run-level
+            // unions (NOT per-chain - a compaction has no active C++->JS entry
+            // to entry-join, so attributing it to a chain would be a guess).
+            // "taint-swept tag=%x" / "taint-deadend tag=%x".
+            "fingerprint" if txt.starts_with("taint-swept tag=") => {
+                if let Some(h) = txt.split("tag=").nth(1) {
+                    if let Ok(v) = u64::from_str_radix(h.trim(), 16) {
+                        taint_swept_union |= v;
+                    }
+                }
+            }
+            "fingerprint" if txt.starts_with("taint-deadend tag=") => {
+                if let Some(h) = txt.split("tag=").nth(1) {
+                    if let Ok(v) = u64::from_str_radix(h.trim(), 16) {
+                        taint_deadend_union |= v;
                     }
                 }
             }
@@ -1598,6 +1628,8 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     stats.exec_wasm_code = exec_wasm_code;
     stats.wasm_traps = wasm_traps;
     stats.automation_tells = automation_tells.values().sum();
+    stats.taint_swept_union = taint_swept_union;
+    stats.taint_deadend_union = taint_deadend_union;
 
     // ---- 1+2+3: chains + wasm + taint ------------------------------------
     let mut chains: HashMap<(u64, String, String), usize> = HashMap::new();
@@ -2007,7 +2039,12 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         }
         let is_crypto_sink = r.kind == "crypto-op"
             && SINK_CRYPTO_OPS.iter().any(|o| tag.contains(o));
-        let is_upload = r.kind == "net-request" && tag == "req-body";
+        // 0032: streaming fetch bodies materialize at
+        // ChunkedDataPipeUploadDataStream::ReadInternal as "req-body-stream"
+        // spans - 0011's "req-body" only catches non-streaming bodies. Both
+        // are wire sinks; prefix-match so the streaming tag joins too.
+        let is_upload = r.kind == "net-request"
+            && (tag == "req-body" || tag == "req-body-stream");
         // the method\0url record: a carrier, and a SINK when the query is
         // long enough to be a payload rather than a cache-buster. A body-less
         // beacon is the only observable evidence that anything left.
@@ -3002,6 +3039,9 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             "unresolved": stats.unresolved_chains,
             "provenance_parents": stats.provenance_parents,
             "fetched_url_chains": stats.fetched_url_chains,
+            "taint_sink_chains": stats.taint_sink_chains,
+            "taint_swept_union": stats.taint_swept_union,
+            "taint_deadend_union": stats.taint_deadend_union,
             "rule": "proven = graph-sink | graph-entry | send-initiator | token-access | spawned-proven (observed facts: byte identity to a sink within the window, byte identity + entry attribution when the tainted record is outside the window, an entry that initiated the send, an entry that touched the stored token, an entry that compiled proven code); heuristic = token_forming without a fact (sink-call text, handler-born window, fp-probes, integrity, net-window); dead-end-proven = no link AND a completeness witness (zero sink-ring drops in this pid, 0023 kind 39); unresolved = no link and NO witness - capture may have dropped the evidence. In-memory dataflow (fingerprint -> closure -> sent later by another chain) crosses no C++ boundary, so it can never be linked by bytes: such chains stay unresolved or dead-end-proven, never silently dropped as fact. AF_STRICT_GRAPH=1 cuts the filtered zip to proven only.",
         },
         "v8_depth": {
