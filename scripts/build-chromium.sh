@@ -130,59 +130,22 @@ extra_cflags = [
   "-DNET_AFEYE=1",
 ]
 
-# v12.4 (graph cut): every arg below REMOVES translation units from the
-# ninja graph without touching the antifraud-relevant runtime surface.
-# The rule applied to each: if a fingerprint/telemetry probe reads it at
-# runtime (WebGL/ANGLE, WebRTC SDP+ICE, audio, Intl, media codecs,
-# plugins/mime), the component STAYS; if it is a build-only or
-# developer/desktop-only artifact (test binaries, example apps, devtools
-# frontend, crash-service UI, print preview backend, remoting host,
-# assistant), it GOES. Detection surface unchanged by construction.
-rtc_build_examples = false
-rtc_build_tools = false
-# WebRTC itself stays (rtcp_peerconnection.cc hook 0007 needs the full
-# SDP/ICE stack compiled in; only its dev tools and sample apps die).
-build_with_libvpx_headers_only = false
-enable_media_remoting = false
-enable_remoting_host = false
-enable_print_preview = false
-enable_service_discovery = false
-chrome_pgo_phase = 0
-use_thin_lto = false
-thin_lto_enable_opt = false
-optimize_for_size = false
-blink_enable_generated_interfaces_perf_check = false
-skia_enable_pdf = false
-skia_use_dng_sdk = false
-# skia_use_libjpeg_turbo_encode stays TRUE: canvas.toDataURL('image/jpeg')
-# and toBlob('image/jpeg') (the 0012 fingerprint readbacks) ride the Skia
-# jpeg encoder; without it the encode path throws and the digest never
-# materializes. DECODE (skia_use_libjpeg_turbo_decode) likewise feeds the
-# image-draw fingerprint chain.
-skia_use_libjpeg_turbo_encode = true
-skia_use_expat = false
-use_evdev_gestures = false
-# use_udev stays TRUE: media-device enumeration (MediaDeviceInfo hook,
-# patch 0007) reads the udev device list at runtime. The ctor hook would
-# still fire on a udev-less build, but the CONTENT it carries (real device
-# ids / groups / labels) would degrade to hollow defaults - a
-# fingerprint-surface regression for a handful of TUs. Not worth it.
-use_udev = true
-# v12.4 cut use_gio but left use_gtk=true: ui/gtk/BUILD.gn:16 asserts
-# use_gio ("GIO is required for building with GTK") and root BUILD.gn:323
-# pulls //ui/gtk:gtk_unittests whenever use_gtk is on - gn gen died there
-# (CI run 35697981760, the first run to clear the patch stage). GIO stays:
-# it is a handful of TUs and GTK hard-requires it. use_libpci=false is safe
-# because its only consumer (enable_service_discovery) is also off.
-use_gio = true
-use_gtk = true
-use_libpci = false
-use_system_libdrm = true
-use_ozone = true
-ozone_platform_headless = true
-ozone_platform_x11 = true
-enable_mojom_js_bindings = false
-enable_js_type_check = false
+# v12.5 REVERT of the v12.4 ninja-graph cut (c1628ea). That commit added 26
+# gn args at once; NONE had ever passed `gn gen`, and the first two CI runs
+# to clear the patch stage both died on its asserts:
+#   run 35697981760: use_gio=false + use_gtk=true -> ui/gtk/BUILD.gn:16
+#                    assert(use_gio, "GIO is required for building with GTK")
+#   run 35700335846: enable_print_preview=false -> chrome/test/BUILD.gn:8840
+#                    pulls print_preview:interactive_ui_tests UNGATED, and
+#                    print_preview/BUILD.gn:11 asserts the flag
+# gn args cannot be validated without the full chromium tree + buildtools
+# (the local oracle is 59 files, no gn binary), so every remaining cut flag
+# was a 4.5h-CI-cycle gamble. The graph cut is a build-SPEED optimization -
+# it removes test/dev/remoting/print TUs, never an afeye hook, so capture
+# output is byte-identical with or without it. The window-chaining + ccache
+# architecture exists precisely to absorb a slower full build. Reverting to
+# the ONLY args config with empirical proof of reaching ninja (obj 23531 in
+# run 35618590286): the 18-arg block above. Faster unproven << slower proven.
 EOF
 )"
 
