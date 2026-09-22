@@ -1,3 +1,5 @@
+diff --git a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
+index bf7d20a..4c72860 100644
 --- a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
 +++ b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
 @@ -6,8 +6,10 @@
@@ -76,7 +78,7 @@
  void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
    AfeyeApiCell* cell = nullptr;
 @@ -54,15 +113,28 @@ void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
-     cell = static_cast<AfeyeApiCell*>(data.As<v8::External>()->Value());
+     cell = static_cast<AfeyeApiCell*>(data.As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault));
    }
    if (cell) {
 -    // hard cap keeps the dom-api stream from starving the script stream

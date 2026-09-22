@@ -1,7 +1,70 @@
+diff --git a/services/network/url_loader.cc b/services/network/url_loader.cc
+index 1720130..9f15fff 100644
+--- a/services/network/url_loader.cc
++++ b/services/network/url_loader.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "services/network/url_loader.h"
+ #ifdef NET_AFEYE
++#include <atomic>
++#include <cstdlib>
+ #include <string>
+ #include "services/network/afeye_sink.h"
+ #endif
+@@ -2256,6 +2258,48 @@ void URLLoader::SetRawRequestHeadersAndNotify(
+     raw_request_headers_size_ += key.size() + value.size();
+   }
+ 
++#ifdef NET_AFEYE
++  // v12.2 (relocated from net/url_request/url_request_http_job.cc by v12.5):
++  // the cookie->header RELAY record. 0013 catches the cookie VALUE in blink;
++  // kind-18 catches Set-Cookie planting; THIS catches the attach - which
++  // cookies actually left, on which request. This callback receives the
++  // FINAL merged raw headers (the jar-built Cookie: line included), and
++  // lives in services/network where network::afeye is linked - the net/
++  // placement could not link (libnet.so has no //services/network dep,
++  // -Wl,-z,defs would kill it). Same record: EmitSpan body carries the
++  // exact line bytes so the content graph joins them to the blink
++  // cookie-set VALUE bytes (tag prefix "cookie-attach", net kind 17).
++  if (network::afeye::Enabled()) {
++    static std::atomic<uint64_t> g_afeye_catt{0};
++    static bool g_afeye_catt_off = []() {
++      const char* v = std::getenv("AFEYE_TRACE_COOKIEATTACH");
++      return v != nullptr && *v != 0 && v[0] == '0';
++    }();
++    if (!g_afeye_catt_off &&
++        g_afeye_catt.fetch_add(1, std::memory_order_relaxed) < 500000) {
++      for (const auto& [key, value] : headers.headers()) {
++        if (!base::EqualsCaseInsensitiveASCII(key, "Cookie")) {
++          continue;
++        }
++        std::string afeye_tag;
++        afeye_tag.reserve(96);
++        afeye_tag += "cookie-attach url=";
++        const std::string& afeye_u = url_request_->url().spec();
++        afeye_tag +=
++            afeye_u.substr(0, afeye_u.size() < 48 ? afeye_u.size() : 48);
++        const std::string afeye_line =
++            value.substr(0, value.size() < 640 ? value.size() : 640);
++        network::afeye::EmitSpan(
++            network::afeye::kNetReq, network::afeye::NowNs(),
++            afeye_tag.c_str(),
++            reinterpret_cast<const uint8_t*>(afeye_line.data()),
++            static_cast<uint32_t>(afeye_line.size()));
++        break;
++      }
++    }
++  }
++#endif
++
+   if (cookie_observer_) {
+     std::vector<mojom::CookieOrLineWithAccessResultPtr> reported_cookies;
+     for (const auto& cookie_with_access_result :
 diff --git a/v8/src/api/api.cc b/v8/src/api/api.cc
+index 31c6251..9f13535 100644
 --- a/v8/src/api/api.cc
 +++ b/v8/src/api/api.cc
-@@ -10378,6 +10378,37 @@ Isolate* Isolate::New(const IsolateGroup& group,
+@@ -10378,6 +10378,38 @@ Isolate* Isolate::New(const IsolateGroup& group,
                    static_cast<void*>(v8_isolate));
      v8::afeye::EmitStr(v8::afeye::kIsolateBirth, v8::afeye::NowNs(),
                         afeye_buf);
@@ -34,121 +97,14 @@ diff --git a/v8/src/api/api.cc b/v8/src/api/api.cc
 +              // for isolates whose compile never crosses LogRecordedBuffer)
 +              // and the counter shared with the log.cc hook so the 4M
 +              // cap stays ONE budget across both.
++            });
 +      }
 +    }
    }
  #endif
    return v8_isolate;
-diff --git a/v8/src/objects/js-objects.cc b/v8/src/objects/js-objects.cc
---- a/v8/src/objects/js-objects.cc
-+++ b/v8/src/objects/js-objects.cc
-@@ -1991,6 +1991,48 @@ Maybe<bool> JSReceiver::GetOwnPropertyDescriptor(LookupIterator* it,
-   Isolate* isolate = it->isolate();
-   // "Virtual" dispatch.
-   if (it->IsFound() && IsJSProxy(*it->GetHolder<JSReceiver>())) {
-+#ifdef V8_AFEYE
-+    // v12.2: the proxy branch returned into JSProxy::GOPD BEFORE the 0022
-+    // end-hook - descriptor tamper-checks over PROXIES (antifraud wraps
-+    // navigator in a proxy, then GOPDs it to detect the wrap) were
-+    // invisible. Emit the probe fact here; the 0022 end-hook still covers
-+    // non-proxy special receivers. Shares the AFEYE_TRACE_GOPD gate.
-+    if (v8::afeye::Enabled()) {
-+      static std::atomic<uint64_t> g_afeye_gopd_proxy{0};
-+      static bool g_afeye_gopd_off = []() {
-+        const char* v = ::getenv("AFEYE_TRACE_GOPD");
-+        return v != nullptr && *v != 0 && v[0] == '0';
-+      }();
-+      if (!g_afeye_gopd_off &&
-+          g_afeye_gopd_proxy.fetch_add(1, std::memory_order_relaxed) <
-+              2000000) {
-+        char afeye_key[65] = {0};
-+        {
-+          DisallowGarbageCollection afeye_no_gc;
-+          DirectHandle<Name> afeye_name = it->GetName();
-+          if (IsString(*afeye_name)) {
-+            String::FlatContent afeye_flat =
-+                Cast<String>(*afeye_name)->GetFlatContent(afeye_no_gc);
-+            if (afeye_flat.IsFlat() && afeye_flat.IsOneByte()) {
-+              uint32_t afeye_l = afeye_flat.length();
-+              if (afeye_l > 64) afeye_l = 64;
-+              const uint8_t* afeye_p = afeye_flat.ToOneByteVector().begin();
-+              for (uint32_t i = 0; i < afeye_l; ++i) {
-+                uint8_t c = afeye_p[i];
-+                afeye_key[i] =
-+                    (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
-+              }
-+            }
-+          }
-+        }
-+        char afeye_buf[128];
-+        std::snprintf(afeye_buf, sizeof(afeye_buf),
-+                      "gopd holder=proxy key=%s", afeye_key);
-+        v8::afeye::EmitStr(v8::afeye::kFingerprint, v8::afeye::NowNs(),
-+                           afeye_buf);
-+      }
-+    }
-+#endif
-     return JSProxy::GetOwnPropertyDescriptor(isolate, it->GetHolder<JSProxy>(),
-                                              it->GetName(), desc);
-   }
-diff --git a/v8/src/wasm/wasm-objects.cc b/v8/src/wasm/wasm-objects.cc
---- a/v8/src/wasm/wasm-objects.cc
-+++ b/v8/src/wasm/wasm-objects.cc
-@@ -4,7 +4,24 @@
- 
- #include "src/wasm/wasm-objects.h"
- 
-+#ifdef V8_AFEYE
-+#include <atomic>
-+#include <cstdio>
-+#include <cstdlib>
-+#include "src/afeye/sink.h"
-+#endif
-+
-+#ifdef V8_AFEYE
-+// v12.2: the wasm linear-memory boundary - every grow event. PoW-style
-+// wasm antifraud (Kasada) allocates/grows in deterministic bursts; the
-+// pattern is now a record (kind 31). Memory CONTENTS stay a black box:
-+// per-access capture needs CSA hooks that do not exist (honest limit).
-+// All three Grow exits share this helper.
-+// v12.4 (N9): the DEFINITION moved to 0001 sink.cc (the sink.h
-+// declaration alone left every other TU with an undefined symbol);
-+// this TU keeps only the include and the calls below.
-+#endif
-
- #if V8_TARGET_OS_LINUX
- #include <sys/mman.h>
- #include <sys/stat.h>
-@@ -1118,6 +1154,9 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
-     uint32_t result = static_cast<int32_t>(result_inplace.value());
-     memory_object->managed_backing_store()->UpdateEstimatedSize(
-         backing_store->byte_length(), isolate);
-+    // v12.2: wasm linear-memory grow event
-+    if (v8::afeye::Enabled())
-+      v8::afeye::EmitWasmMemGrow(old_pages, old_pages + pages);
-     return result;  // success
-   }
- 
-@@ -1137,6 +1176,9 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
-     DCHECK_EQ(result_inplace.value(), old_pages);
-     memory_object->managed_backing_store()->UpdateEstimatedSize(
-         backing_store->byte_length(), isolate);
-+    // v12.2: wasm linear-memory grow event
-+    if (v8::afeye::Enabled())
-+      v8::afeye::EmitWasmMemGrow(old_pages, old_pages + pages);
-     return static_cast<int32_t>(result_inplace.value());  // success
-   }
-   DCHECK(!has_old_buffer || !maybe_old_buffer->is_resizable_by_js());
-@@ -1181,6 +1223,8 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
-   }
-   memory_object->UpdateInstances(isolate);
- 
-+  // v12.2: wasm linear-memory grow event
-+  if (v8::afeye::Enabled()) v8::afeye::EmitWasmMemGrow(old_pages, new_pages);
-   return static_cast<int32_t>(old_pages);  // success
- }
- 
 diff --git a/v8/src/logging/log.cc b/v8/src/logging/log.cc
+index 773c24f..652cce8 100644
 --- a/v8/src/logging/log.cc
 +++ b/v8/src/logging/log.cc
 @@ -4,6 +4,14 @@
@@ -240,59 +196,103 @@ diff --git a/v8/src/logging/log.cc b/v8/src/logging/log.cc
    code_event_handler_(&event);
  }
  
-diff --git a/net/url_request/url_request_http_job.cc b/net/url_request/url_request_http_job.cc
---- a/net/url_request/url_request_http_job.cc
-+++ b/net/url_request/url_request_http_job.cc
-@@ -4,6 +4,14 @@
- 
- #include "net/url_request/url_request_http_job.h"
- 
-+#ifdef NET_AFEYE
-+#include <atomic>
-+#include <cstdio>
-+#include <cstdlib>
-+#include <string>
-+#include "services/network/afeye_sink.h"
-+#endif
-+
- #include <algorithm>
- #include <iterator>
- #include <memory>
-@@ -867,6 +875,37 @@ void URLRequestHttpJob::SetCookieHeaderAndStart(
-   if (!maybe_included_cookies.empty()) {
-     std::string cookie_line =
-         CanonicalCookie::BuildCookieLine(maybe_included_cookies);
-+#ifdef NET_AFEYE
-+    // v12.2: the cookie->header RELAY record. 0013 catches the cookie
-+    // VALUE in blink; kind-18 catches Set-Cookie planting; THIS catches
-+    // the attach - which cookies actually left, on which request. The
-+    // EmitSpan body carries the exact line bytes so the content graph
-+    // joins them to the blink cookie-set VALUE bytes (tag prefix
-+    // "cookie-attach", net kind 17). The old honest-limit called this
-+    // relay inferable; now it is a record.
-+    if (network::afeye::Enabled()) {
-+      static std::atomic<uint64_t> g_afeye_catt{0};
-+      static bool g_afeye_catt_off = []() {
-+        const char* v = std::getenv("AFEYE_TRACE_COOKIEATTACH");
+diff --git a/v8/src/objects/js-objects.cc b/v8/src/objects/js-objects.cc
+index 144dac6..90c50df 100644
+--- a/v8/src/objects/js-objects.cc
++++ b/v8/src/objects/js-objects.cc
+@@ -1991,6 +1991,48 @@ Maybe<bool> JSReceiver::GetOwnPropertyDescriptor(LookupIterator* it,
+   Isolate* isolate = it->isolate();
+   // "Virtual" dispatch.
+   if (it->IsFound() && IsJSProxy(*it->GetHolder<JSReceiver>())) {
++#ifdef V8_AFEYE
++    // v12.2: the proxy branch returned into JSProxy::GOPD BEFORE the 0022
++    // end-hook - descriptor tamper-checks over PROXIES (antifraud wraps
++    // navigator in a proxy, then GOPDs it to detect the wrap) were
++    // invisible. Emit the probe fact here; the 0022 end-hook still covers
++    // non-proxy special receivers. Shares the AFEYE_TRACE_GOPD gate.
++    if (v8::afeye::Enabled()) {
++      static std::atomic<uint64_t> g_afeye_gopd_proxy{0};
++      static bool g_afeye_gopd_off = []() {
++        const char* v = ::getenv("AFEYE_TRACE_GOPD");
 +        return v != nullptr && *v != 0 && v[0] == '0';
 +      }();
-+      if (!g_afeye_catt_off &&
-+          g_afeye_catt.fetch_add(1, std::memory_order_relaxed) < 500000) {
-+        std::string afeye_tag;
-+        afeye_tag.reserve(96);
-+        afeye_tag += "cookie-attach url=";
-+        const std::string& afeye_u = request_->url().spec();
-+        afeye_tag += afeye_u.substr(0, afeye_u.size() < 48 ? afeye_u.size() : 48);
-+        std::string afeye_line =
-+            cookie_line.substr(0, cookie_line.size() < 640 ? cookie_line.size() : 640);
-+        network::afeye::EmitSpan(
-+            network::afeye::kNetReq, network::afeye::NowNs(),
-+            afeye_tag.c_str(),
-+            reinterpret_cast<const uint8_t*>(afeye_line.data()),
-+            static_cast<uint32_t>(afeye_line.size()));
++      if (!g_afeye_gopd_off &&
++          g_afeye_gopd_proxy.fetch_add(1, std::memory_order_relaxed) <
++              2000000) {
++        char afeye_key[65] = {0};
++        {
++          DisallowGarbageCollection afeye_no_gc;
++          DirectHandle<Name> afeye_name = it->GetName();
++          if (IsString(*afeye_name)) {
++            String::FlatContent afeye_flat =
++                Cast<String>(*afeye_name)->GetFlatContent(afeye_no_gc);
++            if (afeye_flat.IsFlat() && afeye_flat.IsOneByte()) {
++              uint32_t afeye_l = afeye_flat.length();
++              if (afeye_l > 64) afeye_l = 64;
++              const uint8_t* afeye_p = afeye_flat.ToOneByteVector().begin();
++              for (uint32_t i = 0; i < afeye_l; ++i) {
++                uint8_t c = afeye_p[i];
++                afeye_key[i] =
++                    (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
++              }
++            }
++          }
++        }
++        char afeye_buf[128];
++        std::snprintf(afeye_buf, sizeof(afeye_buf),
++                      "gopd holder=proxy key=%s", afeye_key);
++        v8::afeye::EmitStr(v8::afeye::kFingerprint, v8::afeye::NowNs(),
++                           afeye_buf);
 +      }
 +    }
 +#endif
-     request_info_.extra_headers.SetHeader(HttpRequestHeaders::kCookie,
-                                           cookie_line);
+     return JSProxy::GetOwnPropertyDescriptor(isolate, it->GetHolder<JSProxy>(),
+                                              it->GetName(), desc);
+   }
+diff --git a/v8/src/wasm/wasm-objects.cc b/v8/src/wasm/wasm-objects.cc
+index 69f794f..85814c9 100644
+--- a/v8/src/wasm/wasm-objects.cc
++++ b/v8/src/wasm/wasm-objects.cc
+@@ -4,6 +4,13 @@
+ 
+ #include "src/wasm/wasm-objects.h"
+ 
++#ifdef V8_AFEYE
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include "src/afeye/sink.h"
++#endif
++
+ #if V8_TARGET_OS_LINUX
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+@@ -1118,6 +1125,9 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
+     uint32_t result = static_cast<int32_t>(result_inplace.value());
+     memory_object->managed_backing_store()->UpdateEstimatedSize(
+         backing_store->byte_length(), isolate);
++    // v12.2: wasm linear-memory grow event
++    if (v8::afeye::Enabled())
++      v8::afeye::EmitWasmMemGrow(old_pages, old_pages + pages);
+     return result;  // success
+   }
+ 
+@@ -1137,6 +1147,9 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
+     DCHECK_EQ(result_inplace.value(), old_pages);
+     memory_object->managed_backing_store()->UpdateEstimatedSize(
+         backing_store->byte_length(), isolate);
++    // v12.2: wasm linear-memory grow event
++    if (v8::afeye::Enabled())
++      v8::afeye::EmitWasmMemGrow(old_pages, old_pages + pages);
+     return static_cast<int32_t>(result_inplace.value());  // success
+   }
+   DCHECK(!has_old_buffer || !maybe_old_buffer->is_resizable_by_js());
+@@ -1181,6 +1194,8 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
+   }
+   memory_object->UpdateInstances(isolate);
+ 
++  // v12.2: wasm linear-memory grow event
++  if (v8::afeye::Enabled()) v8::afeye::EmitWasmMemGrow(old_pages, new_pages);
+   return static_cast<int32_t>(old_pages);  // success
+ }
  

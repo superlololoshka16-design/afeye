@@ -1,3 +1,40 @@
+diff --git a/third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.cc b/third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.cc
+index 9907307..9f60518 100644
+--- a/third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.cc
++++ b/third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.cc
+@@ -29,6 +29,9 @@
+  */
+ 
+ #include "third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -239,7 +242,19 @@ SerializedScriptValue::SerializedScriptValue()
+ 
+ SerializedScriptValue::SerializedScriptValue(DataBufferPtr data)
+     : data_buffer_(std::move(data)),
+-      has_registered_external_allocation_(false) {}
++      has_registered_external_allocation_(false) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    auto afeye_span = data_buffer_.as_span();
++    if (!afeye_span.empty()) {
++      blink::afeye::EmitSpan(blink::afeye::kStructuredClone,
++                             blink::afeye::NowNs(), "ssv",
++                             reinterpret_cast<const uint8_t*>(afeye_span.data()),
++                             static_cast<uint32_t>(afeye_span.size()));
++    }
++  }
++#endif
++      }
+ 
+ void SerializedScriptValue::SetImageBitmapContentsArray(
+     ImageBitmapContentsArray contents) {
+diff --git a/third_party/blink/renderer/core/dom/element.cc b/third_party/blink/renderer/core/dom/element.cc
+index 46a9172..25ed60e 100644
 --- a/third_party/blink/renderer/core/dom/element.cc
 +++ b/third_party/blink/renderer/core/dom/element.cc
 @@ -25,6 +25,10 @@
@@ -11,7 +48,7 @@
  
  #include <algorithm>
  #include <bitset>
-@@ -2527,6 +2531,17 @@
+@@ -2527,6 +2531,17 @@ bool Element::IsViewportScrollElement() {
  }
  
  int Element::clientWidth() {
@@ -29,7 +66,7 @@
    // When in strict mode, clientWidth for the document element should return the
    // width of the containing frame.
    // When in quirks mode, clientWidth for the body element should return the
-@@ -2570,6 +2585,17 @@
+@@ -2570,6 +2585,17 @@ int Element::clientWidth() {
  }
  
  int Element::clientHeight() {
@@ -47,7 +84,7 @@
    // When in strict mode, clientHeight for the document element should return
    // the height of the containing frame.
    // When in quirks mode, clientHeight for the body element should return the
-@@ -2828,6 +2854,17 @@
+@@ -2828,6 +2854,17 @@ void Element::setScrollTop(double new_top) {
  }
  
  int Element::scrollWidth() {
@@ -65,7 +102,7 @@
    if (!InActiveDocument()) {
      return 0;
    }
-@@ -2852,6 +2889,17 @@
+@@ -2852,6 +2889,17 @@ int Element::scrollWidth() {
  }
  
  int Element::scrollHeight() {
@@ -83,7 +120,7 @@
    if (!InActiveDocument()) {
      return 0;
    }
-@@ -3359,6 +3407,17 @@
+@@ -3359,6 +3407,17 @@ void Element::ClientQuads(Vector<gfx::QuadF>& quads) const {
  }
  
  DOMRectList* Element::getClientRects() {
@@ -101,7 +138,7 @@
    Vector<gfx::RectF> rects = GetClientRectsNoAdjustment();
    if (rects.empty()) {
      return MakeGarbageCollected<DOMRectList>();
-@@ -3465,7 +3524,31 @@
+@@ -3465,7 +3524,31 @@ DOMRect* Element::GetBoundingClientRectForBinding() {
    // TODO(crbug.com/1499981): This should be removed once synchronized scrolling
    // impact is understood.
    SyncScrollAttemptHeuristic::DidAccessScrollOffset();
@@ -134,9 +171,11 @@
  }
  
  ContainerQueryList* Element::matchContainer(const String& query) {
+diff --git a/third_party/blink/renderer/core/html/html_element.cc b/third_party/blink/renderer/core/html/html_element.cc
+index 8e2ed29..f99b04d 100644
 --- a/third_party/blink/renderer/core/html/html_element.cc
 +++ b/third_party/blink/renderer/core/html/html_element.cc
-@@ -24,6 +107,10 @@
+@@ -24,6 +24,10 @@
   */
  
  #include "third_party/blink/renderer/core/html/html_element.h"
@@ -147,7 +186,7 @@
  
  #include <iterator>
  
-@@ -4273,11 +4360,35 @@
+@@ -4273,11 +4277,35 @@ int HTMLElement::OffsetTopOrLeft(bool top) {
  }
  
  int HTMLElement::offsetLeftForBinding() {
@@ -185,7 +224,7 @@
  }
  
  int HTMLElement::offsetWidthForBinding() {
-@@ -4287,6 +4398,17 @@
+@@ -4287,6 +4315,17 @@ int HTMLElement::offsetWidthForBinding() {
    if (const auto* layout_object = GetLayoutBoxModelObject()) {
      result = AdjustedOffsetForZoom(layout_object->OffsetWidth());
    }
@@ -203,7 +242,7 @@
    return result;
  }
  
-@@ -4298,6 +4420,17 @@
+@@ -4298,6 +4337,17 @@ int HTMLElement::offsetHeightForBinding() {
    if (const auto* layout_object = GetLayoutBoxModelObject()) {
      result = AdjustedOffsetForZoom(layout_object->OffsetHeight());
    }
@@ -221,9 +260,382 @@
    return result;
  }
  
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index 38528f7..9368cf8 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.h"
++#ifdef BLINK_AFEYE
++#include <cstdio>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <cmath>
+ #include <cstdint>
+@@ -360,6 +364,16 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+     int sh,
+     ImageDataSettings* image_data_settings,
+     ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[160];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "canvas/get-image-data rect=%d,%d %dx%d ctx=%.48s",
++                  sx, sy, sw, sh, blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
+   if (!base::CheckMul(sw, sh).IsValid<int>()) {
+     exception_state.ThrowRangeError("Out of memory at ImageData creation");
+     return nullptr;
+@@ -1167,31 +1181,57 @@ void BaseRenderingContext2D::DrawTextInternal(
+ }
+ 
+ TextMetrics* BaseRenderingContext2D::measureText(const String& text) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[224];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "canvas/measure text=%.64s font=%.64s ctx=%.48s",
++                  text.Utf8().c_str(),
++                  GetState().UnparsedFont().Utf8().c_str(),
++                  blink::afeye::Tag());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
+   // The style resolution required for fonts is not available in frame-less
+   // documents.
+-  HTMLCanvasElement* canvas = HostAsHTMLCanvasElement();
+-
+-  if (canvas) {
+-    if (!canvas->GetDocument().GetFrame()) {
+-      return MakeGarbageCollected<TextMetrics>();
++  HTMLCanvasElement* afeye_canvas = HostAsHTMLCanvasElement();
++  TextMetrics* afeye_tm = nullptr;
++  if (afeye_canvas) {
++    if (!afeye_canvas->GetDocument().GetFrame()) {
++      afeye_tm = MakeGarbageCollected<TextMetrics>();
++    } else {
++      afeye_canvas->GetDocument().UpdateStyleAndLayoutTreeForElement(
++          afeye_canvas, DocumentUpdateReason::kCanvas);
+     }
+-
+-    canvas->GetDocument().UpdateStyleAndLayoutTreeForElement(
+-        canvas, DocumentUpdateReason::kCanvas);
+   }
+-
+-  const Font* font = AccessFont(canvas);
+-
+-  const CanvasRenderingContext2DState& state = GetState();
+-  const ComputedStyle* computed_style =
+-      canvas ? canvas->EnsureComputedStyle() : nullptr;
+-  CanvasRenderingContextHost* host = GetCanvasRenderingContextHost();
+-  TextDirection direction =
+-      ToTextDirection(state.GetDirection(), host, computed_style);
+-
+-  return MakeGarbageCollected<TextMetrics>(
+-      font, direction, state.GetTextBaseline(), state.GetTextAlign(), text,
+-      host->GetPlainTextPainter());
++  if (!afeye_tm) {
++    const Font* afeye_font = AccessFont(afeye_canvas);
++    const CanvasRenderingContext2DState& afeye_state = GetState();
++    const ComputedStyle* afeye_style =
++        afeye_canvas ? afeye_canvas->EnsureComputedStyle() : nullptr;
++    CanvasRenderingContextHost* afeye_host = GetCanvasRenderingContextHost();
++    TextDirection afeye_dir = ToTextDirection(afeye_state.GetDirection(),
++                                              afeye_host, afeye_style);
++    afeye_tm = MakeGarbageCollected<TextMetrics>(
++        afeye_font, afeye_dir, afeye_state.GetTextBaseline(),
++        afeye_state.GetTextAlign(), text, afeye_host->GetPlainTextPainter());
++  }
++#ifdef BLINK_AFEYE
++  // v12.4 (antifraud attack): the WIDTH is the measurement - the font
++  // fingerprint is sub-pixel text metrics. The ask (text+font) was
++  // already logged above; without the RESULT the two sides of the
++  // fingerprint (what was probed vs what it measured) never meet.
++  if (blink::afeye::Enabled() && afeye_tm) {
++    char afeye_buf[224];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "canvas/measure-r text=%.64s w=%.6f",
++                  text.Utf8().c_str(), afeye_tm->width());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
++  return afeye_tm;
+ }
+ 
+ String BaseRenderingContext2D::lang() const {
+diff --git a/third_party/blink/renderer/modules/crypto/crypto.cc b/third_party/blink/renderer/modules/crypto/crypto.cc
+index 5cd2723..8354e24 100644
+--- a/third_party/blink/renderer/modules/crypto/crypto.cc
++++ b/third_party/blink/renderer/modules/crypto/crypto.cc
+@@ -27,6 +27,9 @@
+  */
+ 
+ #include "third_party/blink/renderer/modules/crypto/crypto.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include "crypto/random.h"
+ #include "third_party/blink/renderer/core/dom/quota_exceeded_error.h"
+@@ -74,6 +77,17 @@ NotShared<DOMArrayBufferView> Crypto::getRandomValues(
+     return NotShared<DOMArrayBufferView>(nullptr);
+   }
+   crypto::RandBytes(array->ByteSpan());
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    auto afeye_span = array->ByteSpan();
++    if (!afeye_span.empty()) {
++      blink::afeye::EmitSpan(blink::afeye::kCryptoOp,
++                             blink::afeye::NowNs(), "getRandomValues",
++                             reinterpret_cast<const uint8_t*>(afeye_span.data()),
++                             static_cast<uint32_t>(afeye_span.size()));
++    }
++  }
++#endif
+   return array;
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
+index b456ecc..c686ccf 100644
+--- a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
++++ b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
+@@ -29,6 +29,10 @@
+  */
+ 
+ #include "third_party/blink/renderer/modules/crypto/subtle_crypto.h"
++#ifdef BLINK_AFEYE
++#include <string>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include "base/check_deref.h"
+ #include "base/task/single_thread_task_runner.h"
+@@ -234,6 +238,38 @@ bool supportsInternal(ScriptState* script_state,
+ 
+ }  // namespace
+ 
++#ifdef BLINK_AFEYE
++static void AfeyeDumpSubtleOp(const char* op,
++                              const V8BufferSource* raw_data) {
++  if (!blink::afeye::Enabled() || !raw_data) return;
++  const uint8_t* p = nullptr;
++  size_t n = 0;
++  if (raw_data->IsArrayBuffer()) {
++    const DOMArrayBuffer* b = raw_data->GetAsArrayBuffer();
++    if (b) {
++      p = reinterpret_cast<const uint8_t*>(b->Data());
++      n = b->ByteLength();
++    }
++  } else if (raw_data->IsArrayBufferView()) {
++    // v12.1: the union accessor returns NotShared<DOMArrayBufferView> - a
++    // raw-pointer assignment does not compile (in-tree precedent:
++    // GetAsArrayBufferView().Get() at subtle_crypto.cc:587).
++    NotShared<DOMArrayBufferView> v = raw_data->GetAsArrayBufferView();
++    if (v) {
++      const DOMArrayBufferView* view = v.Get();
++      auto s = view->ByteSpan();
++      p = reinterpret_cast<const uint8_t*>(s.data());
++      n = s.size();
++    }
++  }
++  if (p && n) {
++    blink::afeye::EmitSpan(blink::afeye::kCryptoOp,
++                           blink::afeye::NowNs(), op,
++                           p, static_cast<uint32_t>(n));
++  }
++}
++#endif
++
+ SubtleCrypto::SubtleCrypto() = default;
+ 
+ ScriptPromise<DOMArrayBuffer> SubtleCrypto::encrypt(
+@@ -242,6 +278,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::encrypt(
+     CryptoKey* key,
+     const V8BufferSource* raw_data,
+     ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  AfeyeDumpSubtleOp("encrypt", raw_data);
++#endif
++
+   // Method described by:
+   // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-encrypt
+ 
+@@ -292,6 +332,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::decrypt(
+     CryptoKey* key,
+     const V8BufferSource* raw_data,
+     ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  AfeyeDumpSubtleOp("decrypt", raw_data);
++#endif
++
+   // Method described by:
+   // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-decrypt
+ 
+@@ -342,6 +386,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::sign(
+     CryptoKey* key,
+     const V8BufferSource* raw_data,
+     ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  AfeyeDumpSubtleOp("sign", raw_data);
++#endif
++
+   // Method described by:
+   // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-sign
+ 
+@@ -447,6 +495,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::digest(
+     const V8AlgorithmIdentifier* raw_algorithm,
+     const V8BufferSource* raw_data,
+     ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  AfeyeDumpSubtleOp("digest", raw_data);
++#endif
++
+   // Method described by:
+   // https://w3c.github.io/webcrypto/Overview.html#SubtleCrypto-method-digest
+ 
+@@ -823,6 +875,7 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::deriveBits(
+     CryptoKey* base_key,
+     std::optional<unsigned> length_bits,
+     ExceptionState& exception_state) {
++
+   // Method described by:
+   // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-deriveBits
+ 
+diff --git a/third_party/blink/renderer/modules/mediastream/media_device_info.cc b/third_party/blink/renderer/modules/mediastream/media_device_info.cc
+index 39c9356..83c80fc 100644
+--- a/third_party/blink/renderer/modules/mediastream/media_device_info.cc
++++ b/third_party/blink/renderer/modules/mediastream/media_device_info.cc
+@@ -24,6 +24,10 @@
+  */
+ 
+ #include "third_party/blink/renderer/modules/mediastream/media_device_info.h"
++#ifdef BLINK_AFEYE
++#include <string>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include "third_party/blink/public/mojom/mediastream/media_devices.mojom-blink.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
+@@ -40,7 +44,17 @@ MediaDeviceInfo::MediaDeviceInfo(const String& device_id,
+     : device_id_(device_id),
+       label_(label),
+       group_id_(group_id),
+-      device_type_(device_type) {}
++      device_type_(device_type) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    std::string afeye_rec = "device id=" + device_id.Utf8() +
++        " group=" + group_id.Utf8() + " label=" + label.Utf8() +
++        " type=" + std::to_string(static_cast<unsigned>(device_type));
++    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
++                          afeye_rec.c_str());
++  }
++#endif
++  }
+ 
+ String MediaDeviceInfo::deviceId() const {
+   return device_id_;
+diff --git a/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc b/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc
+index 41deaa8..2fba607 100644
+--- a/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc
++++ b/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc
+@@ -29,6 +29,9 @@
+  */
+ 
+ #include "third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -828,6 +831,12 @@ ScriptPromise<RTCSessionDescriptionInit> RTCPeerConnection::createOffer(
+     ScriptState* script_state,
+     const RTCOfferOptions* options,
+     ExceptionState& exception_state) {
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    blink::afeye::EmitStr(blink::afeye::kWebrtc, blink::afeye::NowNs(),
++                          "webrtc create-offer");
++  }
++#endif
+   if (signaling_state_ ==
+       webrtc::PeerConnectionInterface::SignalingState::kClosed) {
+     exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
+@@ -1101,6 +1110,12 @@ ScriptPromise<IDLUndefined> RTCPeerConnection::setLocalDescription(
+   }
+ 
+   String sdp = session_description_init->sdp();
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled() && !sdp.empty()) {
++    blink::afeye::EmitStr(blink::afeye::kWebrtc, blink::afeye::NowNs(),
++                          ("webrtc sdp-local " + sdp.Utf8()).c_str());
++  }
++#endif
+   // https://w3c.github.io/webrtc-pc/#dom-peerconnection-setlocaldescription
+   // step 4.4 and 4.5: If SDP is empty, return the last created offer or answer.
+   if (sdp.empty()) {
+@@ -1679,6 +1694,13 @@ ScriptPromise<IDLUndefined> RTCPeerConnection::addIceCandidate(
+     const RTCIceCandidateInit* candidate,
+     ExceptionState& exception_state) {
+   DCHECK(script_state->ContextIsValid());
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled() && candidate->hasCandidate() &&
++      !candidate->candidate().empty()) {
++    blink::afeye::EmitStr(blink::afeye::kWebrtc, blink::afeye::NowNs(),
++                          ("webrtc ice " + candidate->candidate().Utf8()).c_str());
++  }
++#endif
+   if (signaling_state_ ==
+       webrtc::PeerConnectionInterface::SignalingState::kClosed) {
+     exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
+diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc b/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
+index eb3a939..0a483cb 100644
+--- a/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
++++ b/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.h"
++#ifdef BLINK_AFEYE
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <algorithm>
+ 
+@@ -226,6 +229,19 @@ void OfflineAudioDestinationHandler::SuspendOfflineRendering() {
+ 
+ void OfflineAudioDestinationHandler::FinishOfflineRendering() {
+   DCHECK(!IsMainThread());
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled() && shared_render_target_ &&
++      shared_render_target_->numberOfChannels() > 0) {
++    auto afeye_span = shared_render_target_->channels()[0].ByteSpan();
++    uint32_t afeye_n = static_cast<uint32_t>(
++        afeye_span.size() > 16384 ? 16384 : afeye_span.size());
++    if (afeye_n > 0) {
++      blink::afeye::EmitSpan(blink::afeye::kAudio, blink::afeye::NowNs(),
++                             "audio/offline-ch0",
++                             afeye_span.data(), afeye_n);
++    }
++  }
++#endif
+ 
+   // The actual rendering has been completed. Notify the context.
+   PostCrossThreadTask(
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index 403e1b3..e571f3f 100644
 --- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-@@ -24,6 +157,11 @@
+@@ -24,6 +24,11 @@
   */
  
  #include "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h"
@@ -235,7 +647,7 @@
  
  #include <inttypes.h>
  
-@@ -3874,6 +4012,15 @@
+@@ -3874,6 +3879,15 @@ bool WebGLRenderingContextBase::TimerQueryExtensionsEnabled() {
  
  ScriptObject WebGLRenderingContextBase::getExtension(ScriptState* script_state,
                                                       const String& name) {
@@ -251,7 +663,7 @@
    ExecutionContext* context = ExecutionContext::From(script_state);
  
    if (name == WebGLDebugRendererInfo::ExtensionName()) {
-@@ -3989,6 +4136,89 @@
+@@ -3989,6 +4003,89 @@ void WebGLRenderingContextBase::RecordANGLEImplementation() {
  
  ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
                                                      GLenum pname) {
@@ -341,7 +753,7 @@
    if (isContextLost())
      return ScriptValue::CreateNull(script_state->GetIsolate());
    const int kIntZero = 0;
-@@ -4487,6 +4643,17 @@
+@@ -4487,6 +4584,17 @@ String WebGLRenderingContextBase::getShaderInfoLog(WebGLShader* shader) {
  WebGLShaderPrecisionFormat* WebGLRenderingContextBase::getShaderPrecisionFormat(
      GLenum shader_type,
      GLenum precision_type) {
@@ -359,7 +771,7 @@
    if (isContextLost())
      return nullptr;
    if (!ValidateShaderType("getShaderPrecisionFormat", shader_type)) {
-@@ -4533,6 +4700,23 @@
+@@ -4533,6 +4641,23 @@ WebGLRenderingContextBase::getSupportedExtensions() {
      }
    }
  
@@ -383,399 +795,3 @@
    return result;
  }
  
---- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-+++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-@@ -3,6 +187,10 @@
- // found in the LICENSE file.
- 
- #include "third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.h"
-+#ifdef BLINK_AFEYE
-+#include <cstdio>
-+#include "third_party/blink/renderer/platform/afeye/sink.h"
-+#endif
- 
- #include <cmath>
- #include <cstdint>
-@@ -360,6 +548,16 @@
-     int sh,
-     ImageDataSettings* image_data_settings,
-     ExceptionState& exception_state) {
-+#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled()) {
-+    char afeye_buf[160];
-+    std::snprintf(afeye_buf, sizeof(afeye_buf),
-+                  "canvas/get-image-data rect=%d,%d %dx%d ctx=%.48s",
-+                  sx, sy, sw, sh, blink::afeye::Tag());
-+    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
-+                          afeye_buf);
-+  }
-+#endif
-   if (!base::CheckMul(sw, sh).IsValid<int>()) {
-     exception_state.ThrowRangeError("Out of memory at ImageData creation");
-     return nullptr;
-@@ -1167,29 +1365,54 @@
- }
- 
- TextMetrics* BaseRenderingContext2D::measureText(const String& text) {
--  // The style resolution required for fonts is not available in frame-less
--  // documents.
--  HTMLCanvasElement* canvas = HostAsHTMLCanvasElement();
--
--  if (canvas) {
--    if (!canvas->GetDocument().GetFrame()) {
--      return MakeGarbageCollected<TextMetrics>();
--    }
--
--    canvas->GetDocument().UpdateStyleAndLayoutTreeForElement(
--        canvas, DocumentUpdateReason::kCanvas);
--  }
--
--  const Font* font = AccessFont(canvas);
--
--  const CanvasRenderingContext2DState& state = GetState();
--  const ComputedStyle* computed_style =
--      canvas ? canvas->EnsureComputedStyle() : nullptr;
--  CanvasRenderingContextHost* host = GetCanvasRenderingContextHost();
--  TextDirection direction =
--      ToTextDirection(state.GetDirection(), host, computed_style);
--
--  return MakeGarbageCollected<TextMetrics>(
--      font, direction, state.GetTextBaseline(), state.GetTextAlign(), text,
--      host->GetPlainTextPainter());
--}
-+  if (blink::afeye::Enabled()) {
-+    char afeye_buf[224];
-+    std::snprintf(afeye_buf, sizeof(afeye_buf),
-+                  "canvas/measure text=%.64s font=%.64s ctx=%.48s",
-+                  text.Utf8().c_str(),
-+                  GetState().UnparsedFont().Utf8().c_str(),
-+                  blink::afeye::Tag());
-+    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
-+                          afeye_buf);
-+  }
-+#endif
-+  // The style resolution required for fonts is not available in frame-less
-+  // documents.
-+  HTMLCanvasElement* afeye_canvas = HostAsHTMLCanvasElement();
-+  TextMetrics* afeye_tm = nullptr;
-+  if (afeye_canvas) {
-+    if (!afeye_canvas->GetDocument().GetFrame()) {
-+      afeye_tm = MakeGarbageCollected<TextMetrics>();
-+    } else {
-+      afeye_canvas->GetDocument().UpdateStyleAndLayoutTreeForElement(
-+          afeye_canvas, DocumentUpdateReason::kCanvas);
-+    }
-+  }
-+  if (!afeye_tm) {
-+    const Font* afeye_font = AccessFont(afeye_canvas);
-+    const CanvasRenderingContext2DState& afeye_state = GetState();
-+    const ComputedStyle* afeye_style =
-+        afeye_canvas ? afeye_canvas->EnsureComputedStyle() : nullptr;
-+    CanvasRenderingContextHost* afeye_host = GetCanvasRenderingContextHost();
-+    TextDirection afeye_dir = ToTextDirection(afeye_state.GetDirection(),
-+                                              afeye_host, afeye_style);
-+    afeye_tm = MakeGarbageCollected<TextMetrics>(
-+        afeye_font, afeye_dir, afeye_state.GetTextBaseline(),
-+        afeye_state.GetTextAlign(), text, afeye_host->GetPlainTextPainter());
-+  }
-+#ifdef BLINK_AFEYE
-+  // v12.4 (antifraud attack): the WIDTH is the measurement - the font
-+  // fingerprint is sub-pixel text metrics. The ask (text+font) was
-+  // already logged above; without the RESULT the two sides of the
-+  // fingerprint (what was probed vs what it measured) never meet.
-+  if (blink::afeye::Enabled() && afeye_tm) {
-+    char afeye_buf[224];
-+    std::snprintf(afeye_buf, sizeof(afeye_buf),
-+                  "canvas/measure-r text=%.64s w=%.6f",
-+                  text.Utf8().c_str(), afeye_tm->width());
-+    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
-+                          afeye_buf);
-+  }
-+#endif
-+  return afeye_tm;
-+}
---- a/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
-+++ b/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
-@@ -3,6 +213,9 @@
- // found in the LICENSE file.
- 
- #include "third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.h"
-+#ifdef BLINK_AFEYE
-+#include "third_party/blink/renderer/platform/afeye/sink.h"
-+#endif
- 
- #include <algorithm>
- 
-@@ -226,6 +439,19 @@
- 
- void OfflineAudioDestinationHandler::FinishOfflineRendering() {
-   DCHECK(!IsMainThread());
-+#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled() && shared_render_target_ &&
-+      shared_render_target_->numberOfChannels() > 0) {
-+    auto afeye_span = shared_render_target_->channels()[0].ByteSpan();
-+    uint32_t afeye_n = static_cast<uint32_t>(
-+        afeye_span.size() > 16384 ? 16384 : afeye_span.size());
-+    if (afeye_n > 0) {
-+      blink::afeye::EmitSpan(blink::afeye::kAudio, blink::afeye::NowNs(),
-+                             "audio/offline-ch0",
-+                             afeye_span.data(), afeye_n);
-+    }
-+  }
-+#endif
- 
-   // The actual rendering has been completed. Notify the context.
-   PostCrossThreadTask(
---- a/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc
-+++ b/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc
-@@ -29,6 +255,9 @@
-  */
- 
- #include "third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.h"
-+#ifdef BLINK_AFEYE
-+#include "third_party/blink/renderer/platform/afeye/sink.h"
-+#endif
- 
- #include <algorithm>
- #include <memory>
-@@ -828,6 +1057,12 @@
-     ScriptState* script_state,
-     const RTCOfferOptions* options,
-     ExceptionState& exception_state) {
-+#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled()) {
-+    blink::afeye::EmitStr(blink::afeye::kWebrtc, blink::afeye::NowNs(),
-+                          "webrtc create-offer");
-+  }
-+#endif
-   if (signaling_state_ ==
-       webrtc::PeerConnectionInterface::SignalingState::kClosed) {
-     exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
-@@ -1101,6 +1336,12 @@
-   }
- 
-   String sdp = session_description_init->sdp();
-+#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled() && !sdp.empty()) {
-+    blink::afeye::EmitStr(blink::afeye::kWebrtc, blink::afeye::NowNs(),
-+                          ("webrtc sdp-local " + sdp.Utf8()).c_str());
-+  }
-+#endif
-   // https://w3c.github.io/webrtc-pc/#dom-peerconnection-setlocaldescription
-   // step 4.4 and 4.5: If SDP is empty, return the last created offer or answer.
-   if (sdp.empty()) {
-@@ -1679,6 +1920,13 @@
-     const RTCIceCandidateInit* candidate,
-     ExceptionState& exception_state) {
-   DCHECK(script_state->ContextIsValid());
-+#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled() && candidate->hasCandidate() &&
-+      !candidate->candidate().empty()) {
-+    blink::afeye::EmitStr(blink::afeye::kWebrtc, blink::afeye::NowNs(),
-+                          ("webrtc ice " + candidate->candidate().Utf8()).c_str());
-+  }
-+#endif
-   if (signaling_state_ ==
-       webrtc::PeerConnectionInterface::SignalingState::kClosed) {
-     exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
---- a/third_party/blink/renderer/modules/mediastream/media_device_info.cc
-+++ b/third_party/blink/renderer/modules/mediastream/media_device_info.cc
-@@ -24,6 +272,10 @@
-  */
- 
- #include "third_party/blink/renderer/modules/mediastream/media_device_info.h"
-+#ifdef BLINK_AFEYE
-+#include <string>
-+#include "third_party/blink/renderer/platform/afeye/sink.h"
-+#endif
- 
- #include "third_party/blink/public/mojom/mediastream/media_devices.mojom-blink.h"
- #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
-@@ -41,6 +293,16 @@
-       label_(label),
-       group_id_(group_id),
--      device_type_(device_type) {}
-+      device_type_(device_type) {
-+#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled()) {
-+    std::string afeye_rec = "device id=" + device_id.Utf8() +
-+        " group=" + group_id.Utf8() + " label=" + label.Utf8() +
-+        " type=" + std::to_string(static_cast<unsigned>(device_type));
-+    blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
-+                          afeye_rec.c_str());
-+  }
-+#endif
-+  }
- 
- String MediaDeviceInfo::deviceId() const {
-   return device_id_;
---- a/third_party/blink/renderer/modules/crypto/crypto.cc
-+++ b/third_party/blink/renderer/modules/crypto/crypto.cc
-@@ -27,6 +289,9 @@
-  */
- 
- #include "third_party/blink/renderer/modules/crypto/crypto.h"
-+#ifdef BLINK_AFEYE
-+#include "third_party/blink/renderer/platform/afeye/sink.h"
-+#endif
- 
- #include "crypto/random.h"
- #include "third_party/blink/renderer/core/dom/quota_exceeded_error.h"
-@@ -74,6 +339,17 @@
-     return NotShared<DOMArrayBufferView>(nullptr);
-   }
-   crypto::RandBytes(array->ByteSpan());
-+#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled()) {
-+    auto afeye_span = array->ByteSpan();
-+    if (!afeye_span.empty()) {
-+      blink::afeye::EmitSpan(blink::afeye::kCryptoOp,
-+                             blink::afeye::NowNs(), "getRandomValues",
-+                             reinterpret_cast<const uint8_t*>(afeye_span.data()),
-+                             static_cast<uint32_t>(afeye_span.size()));
-+    }
-+  }
-+#endif
-   return array;
- }
- 
---- a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
-+++ b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
-@@ -29,6 +305,10 @@
-  */
- 
- #include "third_party/blink/renderer/modules/crypto/subtle_crypto.h"
-+#ifdef BLINK_AFEYE
-+#include <string>
-+#include "third_party/blink/renderer/platform/afeye/sink.h"
-+#endif
- 
- #include "base/check_deref.h"
- #include "base/task/single_thread_task_runner.h"
-@@ -234,6 +514,38 @@
- 
- }  // namespace
- 
-+#ifdef BLINK_AFEYE
-+static void AfeyeDumpSubtleOp(const char* op,
-+                              const V8BufferSource* raw_data) {
-+  if (!blink::afeye::Enabled() || !raw_data) return;
-+  const uint8_t* p = nullptr;
-+  size_t n = 0;
-+  if (raw_data->IsArrayBuffer()) {
-+    const DOMArrayBuffer* b = raw_data->GetAsArrayBuffer();
-+    if (b) {
-+      p = reinterpret_cast<const uint8_t*>(b->Data());
-+      n = b->ByteLength();
-+    }
-+  } else if (raw_data->IsArrayBufferView()) {
-+    // v12.1: the union accessor returns NotShared<DOMArrayBufferView> - a
-+    // raw-pointer assignment does not compile (in-tree precedent:
-+    // GetAsArrayBufferView().Get() at subtle_crypto.cc:587).
-+    NotShared<DOMArrayBufferView> v = raw_data->GetAsArrayBufferView();
-+    if (v) {
-+      const DOMArrayBufferView* view = v.Get();
-+      auto s = view->ByteSpan();
-+      p = reinterpret_cast<const uint8_t*>(s.data());
-+      n = s.size();
-+    }
-+  }
-+  if (p && n) {
-+    blink::afeye::EmitSpan(blink::afeye::kCryptoOp,
-+                           blink::afeye::NowNs(), op,
-+                           p, static_cast<uint32_t>(n));
-+  }
-+}
-+#endif
-+
- SubtleCrypto::SubtleCrypto() = default;
- 
- ScriptPromise<DOMArrayBuffer> SubtleCrypto::encrypt(
-@@ -242,6 +554,10 @@
-     CryptoKey* key,
-     const V8BufferSource* raw_data,
-     ExceptionState& exception_state) {
-+#ifdef BLINK_AFEYE
-+  AfeyeDumpSubtleOp("encrypt", raw_data);
-+#endif
-+
-   // Method described by:
-   // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-encrypt
- 
-@@ -292,6 +608,10 @@
-     CryptoKey* key,
-     const V8BufferSource* raw_data,
-     ExceptionState& exception_state) {
-+#ifdef BLINK_AFEYE
-+  AfeyeDumpSubtleOp("decrypt", raw_data);
-+#endif
-+
-   // Method described by:
-   // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-decrypt
- 
-@@ -342,6 +662,10 @@
-     CryptoKey* key,
-     const V8BufferSource* raw_data,
-     ExceptionState& exception_state) {
-+#ifdef BLINK_AFEYE
-+  AfeyeDumpSubtleOp("sign", raw_data);
-+#endif
-+
-   // Method described by:
-   // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-sign
- 
-@@ -447,6 +771,10 @@
-     const V8AlgorithmIdentifier* raw_algorithm,
-     const V8BufferSource* raw_data,
-     ExceptionState& exception_state) {
-+#ifdef BLINK_AFEYE
-+  AfeyeDumpSubtleOp("digest", raw_data);
-+#endif
-+
-   // Method described by:
-   // https://w3c.github.io/webcrypto/Overview.html#SubtleCrypto-method-digest
- 
-@@ -823,6 +1151,10 @@
-     CryptoKey* base_key,
-     std::optional<unsigned> length_bits,
-     ExceptionState& exception_state) {
-+#ifdef BLINK_AFEYE
-+  AfeyeDumpSubtleOp("deriveBits", raw_data);
-+#endif
-+
-   // Method described by:
-   // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-deriveBits
- 
---- a/third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.cc
-+++ b/third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.cc
-@@ -29,6 +361,9 @@
-  */
- 
- #include "third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.h"
-+#ifdef BLINK_AFEYE
-+#include "third_party/blink/renderer/platform/afeye/sink.h"
-+#endif
- 
- #include <algorithm>
- #include <memory>
-@@ -239,7 +574,19 @@
- 
- SerializedScriptValue::SerializedScriptValue(DataBufferPtr data)
-     : data_buffer_(std::move(data)),
--      has_registered_external_allocation_(false) {}
-+      has_registered_external_allocation_(false) {
-+#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled()) {
-+    auto afeye_span = data_buffer_.as_span();
-+    if (!afeye_span.empty()) {
-+      blink::afeye::EmitSpan(blink::afeye::kStructuredClone,
-+                             blink::afeye::NowNs(), "ssv",
-+                             reinterpret_cast<const uint8_t*>(afeye_span.data()),
-+                             static_cast<uint32_t>(afeye_span.size()));
-+    }
-+  }
-+#endif
-+      }
- 
- void SerializedScriptValue::SetImageBitmapContentsArray(
-     ImageBitmapContentsArray contents) {

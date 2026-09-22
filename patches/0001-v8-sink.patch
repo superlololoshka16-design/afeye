@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000000..1111111111
 --- /dev/null
 +++ b/v8/src/afeye/sink.h
-@@ -0,0 +0,58 @@
+@@ -0,0 +0,59 @@
 +#ifndef V8_AFEYE_SINK_H_
 +#define V8_AFEYE_SINK_H_
 +
@@ -68,7 +68,7 @@ new file mode 100644
 index 0000000000..1111111111
 --- /dev/null
 +++ b/v8/src/afeye/sink.cc
-@@ -0,0 +58,284 @@
+@@ -0,0 +58,378 @@
 +#include "src/afeye/sink.h"
 +
 +#ifdef V8_AFEYE

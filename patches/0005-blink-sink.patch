@@ -80,7 +80,7 @@ diff --git a/third_party/blink/renderer/platform/afeye/sink.cc b/third_party/bli
 new file mode 100644
 --- /dev/null
 +++ b/third_party/blink/renderer/platform/afeye/sink.cc
-@@ -0,0 +73,286 @@
+@@ -0,0 +73,348 @@
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +
 +#ifdef BLINK_AFEYE

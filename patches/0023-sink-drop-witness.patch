@@ -1,6 +1,8 @@
+diff --git a/services/network/afeye_sink.cc b/services/network/afeye_sink.cc
+index 941dd49..1bd3aa8 100644
 --- a/services/network/afeye_sink.cc
 +++ b/services/network/afeye_sink.cc
-@@ -92,6 +92,29 @@ void EmitHello(int fd) {
+@@ -98,6 +98,29 @@ void EmitHello(int fd) {
    WriteAll(fd, rec, total);
  }
  
@@ -30,10 +32,10 @@
  void DrainLoop() {
    char pid[16];
    std::snprintf(pid, sizeof(pid), "%d", static_cast<int>(::getpid()));
-@@ -99,6 +122,10 @@ void DrainLoop() {
-   int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
-   if (fd >= 0) EmitHello(fd);
-   std::vector<uint8_t> buf;
+@@ -108,6 +131,10 @@ void DrainLoop() {
+   // outside it - buf.assign() malloc'd up to 1 MiB INSIDE the ring lock.
+   static thread_local std::vector<uint8_t> buf;
+   buf.resize(kMaxRecord);
 +  // drop-report throttling: emit at most ~10/s and only when the count moved,
 +  // so a sustained overflow cannot itself flood the file.
 +  uint64_t reported_drops = 0;
@@ -41,7 +43,7 @@
    for (;;) {
      size_t len = 0;
      bool have = false;
-@@ -130,6 +157,21 @@ void DrainLoop() {
+@@ -150,6 +177,22 @@ void DrainLoop() {
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds(500));
      }
@@ -60,9 +62,12 @@
 +          last_report_ns = now_ns;
 +        }
 +      }
++    }
    }
  }
  
+diff --git a/services/network/afeye_sink.h b/services/network/afeye_sink.h
+index 8b85e1a..5a020c2 100644
 --- a/services/network/afeye_sink.h
 +++ b/services/network/afeye_sink.h
 @@ -14,6 +14,12 @@ enum EventKind : uint8_t {
@@ -78,9 +83,11 @@
  };
  
  bool Enabled();
+diff --git a/third_party/blink/renderer/platform/afeye/sink.cc b/third_party/blink/renderer/platform/afeye/sink.cc
+index 2b8aa43..9183c25 100644
 --- a/third_party/blink/renderer/platform/afeye/sink.cc
 +++ b/third_party/blink/renderer/platform/afeye/sink.cc
-@@ -92,6 +92,29 @@ void EmitHello(int fd) {
+@@ -113,6 +113,29 @@ void EmitHello(int fd) {
    WriteAll(fd, rec, total);
  }
  
@@ -110,10 +117,10 @@
  void DrainLoop() {
    char pid[16];
    std::snprintf(pid, sizeof(pid), "%d", static_cast<int>(::getpid()));
-@@ -99,6 +122,10 @@ void DrainLoop() {
-   int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
-   if (fd >= 0) EmitHello(fd);
-   std::vector<uint8_t> buf;
+@@ -123,6 +146,10 @@ void DrainLoop() {
+   // outside it - buf.assign() malloc'd up to 1 MiB INSIDE the ring lock.
+   static thread_local std::vector<uint8_t> buf;
+   buf.resize(kMaxRecord);
 +  // drop-report throttling: emit at most ~10/s and only when the count moved,
 +  // so a sustained overflow cannot itself flood the file.
 +  uint64_t reported_drops = 0;
@@ -121,7 +128,7 @@
    for (;;) {
      size_t len = 0;
      bool have = false;
-@@ -130,6 +157,19 @@ void DrainLoop() {
+@@ -165,6 +192,19 @@ void DrainLoop() {
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds(500));
      }
@@ -141,9 +148,11 @@
    }
  }
  
+diff --git a/third_party/blink/renderer/platform/afeye/sink.h b/third_party/blink/renderer/platform/afeye/sink.h
+index 14418a2..ca2adb4 100644
 --- a/third_party/blink/renderer/platform/afeye/sink.h
 +++ b/third_party/blink/renderer/platform/afeye/sink.h
-@@ -41,6 +41,12 @@ enum EventKind : uint8_t {
+@@ -42,6 +42,12 @@ enum EventKind : uint8_t {
    // the token pipeline, so the Rust filter can run content-runs across them
    // (backward slice by DATA, not by timer).
    kTaintEdge = 37,
@@ -156,9 +165,11 @@
  };
  
  bool Enabled();
+diff --git a/v8/src/afeye/sink.cc b/v8/src/afeye/sink.cc
+index 65992de..1460bee 100644
 --- a/v8/src/afeye/sink.cc
 +++ b/v8/src/afeye/sink.cc
-@@ -92,6 +92,29 @@ void EmitHello(int fd) {
+@@ -111,6 +111,29 @@ void EmitHello(int fd) {
    WriteAll(fd, rec, total);
  }
  
@@ -188,10 +199,10 @@
  void DrainLoop() {
    char pid[16];
    std::snprintf(pid, sizeof(pid), "%d", static_cast<int>(::getpid()));
-@@ -99,6 +122,10 @@ void DrainLoop() {
-   int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
-   if (fd >= 0) EmitHello(fd);
-   std::vector<uint8_t> buf;
+@@ -125,6 +148,10 @@ void DrainLoop() {
+   // Now: copy under lock into a pre-sized buffer, write outside it.
+   static thread_local std::vector<uint8_t> buf;
+   buf.resize(kMaxRecord);
 +  // drop-report throttling: emit at most ~10/s and only when the count moved,
 +  // so a sustained overflow cannot itself flood the file.
 +  uint64_t reported_drops = 0;
@@ -199,7 +210,7 @@
    for (;;) {
      size_t len = 0;
      bool have = false;
-@@ -130,6 +157,19 @@ void DrainLoop() {
+@@ -172,6 +199,19 @@ void DrainLoop() {
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds(500));
      }
@@ -219,6 +230,8 @@
    }
  }
  
+diff --git a/v8/src/afeye/sink.h b/v8/src/afeye/sink.h
+index dc5ef13..1217581 100644
 --- a/v8/src/afeye/sink.h
 +++ b/v8/src/afeye/sink.h
 @@ -35,6 +35,12 @@ enum EventKind : uint8_t {

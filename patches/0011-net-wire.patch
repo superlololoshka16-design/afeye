@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000000..1111111111
 --- /dev/null
 +++ b/services/network/afeye_sink.h
-@@ -0,0 +0,37 @@
+@@ -0,0 +0,38 @@
 +#ifndef SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
 +#define SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
 +
@@ -47,7 +47,7 @@ new file mode 100644
 index 0000000000..1111111111
 --- /dev/null
 +++ b/services/network/afeye_sink.cc
-@@ -0,0 +37,280 @@
+@@ -0,0 +37,315 @@
 +#include "services/network/afeye_sink.h"
 +
 +#ifdef NET_AFEYE
