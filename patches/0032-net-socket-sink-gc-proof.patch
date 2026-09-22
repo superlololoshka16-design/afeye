@@ -1,0 +1,351 @@
+diff --git a/services/network/chunked_data_pipe_upload_data_stream.cc b/services/network/chunked_data_pipe_upload_data_stream.cc
+index 8da5039..fd89dbc 100644
+--- a/services/network/chunked_data_pipe_upload_data_stream.cc
++++ b/services/network/chunked_data_pipe_upload_data_stream.cc
+@@ -16,6 +16,22 @@
+ #include "net/base/io_buffer.h"
+ #include "net/base/net_errors.h"
+ 
++#ifdef NET_AFEYE
++// afeye (0032): the STREAMING request-body wire funnel. ReadInternal below is
++// where a streaming (chunked) fetch/upload body materializes into the net
++// IOBuffer right before net's HTTP layer hands it to the socket for writing -
++// the single services/network-side point for streaming bodies that 0011's
++// non-streaming req-body span (url_loader.cc SetUpUpload) misses. This is a
++// CONTENT sink via network::afeye (the 0011/0025 precedent): services/network
++// has NO //v8 dep (BUILD.gn deps = //base,//net,//services/network/public/*,
++// verified) and runs in a SEPARATE process from the renderer's v8 taint store,
++// so v8::afeye::TaintGet is neither linkable nor meaningful here. The honest
++// cross-process `proven` path is the Rust filter content-matching these exact
++// wire bytes against the renderer-side taint captures (0027 kSrcFingerprint
++// birth + Factory propagation). Emitting a fake TaintGet here would be a lie.
++#include "services/network/afeye_sink.h"
++#endif
++
+ namespace network {
+ 
+ ChunkedDataPipeUploadDataStream::ChunkedDataPipeUploadDataStream(
+@@ -123,6 +139,22 @@ int ChunkedDataPipeUploadDataStream::ReadInternal(net::IOBuffer* buf,
+   MojoResult rv = data_pipe_->ReadData(MOJO_READ_DATA_FLAG_NONE,
+                                        buf->first(num_bytes), num_bytes);
+   if (rv == MOJO_RESULT_OK) {
++#ifdef NET_AFEYE
++    // afeye (0032): the streaming request body hitting the wire funnel. At
++    // this point num_bytes (the ReadData out-param, data_pipe.h:163-180) is
++    // the ACTUAL byte count read into buf, and net's HTTP layer hands this
++    // buffer to the socket. Emit the CONTENT span so the Rust filter can
++    // content-match the exact wire bytes against renderer taint captures.
++    // Head-capped at 256 KiB like the 0011 req-body/resp-body spans (the
++    // content graph hashes the head; the full body is unbounded on the wire).
++    if (network::afeye::Enabled() && num_bytes > 0) {
++      network::afeye::EmitSpan(network::afeye::kNetReq,
++                               network::afeye::NowNs(), "req-body-stream",
++                               reinterpret_cast<const uint8_t*>(buf->data()),
++                               static_cast<uint32_t>(
++                                   num_bytes > 0x40000 ? 0x40000 : num_bytes));
++    }
++#endif
+     bytes_read_ += num_bytes;
+     // Not needed for correctness, but this allows the consumer to send the
+     // final chunk and the end of stream message together, for protocols that
+diff --git a/third_party/blink/renderer/core/messaging/message_port.cc b/third_party/blink/renderer/core/messaging/message_port.cc
+index c9fd4c6..ae9459d 100644
+--- a/third_party/blink/renderer/core/messaging/message_port.cc
++++ b/third_party/blink/renderer/core/messaging/message_port.cc
+@@ -61,6 +61,33 @@
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_functional.h"
+ #include "third_party/blink/renderer/platform/wtf/text/atomic_string.h"
+ 
++#ifdef BLINK_AFEYE
++#include <cstdio>
++// afeye (0032): the postMessage SINK. Two parts:
++//  (1) CONTENT span of the serialized wire bytes (msg.message->GetWireData(),
++//      serialized_script_value.h:213, public) via the blink sink, so the Rust
++//      filter can content-match a postMessage payload against renderer taint
++//      captures even for non-String (object) payloads.
++//  (2) a REAL in-renderer taint verdict: when the posted message is a String,
++//      its heap-address key is queried via the v8 taint ABI (0027) and, if
++//      tainted, emitted through afeye_taint_emit_sink -> the same
++//      "taint-sink post-message space=0 key=.. tag=.." record the proven
++//      verdict consumer already matches. The blink sink cannot include
++//      v8-internal headers (different component), so the extern "C" ABI
++//      symbols are declared locally - identical signatures to
++//      v8/src/afeye/taint_abi.h:37/46/53 (the 0027 idl_member_installer.cc
++//      pattern). The String key is reinterpret_cast<uint64_t>(*str) ==
++//      Tagged<String>::address() (proven at idl_member_installer.cc:102-103,
++//      v8-handle-base.h:139 + tagged.h:508), the SAME identity the Factory
++//      propagation (0027) and the kSrcFingerprint birth tag key on.
++#include "base/containers/span.h"
++#include "third_party/blink/renderer/bindings/core/v8/serialization/serialized_script_value.h"
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++extern "C" uint32_t afeye_taint_get_string(uint64_t key);
++extern "C" void afeye_taint_emit_sink(const char* sink, uint8_t space,
++                                      uint64_t key, uint32_t tag);
++#endif
++
+ namespace blink {
+ 
+ MessagePort::MessagePort(ExecutionContext& execution_context)
+@@ -117,6 +144,47 @@ void MessagePort::postMessage(ScriptState* script_state,
+     return;
+   DCHECK(msg.message);
+ 
++#ifdef BLINK_AFEYE
++  // afeye (0032): the postMessage SINK - the actual dispatch point. Every
++  // MessagePort/MessageChannel/BroadcastChannel post funnels through this
++  // 4-arg overload - the 3-arg one at message_port.cc:118 forwards here.
++  // Runs in the RENDERER, same process as the v8 taint store, so this is a
++  // REAL taint verdict, not a content heuristic.
++  if (blink::afeye::Enabled() && msg.message) {
++    // (1) String payload -> query the v8 heap-shadow taint by the String's
++    // address() key (identical to the 0027 Factory propagation +
++    // kSrcFingerprint birth identity) and emit the taint-sink record the
++    // proven-verdict consumer already matches. space=0 is kKeyHeap
++    // (taint.h:52-57).
++    v8::Local<v8::Value> afeye_msg = message.V8Value();
++    if (!afeye_msg.IsEmpty() && afeye_msg->IsString()) {
++      v8::Local<v8::String> afeye_str = afeye_msg.As<v8::String>();
++      uint64_t afeye_key = reinterpret_cast<uint64_t>(*afeye_str);
++      uint32_t afeye_tag = afeye_taint_get_string(afeye_key);
++      if (afeye_tag != 0) {
++        afeye_taint_emit_sink("post-message", 0 /* kKeyHeap */, afeye_key,
++                              afeye_tag);
++      }
++    }
++    // (2) CONTENT span of the serialized wire bytes - covers EVERY payload
++    // shape (objects, arrays, non-String): the Rust filter content-matches
++    // these bytes against renderer taint captures, so an object assembled
++    // from tainted strings still joins the graph by DATA. GetWireData() is
++    // public (serialized_script_value.h:213-215, public section at :85).
++    base::span<const uint8_t> afeye_wire = msg.message->GetWireData();
++    if (!afeye_wire.empty()) {
++      char afeye_tag_buf[64];
++      std::snprintf(afeye_tag_buf, sizeof(afeye_tag_buf), "post-message len=%u",
++                    static_cast<unsigned>(afeye_wire.size()));
++      blink::afeye::EmitSpan(blink::afeye::kMessage, blink::afeye::NowNs(),
++                             afeye_tag_buf, afeye_wire.data(),
++                             static_cast<uint32_t>(
++                                 afeye_wire.size() > 0x40000 ? 0x40000
++                                                             : afeye_wire.size()));
++    }
++  }
++#endif
++
+   // Make sure we aren't connected to any of the passed-in ports.
+   for (unsigned i = 0; i < transferables.message_ports.size(); ++i) {
+     if (transferables.message_ports[i] == this) {
+diff --git a/v8/src/afeye/gc_witness.cc b/v8/src/afeye/gc_witness.cc
+new file mode 100644
+index 0000000..2f4d8c3
+--- /dev/null
++++ b/v8/src/afeye/gc_witness.cc
+@@ -0,0 +1,93 @@
++#include "src/afeye/gc_witness.h"
++
++#ifdef V8_AFEYE
++
++#include <cstdio>
++
++#include "src/afeye/sink.h"
++#include "src/afeye/taint.h"
++
++namespace v8 {
++namespace afeye {
++
++// afeye (0032): the GC dead-end witness callback. Registered once per isolate
++// by Heap::SetUp via Heap::AddGCEpilogueCallback (verified against the real
++// 153 source: heap.cc:6447 AddGCEpilogueCallback(GCCallbackWithData, GCType,
++// void*); the existing HeapLayoutTracer registration at heap.cc:5874-5875 is
++// the in-file precedent, and its callback signature - heap-layout-tracer.h:22
++// GCEpiloguePrintHeapLayout(v8::Isolate*, v8::GCType, v8::GCCallbackFlags,
++// void*) - is exactly GCCallbackWithData, v8-isolate.h:1167-1168).
++//
++// THIS CALLBACK OWNS THE WIPE. Ordering is rigid and matters: the union
++// readers (TaintLiveHeapTagUnion / TaintSunkUnion, taint.cc:196/209 added by
++// 0027) walk the LIVE g_taint table, so they MUST run BEFORE TaintOnGCEpilogue
++// clears the heap/stack/context spaces. Sequence:
++//   (a) compute `compacting` from the gc_type bits,
++//   (b) read live = TaintLiveHeapTagUnion(), sunk = TaintSunkUnion(),
++//   (c) emit the swept / dead-end prose records,
++//   (d) call TaintOnGCEpilogue(compacting) to clear the moved-identity spaces.
++// v8 does NOT register a second epilogue callback for the wipe (0027 stays
++// wipe-free) - this single callback is the whole GC-taint seam, so ordering is
++// deterministic regardless of the callback list's invoke order.
++//
++// `compacting` semantics match TaintOnGCEpilogue's own contract (taint.h:80-83
++// "true for mark-compact / scavenges that move objects"): the three MOVING
++// collection types set it. kGCTypeIncrementalMarking / kGCTypeProcessWeak-
++// Callbacks epilogues are not moving-collection completions, so they neither
++// wipe nor witness (the store is untouched). Enum values verified at
++// include/v8-callbacks.h:154-162 (kGCTypeScavenge = 1 << 0,
++// kGCTypeMinorMarkSweep = 1 << 1, kGCTypeMarkSweepCompact = 1 << 2).
++void GCEpilogueWitness(v8::Isolate* isolate, v8::GCType gc_type,
++                       v8::GCCallbackFlags flags, void* data) {
++  if (!TaintEnabled()) return;
++
++  // (a) A collection that MOVES objects: heap/stack/context address keys go
++  // stale, so TaintOnGCEpilogue will wipe them. The witness only fires here -
++  // a non-moving epilogue leaves the store intact, so nothing is swept.
++  const bool compacting =
++      (gc_type & (v8::kGCTypeScavenge | v8::kGCTypeMinorMarkSweep |
++                  v8::kGCTypeMarkSweepCompact)) != 0;
++  if (!compacting) return;
++
++  // (b) READ BEFORE WIPE. live = OR of every tag currently in a swept space
++  // (kKeyHeap/kKeyStack/kKeyContext; kKeyWasm survives compaction and is
++  // excluded by the reader - taint.cc:203). sunk = OR of every tag that ever
++  // crossed an in-renderer TaintEmitSink (taint.cc:191-193, fed by the
++  // postMessage path and any other in-v8 sink). Both walk the live table, so
++  // this MUST precede the (d) wipe.
++  const TaintTag live = TaintLiveHeapTagUnion();
++  const TaintTag sunk = TaintSunkUnion();
++
++  // (c) The two process-level FACT records. They are run-level (a GC has no
++  // active JS entry to attribute), consumed by the Rust filter as report
++  // fields taint_swept_union / taint_deadend_union - exact prefixes locked
++  // with the consumer. "swept" = these sources were live in the heap shadow
++  // and are being collected now. "deadend" = swept AND never reached an
++  // in-renderer sink: (live & ~sunk) is the conservative in-renderer
++  // dead-end - the authoritative cross-process proven/dead-end is the Rust
++  // content-match of the socket-write bytes (0032 req-body-stream / 0011
++  // req-body spans) against the renderer taint captures, because the
++  // network-service process cannot see this store.
++  if (live != kSrcNone) {
++    char buf[96];
++    std::snprintf(buf, sizeof(buf), "taint-swept tag=%x",
++                  static_cast<unsigned>(live));
++    EmitStr(kFingerprint, NowNs(), buf);
++    const TaintTag dead = static_cast<TaintTag>(live & ~sunk);
++    if (dead != kSrcNone) {
++      std::snprintf(buf, sizeof(buf), "taint-deadend tag=%x",
++                    static_cast<unsigned>(dead));
++      EmitStr(kFingerprint, NowNs(), buf);
++    }
++  }
++
++  // (d) WIPE LAST. Clears kKeyHeap/kKeyStack/kKeyContext so a recycled address
++  // can never inherit a stale tag (taint.h:44-51, taint.cc:157-175). kKeyWasm
++  // survives - the linear-memory backing store is off-heap and does not move.
++  TaintOnGCEpilogue(compacting);
++}
++
++}  // namespace afeye
++}  // namespace v8
++
++#endif  // V8_AFEYE
+diff --git a/v8/src/afeye/gc_witness.h b/v8/src/afeye/gc_witness.h
+new file mode 100644
+index 0000000..fb5547a
+--- /dev/null
++++ b/v8/src/afeye/gc_witness.h
+@@ -0,0 +1,67 @@
++#ifndef V8_AFEYE_GC_WITNESS_H_
++#define V8_AFEYE_GC_WITNESS_H_
++
++#include <stdint.h>
++
++// GCType / GCCallbackFlags enums + the Isolate forward declaration the
++// callback signature needs (heap-layout-tracer.h:8 is the in-tree precedent
++// for a GC-callback header including exactly this).
++#include "include/v8-callbacks.h"
++
++#ifdef V8_AFEYE
++
++namespace v8 {
++namespace afeye {
++
++// afeye (0032): GC dead-end witness. This module turns the heap-shadow taint
++// store (taint.cc, 0027) into an OBSERVABLE FACT: which fingerprint sources
++// were live in the renderer at each moving GC, and which reached a sink vs.
++// which were swept without ever crossing one. The `dead-end-proven` verdict
++// becomes a FACT (the tainted value was collected and provably never hit an
++// in-renderer sink) instead of a heuristic ("no link + no ring drops").
++//
++// ARCHITECTURE (verified at chromium 153.0.8010.52 / v8 rev d1fed5cd):
++// - The taint store lives in v8 (RENDERER process). services/network (the
++//   network-service process) has NO //v8 dep (services/network/BUILD.gn deps:
++//   //base, //net, //services/network/public/* - verified) and the harness
++//   runs multi-process (no --single-process in the launch flags), so the
++//   socket sink in url_loader/chunked-stream emits CONTENT BYTES
++//   (network::afeye), which the Rust filter content-matches against
++//   renderer-side taint captures => cross-process `proven`.
++// - This witness runs in the RENDERER at each GC epilogue. It reads the
++//   private g_taint aggregate via the taint.cc helpers (0027):
++//   TaintLiveHeapTagUnion() (taint.cc:196) returns the OR of all live
++//   heap/stack/context-space tags BEFORE TaintOnGCEpilogue clears them;
++//   TaintSunkUnion() (taint.cc:209) returns the OR of every tag that ever
++//   crossed TaintEmitSink (an in-renderer sink, incl. the postMessage path).
++// - Record shapes (kind-16 prose, exact prefixes locked with the Rust
++//   consumer): "taint-swept tag=<hex>" and "taint-deadend tag=<hex>"
++//   (deadend = live & ~sunk). These are PROCESS-level facts with no active JS
++//   entry at GC time; the Rust filter consumes them as run-level report
++//   fields (taint_swept_union / taint_deadend_union), NOT per-chain verdicts.
++//
++// GC epoch soundness: a heap address key is only valid within a GC epoch
++// (taint.h:44-51). TaintOnGCEpilogue clears kKeyHeap/kKeyStack/kKeyContext at
++// a moving GC (kKeyWasm survives - the wasm linear-memory backing store is
++// off-heap and fixed). This witness queries the live union BEFORE the clear,
++// so it reports exactly what was in the store at sweep time.
++
++// GC epilogue callback (registered via Heap::AddGCEpilogueCallback from
++// Heap::SetUp, once per isolate - heap.cc:6447; the HeapLayoutTracer
++// registration at heap.cc:5874-5875 is the in-file precedent). Signature =
++// v8::Isolate::GCCallbackWithData (v8-isolate.h:1167-1168; identical to
++// HeapLayoutTracer::GCEpiloguePrintHeapLayout, heap-layout-tracer.h:22).
++//
++// THIS CALLBACK OWNS THE WIPE: it (a) computes `compacting` from the gc_type
++// bits, (b) reads both unions, (c) emits the swept/dead-end records, (d) THEN
++// calls TaintOnGCEpilogue(compacting). v8 registers no second epilogue
++// callback for the wipe, so the read-before-wipe ordering is deterministic.
++void GCEpilogueWitness(v8::Isolate* isolate, v8::GCType gc_type,
++                       v8::GCCallbackFlags flags, void* data);
++
++}  // namespace afeye
++}  // namespace v8
++
++#endif  // V8_AFEYE
++
++#endif  // V8_AFEYE_GC_WITNESS_H_
+diff --git a/v8/src/heap/heap.cc b/v8/src/heap/heap.cc
+index 0cf75de..b48e01c 100644
+--- a/v8/src/heap/heap.cc
++++ b/v8/src/heap/heap.cc
+@@ -17,6 +17,15 @@
+ #include "include/v8-callbacks.h"
+ #include "include/v8-cppgc.h"
+ #include "include/v8-locker.h"
++#ifdef V8_AFEYE
++// afeye (0032): the GC dead-end witness. Registered per-isolate at the end of
++// Heap::SetUp below (the HeapLayoutTracer AddGCEpilogueCallback at
++// heap.cc:5874-5875 is the in-file precedent; signature = GCCallbackWithData,
++// v8-isolate.h:1167-1168). The callback reads the live taint unions, emits
++// the swept/dead-end facts, then OWNS the TaintOnGCEpilogue wipe (single
++// callback = deterministic ordering; 0027 registers none).
++#include "src/afeye/gc_witness.h"
++#endif
+ #include "src/api/api-inl.h"
+ #include "src/base/bits.h"
+ #include "src/base/flags.h"
+@@ -5874,6 +5883,22 @@ void Heap::SetUp(LocalHeap* main_thread_local_heap) {
+     AddGCEpilogueCallback(HeapLayoutTracer::GCEpiloguePrintHeapLayout, gc_type,
+                           nullptr);
+   }
++
++#ifdef V8_AFEYE
++  // afeye (0032): register the GC dead-end witness ONCE PER ISOLATE -
++  // Heap::SetUp runs exactly once per isolate (main_thread_local_heap_ is
++  // DCHECK_NULL on entry, heap.cc:5777-5778), so no process-wide once_flag
++  // is needed here; a static would be WRONG for multi-isolate embedders
++  // (every isolate needs its own wipe or its heap keys dangle past the first
++  // compaction). kGCTypeAll filter: the callback receives every epilogue and
++  // decides `compacting` itself from the gc_type bits (scavenges move too, so
++  // they count - include/v8-callbacks.h:154-162). The callback OWNS the
++  // TaintOnGCEpilogue wipe call (gc_witness.cc step d), so v8 registers no
++  // second epilogue callback - read-before-wipe ordering is deterministic.
++  // AddGCEpilogueCallback signature: heap.h:1490-1491; the HeapLayoutTracer
++  // call above (heap.cc:5883-5884) is the in-file precedent.
++  AddGCEpilogueCallback(afeye::GCEpilogueWitness, v8::kGCTypeAll, nullptr);
++#endif
+ }
+ 
+ void Heap::SetUpFromReadOnlyHeap(ReadOnlyHeap* ro_heap) {
