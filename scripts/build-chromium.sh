@@ -168,7 +168,13 @@ use_evdev_gestures = false
 # ids / groups / labels) would degrade to hollow defaults - a
 # fingerprint-surface regression for a handful of TUs. Not worth it.
 use_udev = true
-use_gio = false
+# v12.4 cut use_gio but left use_gtk=true: ui/gtk/BUILD.gn:16 asserts
+# use_gio ("GIO is required for building with GTK") and root BUILD.gn:323
+# pulls //ui/gtk:gtk_unittests whenever use_gtk is on - gn gen died there
+# (CI run 35697981760, the first run to clear the patch stage). GIO stays:
+# it is a handful of TUs and GTK hard-requires it. use_libpci=false is safe
+# because its only consumer (enable_service_discovery) is also off.
+use_gio = true
 use_gtk = true
 use_libpci = false
 use_system_libdrm = true
