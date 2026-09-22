@@ -3674,4 +3674,108 @@ mod tests {
         assert!(found, "collector.js chain missing from report");
     }
 
+    /// v12.5 DTT (0032): a streaming upload body ("req-body-stream") is a
+    /// graph SINK exactly like the non-streaming "req-body" - a carrier that
+    /// shares content bytes with it is tainted and its chain goes proven.
+    /// Proves the is_upload prefix-match I added (was `tag == "req-body"`).
+    #[test]
+    fn req_body_stream_is_graph_sink() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let raw_dir = tmp.path().join("raw-src");
+        let collect_dir = tmp.path().join("collect");
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        let mut rec: Vec<u8> = Vec::new();
+        let t0: u64 = 3_000_000_000;
+        {
+            let mut w = std::io::Cursor::new(&mut rec);
+            let mut put = |kind: u8, ts: u64, payload: &[u8]| {
+                let total: u32 = (16 + payload.len()) as u32;
+                w.write_all(&total.to_le_bytes()).unwrap();
+                w.write_all(&[kind, 0]).unwrap();
+                w.write_all(&[0u8, 0]).unwrap();
+                w.write_all(&ts.to_le_bytes()).unwrap();
+                w.write_all(payload).unwrap();
+            };
+            put(0, t0, b"afeye-sink/net v2 pid=1");
+            put(36, t0 - 500_000, b"nav-start mono_ns=2999500000");
+            put(1, t0 + 1_000_000,
+                b"https://af.io/stream.js\0function go(){fetch('/u',{method:'POST',body:b})}go()");
+            // the payload bytes: carrier (text-encoder) and streaming sink
+            // share them verbatim -> blake3 content-run edge.
+            let wire = b"{\"fp\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tok\":\"zz\"}";
+            let mut te = Vec::new();
+            te.extend_from_slice(b"text-encoder");
+            te.push(0);
+            te.extend_from_slice(wire);
+            put(37, t0 + 4_000_000, &te);
+            // the STREAMING upload sink (0032 ReadInternal span)
+            let mut rb = Vec::new();
+            rb.extend_from_slice(b"req-body-stream");
+            rb.push(0);
+            rb.extend_from_slice(wire);
+            put(17, t0 + 6_000_000, &rb);
+        }
+        std::env::set_var("AF_RAW_DIR", &raw_dir);
+        std::fs::write(raw_dir.join("net-5.rec"), &rec).unwrap();
+        let collector =
+            crate::collect::Collector::spawn_dirs(raw_dir.clone(), collect_dir.clone());
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let cstats = collector.stop();
+        assert!(cstats.records >= 4, "records: {}", cstats.records);
+
+        let sf = run(&collect_dir).expect("sinkfilter run");
+        // the streaming body must be admitted as a sink seed
+        assert!(sf.graph_sinks >= 1, "req-body-stream not a sink: {}", sf.graph_sinks);
+        assert!(sf.graph_tainted >= 1, "carrier not tainted by stream sink");
+    }
+
+    /// v12.5 DTT (0032): the GC-epilogue witness prose records are consumed
+    /// as RUN-LEVEL unions (not per-chain) and surface in report.json.
+    #[test]
+    fn gc_taint_unions_are_runlevel() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let raw_dir = tmp.path().join("raw-src");
+        let collect_dir = tmp.path().join("collect");
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        let mut rec: Vec<u8> = Vec::new();
+        let t0: u64 = 4_000_000_000;
+        {
+            let mut w = std::io::Cursor::new(&mut rec);
+            let mut put = |kind: u8, ts: u64, payload: &[u8]| {
+                let total: u32 = (16 + payload.len()) as u32;
+                w.write_all(&total.to_le_bytes()).unwrap();
+                w.write_all(&[kind, 0]).unwrap();
+                w.write_all(&[0u8, 0]).unwrap();
+                w.write_all(&ts.to_le_bytes()).unwrap();
+                w.write_all(payload).unwrap();
+            };
+            put(0, t0, b"afeye-sink/v8 v2 pid=1");
+            put(36, t0 - 500_000, b"nav-start mono_ns=3999500000");
+            put(1, t0 + 1_000_000, b"https://af.io/x.js\0var x=1");
+            // two compactions: swept union 0x1|0x4 = 0x5, deadend 0x1
+            put(16, t0 + 2_000_000, b"taint-swept tag=1");
+            put(16, t0 + 3_000_000, b"taint-deadend tag=1");
+            put(16, t0 + 4_000_000, b"taint-swept tag=4");
+        }
+        std::env::set_var("AF_RAW_DIR", &raw_dir);
+        std::fs::write(raw_dir.join("v8-9.rec"), &rec).unwrap();
+        let collector =
+            crate::collect::Collector::spawn_dirs(raw_dir.clone(), collect_dir.clone());
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let _ = collector.stop();
+
+        let sf = run(&collect_dir).expect("sinkfilter run");
+        assert_eq!(sf.taint_swept_union, 0x5, "swept={:#x}", sf.taint_swept_union);
+        assert_eq!(sf.taint_deadend_union, 0x1, "deadend={:#x}", sf.taint_deadend_union);
+        let rep: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(collect_dir.join("filtered/report.json")).unwrap(),
+        )
+        .unwrap();
+        let cls = &rep["classification"];
+        assert_eq!(cls["taint_swept_union"].as_u64(), Some(0x5));
+        assert_eq!(cls["taint_deadend_union"].as_u64(), Some(0x1));
+    }
+
 }
