@@ -70,10 +70,10 @@ index 2d4799e..afdc24a 100644
    }
 diff --git a/v8/src/afeye/taint.cc b/v8/src/afeye/taint.cc
 new file mode 100644
-index 0000000..b4ac6e5
+index 0000000..76678ce
 --- /dev/null
 +++ b/v8/src/afeye/taint.cc
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,220 @@
 +#include "src/afeye/taint.h"
 +
 +#ifdef V8_AFEYE
@@ -119,6 +119,8 @@ index 0000000..b4ac6e5
 +TaintSlot g_taint[kTaintSlots];
 +std::atomic<uint64_t> g_taint_dropped{0};
 +std::atomic<uint64_t> g_taint_live{0};
++// 0032: every tag that ever reached an in-renderer sink (TaintEmitSink).
++std::atomic<uint32_t> g_sunk_union{0};
 +
 +// env gate: AFEYE_TAINT=0 disables the whole DTT layer (falls back to the
 +// boundary sieve). Read once, cached.
@@ -262,6 +264,26 @@ index 0000000..b4ac6e5
 +                static_cast<unsigned long long>(key),
 +                static_cast<unsigned>(tag));
 +  EmitStr(kFingerprint, NowNs(), buf);
++  // 0032: feed the sunk-source union - gc_witness computes the conservative
++  // in-renderer dead-end as (live heap union & ~sunk union) at compaction.
++  g_sunk_union.fetch_or(tag, std::memory_order_relaxed);
++}
++
++TaintTag TaintLiveHeapTagUnion() {
++  TaintTag u = kSrcNone;
++  for (size_t i = 0; i < kTaintSlots; ++i) {
++    const TaintSlot* s = &g_taint[i];
++    const uint64_t k = s->key.load(std::memory_order_relaxed);
++    if (k == 0) continue;
++    const uint8_t space = static_cast<uint8_t>((k >> 61) - 1);
++    if (space == kKeyWasm) continue;  // survives compaction - not swept
++    u |= s->tag.load(std::memory_order_relaxed);
++  }
++  return u;
++}
++
++TaintTag TaintSunkUnion() {
++  return static_cast<TaintTag>(g_sunk_union.load(std::memory_order_relaxed));
 +}
 +
 +uint64_t TaintDropped() {
@@ -274,10 +296,10 @@ index 0000000..b4ac6e5
 +#endif  // V8_AFEYE
 diff --git a/v8/src/afeye/taint.h b/v8/src/afeye/taint.h
 new file mode 100644
-index 0000000..4ec5faf
+index 0000000..41c88aa
 --- /dev/null
 +++ b/v8/src/afeye/taint.h
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,117 @@
 +#ifndef V8_AFEYE_TAINT_H_
 +#define V8_AFEYE_TAINT_H_
 +
@@ -370,6 +392,20 @@ index 0000000..4ec5faf
 +void TaintEmitSink(const char* sink, uint8_t space, uint64_t key,
 +                   TaintTag tag);
 +
++// 0032 (gc_witness): OR of tags over entries a compacting GC CLEARS
++// (kKeyHeap/kKeyStack/kKeyContext - NOT kKeyWasm, which survives because the
++// wasm backing store is off-heap). Lets gc_witness report WHICH sources were
++// live in the heap shadow at sweep time without enumerating the private
++// store. Single pass over g_taint. Call BEFORE TaintOnGCEpilogue wipes.
++TaintTag TaintLiveHeapTagUnion();
++
++// 0032 (gc_witness): OR of every tag ever passed to TaintEmitSink - i.e. the
++// sources that reached an IN-RENDERER sink (socket-side emission is a
++// separate process; cross-process proven is the Rust content-match's job).
++// (live_heap & ~sunk) at a compaction = conservative in-renderer dead-end:
++// those sources were swept without ever hitting a wire sink in this process.
++TaintTag TaintSunkUnion();
++
 +// Records dropped because the shadow table was full (the honest-witness
 +// counter, folded into the sink-drop stream so a taint gap is never mistaken
 +// for a dead end).
@@ -383,10 +419,10 @@ index 0000000..4ec5faf
 +#endif  // V8_AFEYE_TAINT_H_
 diff --git a/v8/src/afeye/taint_abi.cc b/v8/src/afeye/taint_abi.cc
 new file mode 100644
-index 0000000..33a596f
+index 0000000..90b71ab
 --- /dev/null
 +++ b/v8/src/afeye/taint_abi.cc
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,44 @@
 +#include "src/afeye/taint_abi.h"
 +
 +#ifdef V8_AFEYE
@@ -422,15 +458,21 @@ index 0000000..33a596f
 +
 +int afeye_taint_active(void) { return v8::afeye::TaintEnabled() ? 1 : 0; }
 +
++void afeye_taint_emit_sink(const char* sink, uint8_t space, uint64_t key,
++                           uint32_t tag) {
++  v8::afeye::TaintEmitSink(sink, space, key,
++                           static_cast<v8::afeye::TaintTag>(tag));
++}
++
 +}  // extern "C"
 +
 +#endif  // V8_AFEYE
 diff --git a/v8/src/afeye/taint_abi.h b/v8/src/afeye/taint_abi.h
 new file mode 100644
-index 0000000..497dab1
+index 0000000..dd561db
 --- /dev/null
 +++ b/v8/src/afeye/taint_abi.h
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,60 @@
 +#ifndef V8_AFEYE_TAINT_ABI_H_
 +#define V8_AFEYE_TAINT_ABI_H_
 +
@@ -477,6 +519,14 @@ index 0000000..497dab1
 +// True when the DTT layer is active (sink enabled AND AFEYE_TAINT != 0).
 +// Lets a blink site skip the address() read entirely when taint is off.
 +int afeye_taint_active(void);
++
++// 0032: emit a taint-sink record from blink (postMessage funnel -
++// message_port.cc, same renderer process as v8, taint store LIVE). Wraps
++// v8::afeye::TaintEmitSink verbatim: record "taint-sink <sink> space=<n>
++// key=<hex> tag=<hex>" AND feeds the in-renderer sunk-source union that
++// gc_witness uses for the swept-without-sink dead-end fact.
++void afeye_taint_emit_sink(const char* sink, uint8_t space, uint64_t key,
++                           uint32_t tag);
 +
 +}  // extern "C"
 +

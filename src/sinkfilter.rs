@@ -119,6 +119,8 @@ pub struct SinkFilterStats {
     pub heuristic_chains: u64,
     pub unresolved_chains: u64,
     pub dead_end_proven: u64,
+    /// v12.5 DTT: chains with an entry-joined "taint-sink" record (0027/0032)
+    pub taint_sink_chains: u64,
     pub graph_distinct_keys: u64,
     pub graph_fanout_dropped: u64,
     pub strict_graph: bool,
@@ -854,6 +856,14 @@ fn chain_signals(c: &Chain, net_ts: &[u64], content_ts: &[u64]) -> (Vec<String>,
         // whose tainted record sits OUTSIDE the chain's materialization window.
         signals.push(format!("graph-entry@{h}"));
     }
+    if c.taint_sink {
+        // v12.5 DTT: OBSERVED taint-tagged bytes entering a wire sink while
+        // this chain was the active C++->JS entry. Causality-backed and
+        // stronger than byte-identity (graph-sink): the tag rode the VALUE
+        // through every pure-JS re-encoding (Factory concat/slice
+        // propagation), so no content match is needed at all.
+        signals.push("taint-sink".into());
+    }
     if let Some(h) = c.graph_hops {
         // v11: PROVEN byte-identity path to a sink record, h hops away.
         // h=0 the chain wrote the upload/crypto result itself; h=1 its bytes
@@ -1068,6 +1078,14 @@ struct Chain {
     /// late-assembler / late-encryptor / worker-PoW cases the window-based
     /// graph-sink misses. Carries the min hop distance.
     graph_entry: Option<u32>,
+    /// v12.5 (0027/0032 DTT): a kind-16 "taint-sink" record (taint.cc
+    /// TaintEmitSink: "taint-sink <sink> space=<n> key=<hex> tag=<hex>")
+    /// attributes to this chain by entry-join - bytes carrying a fingerprint
+    /// taint tag were OBSERVED entering a wire sink (socket write /
+    /// postMessage) while this chain was the active C++->JS entry. The
+    /// strongest proven fact in the set: the tag rode the value through
+    /// every pure-JS transform, so no byte-identity hop is needed.
+    taint_sink: bool,
     /// v11: an observed FACT (byte-identity path, initiated send, or
     /// cookie/storage access) - not a heuristic. Drives AF_STRICT_GRAPH.
     proven: bool,
@@ -1652,6 +1670,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
                         fetched_url: false,
                         graph_hops: None,
                         graph_entry: None,
+                        taint_sink: false,
                         proven: false,
                         dead_end_proven: false,
                         spawned_proven: Vec::new(),
@@ -2312,6 +2331,7 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
     // per-chain accumulators keyed by idx
     let mut send_init: HashSet<usize> = HashSet::new();
     let mut tok_access: HashSet<usize> = HashSet::new();
+    let mut taint_sink_set: HashSet<usize> = HashSet::new();
     let mut fp_entry: HashMap<usize, Vec<&'static str>> = HashMap::new();
     let mut gopd_chains: HashSet<usize> = HashSet::new();
     let mut stack_chains: HashSet<usize> = HashSet::new();
@@ -2355,6 +2375,15 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
             // The canvas/webgl/audio fingerprints also land in kind 16; only
             // the cookie/storage tags are token ACCESS (read/write of the
             // stored token), the rest are collection (fp_entry below).
+            // kind 16 "taint-sink ..." (0027/0032 DTT): tagged bytes
+            // OBSERVED entering a wire sink. Guarded arm BEFORE the plain
+            // fingerprint arm below. Not a graph carrier (value_of_prose
+            // does not derive it, VALUE_TAGS skips it) - it is a VERDICT
+            // record, and admitting it as a carrier would create prose
+            // edges between unrelated records.
+            "fingerprint" if txt.starts_with("taint-sink ") => {
+                taint_sink_set.insert(idx);
+            }
             "fingerprint" => {
                 if txt.starts_with("cookie-get")
                     || txt.starts_with("cookie-set")
@@ -2402,6 +2431,12 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         if let Some(c) = chain_list.get_mut(idx) {
             c.token_access = true;
             stats.token_access_chains += 1;
+        }
+    }
+    for idx in taint_sink_set {
+        if let Some(c) = chain_list.get_mut(idx) {
+            c.taint_sink = true;
+            stats.taint_sink_chains += 1;
         }
     }
     for (idx, needles) in fp_entry {
@@ -2512,7 +2547,8 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         c.proven = c.graph_hops.is_some()
             || c.graph_entry.is_some()
             || c.send_initiator
-            || c.token_access;
+            || c.token_access
+            || c.taint_sink;
     }
 
     // ---- PASS 1b: URL-identity (structural, zero-risk) ---------------------
@@ -2741,6 +2777,9 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         }
         if c.gopd_check {
             entry["gopd_check"] = json!(true);
+        }
+        if c.taint_sink {
+            entry["taint_sink"] = json!(true);
         }
         if c.stack_inspect {
             entry["stack_inspect"] = json!(true);
@@ -3233,6 +3272,7 @@ mod tests {
             fetched_url: false,
             graph_hops: None,
             graph_entry: None,
+            taint_sink: false,
             proven: false,
             dead_end_proven: false,
             spawned_proven: Vec::new(),
@@ -3518,6 +3558,80 @@ mod tests {
             sf.graph_sinks,
             sf.graph_tainted
         );
+    }
+
+    /// v12.5 DTT consumer: a kind-16 "taint-sink" record attributed by
+    /// entry-join makes the chain PROVEN by observed fact (tagged bytes at
+    /// the wire), carries the "taint-sink" signal, the report flag, and the
+    /// stats counter. The record format is taint.cc's TaintEmitSink:
+    /// "taint-sink <sink> space=<n> key=<hex> tag=<hex>" (EmitStr prose).
+    #[test]
+    fn dtt_taint_sink_verdict() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let raw_dir = tmp.path().join("raw-src");
+        let collect_dir = tmp.path().join("collect");
+        std::fs::create_dir_all(&raw_dir).unwrap();
+
+        let mut rec: Vec<u8> = Vec::new();
+        let t0: u64 = 2_000_000_000;
+        {
+            let mut w = std::io::Cursor::new(&mut rec);
+            let mut put = |kind: u8, ts: u64, payload: &[u8]| {
+                let total: u32 = (16 + payload.len()) as u32;
+                w.write_all(&total.to_le_bytes()).unwrap();
+                w.write_all(&[kind, 0]).unwrap();
+                w.write_all(&[0u8, 0]).unwrap();
+                w.write_all(&ts.to_le_bytes()).unwrap();
+                w.write_all(payload).unwrap();
+            };
+            put(0, t0, b"afeye-sink/v8 v2 pid=1");
+            put(36, t0 - 500_000, b"nav-start mono_ns=1999500000");
+            // the token pipeline script (chain birth)
+            put(1, t0 + 1_000_000,
+                b"https://af.io/collector.js\0function build(){fetch('/t')}build()");
+            // the active C++->JS entry 1 ms before the verdict record
+            put(8, t0 + 2_999_000,
+                b"call argc=1 script=https://af.io/collector.js:2");
+            // the DTT verdict record: fingerprint-tagged bytes at the socket
+            put(16, t0 + 3_000_000,
+                b"taint-sink socket-write space=0 key=7f3a tag=1");
+        }
+
+        std::env::set_var("AF_RAW_DIR", &raw_dir);
+        std::fs::write(raw_dir.join("v8-99.rec"), &rec).unwrap();
+        let collector =
+            crate::collect::Collector::spawn_dirs(raw_dir.clone(), collect_dir.clone());
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let cstats = collector.stop();
+        assert!(cstats.records >= 5, "records: {}", cstats.records);
+
+        let sf = run(&collect_dir).expect("sinkfilter run");
+        assert_eq!(sf.taint_sink_chains, 1, "taint_sink_chains={}", sf.taint_sink_chains);
+        assert!(sf.proven_chains >= 1, "proven: {}", sf.proven_chains);
+
+        let rep: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(collect_dir.join("filtered/report.json")).unwrap(),
+        )
+        .unwrap();
+        let chains = rep["chains"].as_array().unwrap();
+        let mut found = false;
+        for ch in chains {
+            if ch["name"].as_str().unwrap_or("").contains("collector.js") {
+                assert_eq!(ch["verdict"].as_str(), Some("proven"), "chain={:?}", ch);
+                assert_eq!(ch["taint_sink"].as_bool(), Some(true));
+                let sigs: Vec<String> = ch["signals"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect();
+                assert!(sigs.iter().any(|s| s == "taint-sink"), "signals={:?}", sigs);
+                found = true;
+            }
+        }
+        assert!(found, "collector.js chain missing from report");
     }
 
 }
