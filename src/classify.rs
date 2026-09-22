@@ -1373,8 +1373,8 @@ mod tests {
         let json = b"{\"event\":\"page_view\",\"page\":\"/home\",\"id\":12345}";
         assert!(entropy(json) < 5.0);
         let mut hi = Vec::new();
-        for i in 0..4096 {
-            hi.push(((i * 2654435761u32) >> 13) as u8);
+        for i in 0u32..4096 {
+            hi.push(((i.wrapping_mul(2654435761u32) >> 13) as u8));
         }
         assert!(entropy(&hi) > 6.5);
     }
