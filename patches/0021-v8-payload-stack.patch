@@ -15,7 +15,7 @@
  #include "src/builtins/builtins.h"
  #include "src/json/json-parser.h"
  #include "src/json/json-stringifier.h"
-@@ -30,14 +38,89 @@ BUILTIN(JsonParse) {
+@@ -30,14 +38,91 @@ BUILTIN(JsonParse) {
                                          std::nullopt));
  }
  
@@ -127,7 +127,7 @@
  #include "src/api/api-inl.h"
  #include "src/ast/ast.h"
  #include "src/ast/prettyprinter.h"
-@@ -1145,8 +1237,40 @@ ErrorUtils::StackPropertyLookupResult ErrorUtils::GetErrorStackProperty(
+@@ -1145,8 +1237,45 @@ ErrorUtils::StackPropertyLookupResult ErrorUtils::GetErrorStackProperty(
    return {it.GetHolder<JSObject>(), result};
  }
  

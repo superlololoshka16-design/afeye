@@ -1,7 +1,7 @@
 diff --git a/v8/src/api/api.cc b/v8/src/api/api.cc
 --- a/v8/src/api/api.cc
 +++ b/v8/src/api/api.cc
-@@ -10378,6 +10378,53 @@ Isolate* Isolate::New(const IsolateGroup& group,
+@@ -10378,6 +10378,37 @@ Isolate* Isolate::New(const IsolateGroup& group,
                    static_cast<void*>(v8_isolate));
      v8::afeye::EmitStr(v8::afeye::kIsolateBirth, v8::afeye::NowNs(),
                         afeye_buf);
@@ -94,7 +94,7 @@ diff --git a/v8/src/objects/js-objects.cc b/v8/src/objects/js-objects.cc
 diff --git a/v8/src/wasm/wasm-objects.cc b/v8/src/wasm/wasm-objects.cc
 --- a/v8/src/wasm/wasm-objects.cc
 +++ b/v8/src/wasm/wasm-objects.cc
-@@ -4,6 +4,42 @@
+@@ -4,7 +4,24 @@
  
  #include "src/wasm/wasm-objects.h"
  
@@ -166,7 +166,7 @@ diff --git a/v8/src/logging/log.cc b/v8/src/logging/log.cc
  #include <stdint.h>
  
  #include <atomic>
-@@ -878,6 +886,62 @@ void JitLogger::LogRecordedBuffer(
+@@ -878,6 +886,73 @@ void JitLogger::LogRecordedBuffer(
    event.name.str = name;
    event.name.len = length;
    event.isolate = reinterpret_cast<v8::Isolate*>(isolate_);

@@ -15,7 +15,7 @@
  
  #include <memory>
  #include <optional>
-@@ -75,6 +83,53 @@ namespace internal {
+@@ -75,4 +83,59 @@ namespace internal {
  
 +// afeye (v6): raw script-source dumper. ONE definition, placed before every
 +// call site - the three compilation funnels below (eval, streamed, buffered)

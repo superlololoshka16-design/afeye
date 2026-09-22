@@ -41,7 +41,7 @@
    for (;;) {
      size_t len = 0;
      bool have = false;
-@@ -130,6 +157,17 @@ void DrainLoop() {
+@@ -130,6 +157,21 @@ void DrainLoop() {
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds(500));
      }
@@ -121,7 +121,7 @@
    for (;;) {
      size_t len = 0;
      bool have = false;
-@@ -130,6 +157,17 @@ void DrainLoop() {
+@@ -130,6 +157,19 @@ void DrainLoop() {
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds(500));
      }
@@ -199,7 +199,7 @@
    for (;;) {
      size_t len = 0;
      bool have = false;
-@@ -130,6 +157,17 @@ void DrainLoop() {
+@@ -130,6 +157,19 @@ void DrainLoop() {
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds(500));
      }

@@ -251,7 +251,7 @@
    ExecutionContext* context = ExecutionContext::From(script_state);
  
    if (name == WebGLDebugRendererInfo::ExtensionName()) {
-@@ -3989,6 +4136,15 @@
+@@ -3989,6 +4136,89 @@
  
  ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
                                                      GLenum pname) {
