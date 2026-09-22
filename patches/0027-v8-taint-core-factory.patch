@@ -1,3 +1,44 @@
+diff --git a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
+index 4c72860..40eea6e 100644
+--- a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
++++ b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
+@@ -11,6 +11,16 @@
+ #include <mutex>
+ #include "v8/include/v8-container.h"
+ #include "third_party/blink/renderer/platform/afeye/sink.h"
++// afeye (0027): the v8 taint ABI. Blink cannot include v8-internal headers
++// (different component), so declare the exported extern "C" symbols here -
++// identical signatures to v8/src/afeye/taint_abi.h. The key is the String's
++// heap address: reinterpret_cast<uintptr_t>(*v8::Local<String>) ==
++// Tagged<String>::address() == ptr() - kHeapObjectTag (verified at
++// v8-handle-base.h:139 DirectHandleBase::value<T>()=reinterpret_cast<T*>(ptr_)
++// and tagged.h:508). So a tag set HERE matches the v8 Factory propagation
++// keys by construction. source_bit 1 = kSrcFingerprint (taint.h).
++extern "C" void afeye_taint_tag_string(uint64_t key, uint32_t source_bit);
++extern "C" int afeye_taint_active(void);
+ #endif
+ 
+ #include "third_party/blink/renderer/platform/bindings/dom_wrapper_world.h"
+@@ -80,6 +90,19 @@ void AfeyeCaptureValue(v8::Isolate* isolate,
+     std::snprintf(buf, buf_sz, "%.17g", rv->NumberValue(isolate->GetCurrentContext()).FromMaybe(0));
+   } else if (rv->IsString()) {
+     v8::Local<v8::String> str = rv.As<v8::String>();
++#ifdef BLINK_AFEYE
++    // v12.5 (0027): SOURCE TAG BIRTH for a fingerprint read that returns a
++    // String (navigator.userAgent, screen-ish string props, plugin names,
++    // WebGL renderer strings via 0024). Tag the returned String's address
++    // kSrcFingerprint so every concat/slice of it (Factory hooks, 0027) and
++    // every socket write of it (0032) inherits the tag - the causality-backed
++    // `proven` path. Gated by afeye_taint_active() so a taint-off build does
++    // zero work beyond one predictable branch.
++    if (afeye_taint_active()) {
++      afeye_taint_tag_string(
++          reinterpret_cast<uint64_t>(*str), 1u /* kSrcFingerprint */);
++    }
++#endif
+     // v12.1: WriteUtf8 (returns UTF-8 BYTES written) replaces the broken
+     // Utf8Length/WriteOneByte pairing (WriteOneByte copies CODE UNITS, not
+     // bytes - multi-byte strings were truncated and the tail leaked stale
 diff --git a/v8/BUILD.gn b/v8/BUILD.gn
 index 2d4799e..afdc24a 100644
 --- a/v8/BUILD.gn
