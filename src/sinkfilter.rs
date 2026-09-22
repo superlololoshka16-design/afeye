@@ -1878,6 +1878,15 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         "net-request",
         "taint-edge",
         "websocket",
+        "wasm-memory",
+        // kind 4 wasm-memory (0026): linear-memory CONTENT head dumps at
+        // every memory.grow exit and every Memory.buffer read-out - the
+        // PoW result bytes Kasada extracts. Carrier, never a sink: the
+        // bytes do not leave the process here, but they content-match the
+        // btoa/crypto-out/req-body that uploads them. kind 4 carried no
+        // records before 0026 (grow metadata rides kind 31 prose), so no
+        // VALUE_TAGS-style prose gate is needed: every kind-4 record is a
+        // tag\0bytes span by construction.
         // kind 16, but ONLY the byte-carrying records (VALUE_TAGS gate below).
         // kind 18 net-resp-body is deliberately EXCLUDED: those are raw wire
         // bytes (usually gzip/brotli-encoded) that do not byte-match the
