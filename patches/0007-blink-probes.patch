@@ -413,11 +413,36 @@
    if (!base::CheckMul(sw, sh).IsValid<int>()) {
      exception_state.ThrowRangeError("Out of memory at ImageData creation");
      return nullptr;
-@@ -1167,6 +1365,18 @@
+@@ -1167,29 +1365,54 @@
  }
  
  TextMetrics* BaseRenderingContext2D::measureText(const String& text) {
-+#ifdef BLINK_AFEYE
+-  // The style resolution required for fonts is not available in frame-less
+-  // documents.
+-  HTMLCanvasElement* canvas = HostAsHTMLCanvasElement();
+-
+-  if (canvas) {
+-    if (!canvas->GetDocument().GetFrame()) {
+-      return MakeGarbageCollected<TextMetrics>();
+-    }
+-
+-    canvas->GetDocument().UpdateStyleAndLayoutTreeForElement(
+-        canvas, DocumentUpdateReason::kCanvas);
+-  }
+-
+-  const Font* font = AccessFont(canvas);
+-
+-  const CanvasRenderingContext2DState& state = GetState();
+-  const ComputedStyle* computed_style =
+-      canvas ? canvas->EnsureComputedStyle() : nullptr;
+-  CanvasRenderingContextHost* host = GetCanvasRenderingContextHost();
+-  TextDirection direction =
+-      ToTextDirection(state.GetDirection(), host, computed_style);
+-
+-  return MakeGarbageCollected<TextMetrics>(
+-      font, direction, state.GetTextBaseline(), state.GetTextAlign(), text,
+-      host->GetPlainTextPainter());
+-}
 +  if (blink::afeye::Enabled()) {
 +    char afeye_buf[224];
 +    std::snprintf(afeye_buf, sizeof(afeye_buf),
@@ -429,9 +454,46 @@
 +                          afeye_buf);
 +  }
 +#endif
-   // The style resolution required for fonts is not available in frame-less
-   // documents.
-   HTMLCanvasElement* canvas = HostAsHTMLCanvasElement();
++  // The style resolution required for fonts is not available in frame-less
++  // documents.
++  HTMLCanvasElement* afeye_canvas = HostAsHTMLCanvasElement();
++  TextMetrics* afeye_tm = nullptr;
++  if (afeye_canvas) {
++    if (!afeye_canvas->GetDocument().GetFrame()) {
++      afeye_tm = MakeGarbageCollected<TextMetrics>();
++    } else {
++      afeye_canvas->GetDocument().UpdateStyleAndLayoutTreeForElement(
++          afeye_canvas, DocumentUpdateReason::kCanvas);
++    }
++  }
++  if (!afeye_tm) {
++    const Font* afeye_font = AccessFont(afeye_canvas);
++    const CanvasRenderingContext2DState& afeye_state = GetState();
++    const ComputedStyle* afeye_style =
++        afeye_canvas ? afeye_canvas->EnsureComputedStyle() : nullptr;
++    CanvasRenderingContextHost* afeye_host = GetCanvasRenderingContextHost();
++    TextDirection afeye_dir = ToTextDirection(afeye_state.GetDirection(),
++                                              afeye_host, afeye_style);
++    afeye_tm = MakeGarbageCollected<TextMetrics>(
++        afeye_font, afeye_dir, afeye_state.GetTextBaseline(),
++        afeye_state.GetTextAlign(), text, afeye_host->GetPlainTextPainter());
++  }
++#ifdef BLINK_AFEYE
++  // v12.4 (antifraud attack): the WIDTH is the measurement - the font
++  // fingerprint is sub-pixel text metrics. The ask (text+font) was
++  // already logged above; without the RESULT the two sides of the
++  // fingerprint (what was probed vs what it measured) never meet.
++  if (blink::afeye::Enabled() && afeye_tm) {
++    char afeye_buf[224];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "canvas/measure-r text=%.64s w=%.6f",
++                  text.Utf8().c_str(), afeye_tm->width());
++    blink::afeye::EmitStr(blink::afeye::kDomMetric, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
++  return afeye_tm;
++}
 --- a/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
 +++ b/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
 @@ -3,6 +213,9 @@
