@@ -442,6 +442,42 @@ index 0000000..497dab1
 +#endif  // V8_AFEYE
 +
 +#endif  // V8_AFEYE_TAINT_ABI_H_
+diff --git a/v8/src/builtins/builtins-json.cc b/v8/src/builtins/builtins-json.cc
+index 9e3e9d7..3829b1b 100644
+--- a/v8/src/builtins/builtins-json.cc
++++ b/v8/src/builtins/builtins-json.cc
+@@ -9,6 +9,7 @@
+ #include <cstdlib>
+ 
+ #include "src/afeye/sink.h"
++#include "src/afeye/taint.h"
+ #include "src/objects/string-inl.h"
+ #endif
+ #include "src/builtins/builtins.h"
+@@ -119,6 +120,23 @@ BUILTIN(JsonStringify) {
+                             reinterpret_cast<const uint8_t*>(afeye_head),
+                             static_cast<uint32_t>(afeye_n > 0 ? afeye_n : 0));
+       }
++      // v12.5 (0027): SOURCE TAG BIRTH. The JSON.stringify result IS the
++      // assembled fingerprint object - the single highest-value taint source
++      // in the whole pipeline. Tag it kSrcFingerprint so every downstream
++      // concat (FactoryBase::NewConsString) / slice (NewProperSubString) of
++      // this string inherits the tag through pure-JS reshaping, all the way
++      // to the socket sink (0032 TaintEmitSink -> `proven` verdict). The key
++      // is Cast<String>(*afeye_r).address() - the SAME full tag-stripped heap
++      // address the Factory hooks and the blink ABI use, so the identity
++      // matches across layers by construction (tagged.h:508 address() =
++      // ptr() - kHeapObjectTag; blink passes reinterpret_cast<uintptr_t>
++      // (*v8::Local) = the same uncompressed address).
++      if (v8::afeye::TaintEnabled()) {
++        Tagged<String> afeye_s = Cast<String>(*afeye_r);
++        v8::afeye::TaintSet(v8::afeye::kKeyHeap,
++                            static_cast<uint64_t>(afeye_s.address()),
++                            v8::afeye::kSrcFingerprint);
++      }
+     }
+   }
+ #endif
 diff --git a/v8/src/heap/factory-base.cc b/v8/src/heap/factory-base.cc
 index debbaae..67732bf 100644
 --- a/v8/src/heap/factory-base.cc
