@@ -497,6 +497,29 @@ fn value_of_prose(payload: &[u8]) -> Option<(String, Vec<u8>)> {
         }
         return None;
     }
+    // v12.4: the 0007 value-carrying probes - " tag=... val=<v>" /
+    // " ... w=<float>" formats from the upgraded hooks
+    for tag in ["webgl/unmasked-vendor", "webgl/unmasked-renderer", "webgl/param"] {
+        if let Some(rest) = t.strip_prefix(tag) {
+            if let Some(vp) = rest.find(" val=") {
+                let v = &rest[vp + 5..];
+                if !v.is_empty() {
+                    return Some((tag.to_string(), v.as_bytes().to_vec()));
+                }
+            }
+            return None;
+        }
+    }
+    if let Some(rest) = t.strip_prefix("canvas/measure-r") {
+        // " text=<s> w=<float>"
+        if let Some(wp) = rest.find(" w=") {
+            let v = &rest[wp + 3..];
+            if !v.is_empty() {
+                return Some(("canvas/measure-r".to_string(), v.as_bytes().to_vec()));
+            }
+        }
+        return None;
+    }
     None
 }
 
@@ -1881,6 +1904,12 @@ pub fn run(collect_dir: &Path) -> Result<SinkFilterStats, String> {
         "audio/float-timedomain",  // 0014
         "audio/byte-timedomain",   // 0014
         "json-stringify",      // 0021 assembled plaintext head
+        // v12.4: the probe ANSWERS (the value IS the fingerprint - the
+        // graph must be able to link the answer to the token bytes)
+        "webgl/unmasked-vendor",    // 0007 value-carrying getParameter
+        "webgl/unmasked-renderer",  // 0007
+        "webgl/param",             // 0007 GL_VERSION/RENDERER/... strings
+        "canvas/measure-r",        // 0007 measureText width (font fp)
     ];
     // The request URL is a carrier too: a payload can leave in the QUERY
     // STRING with no body at all (pixel beacons, img.src fallbacks), which no
