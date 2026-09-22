@@ -412,7 +412,7 @@ index 0000000000..1111111111
 +#ifdef NET_AFEYE
 +  if (network::afeye::Enabled() && request.request_body) {
 +    uint64_t afeye_total = 0;
-+    for (const auto& afeye_el : request.request_body->elements()) {
++    for (const auto& afeye_el : *request.request_body->elements()) {
 +      if (afeye_el.type() != network::DataElement::Tag::kBytes) {
 +        continue;
 +      }
