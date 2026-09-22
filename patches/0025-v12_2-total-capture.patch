@@ -104,7 +104,7 @@ index 31c6251..9f13535 100644
  #endif
    return v8_isolate;
 diff --git a/v8/src/logging/log.cc b/v8/src/logging/log.cc
-index 773c24f..652cce8 100644
+index 773c24f..bbb2930 100644
 --- a/v8/src/logging/log.cc
 +++ b/v8/src/logging/log.cc
 @@ -4,6 +4,14 @@
@@ -122,7 +122,7 @@ index 773c24f..652cce8 100644
  #include <stdint.h>
  
  #include <atomic>
-@@ -878,6 +886,73 @@ void JitLogger::LogRecordedBuffer(
+@@ -878,6 +886,78 @@ void JitLogger::LogRecordedBuffer(
    event.name.str = name;
    event.name.len = length;
    event.isolate = reinterpret_cast<v8::Isolate*>(isolate_);
@@ -161,8 +161,13 @@ index 773c24f..652cce8 100644
 +      // script/line enrichment below reads the HEAP and is only valid
 +      // when this thread is the isolate's main thread. Everyone else
 +      // gets the name-only record - honest, not garbage.
-+      bool afeye_main = v8::internal::IsMainThread(0) &&
-+                        reinterpret_cast<uintptr_t>(isolate_) != 0;
++      // v12.5: IsMainThread(0) does not exist at this rev (v12.4 hand-edit
++      // invented it; CI run 35713685114 died at log.cc:924). The stock idiom
++      // is THIS FILE'S OWN line 1332: ThreadId::Current() ==
++      // isolate->thread_id() - same namespace (v8::internal), isolate.h
++      // already included here. Null check short-circuits the member call.
++      bool afeye_main =
++          isolate_ != nullptr && ThreadId::Current() == isolate_->thread_id();
 +      if (afeye_main && maybe_shared.ToHandle(&shared) &&
 +          IsScript(shared->script())) {
 +        Tagged<Script> afeye_s = Cast<Script>(shared->script());

@@ -1,5 +1,5 @@
 diff --git a/v8/src/afeye/sink.cc b/v8/src/afeye/sink.cc
-index 108089b..8d9d6a1 100644
+index 108089b..30ca433 100644
 --- a/v8/src/afeye/sink.cc
 +++ b/v8/src/afeye/sink.cc
 @@ -387,6 +387,39 @@ void EmitWasmMemGrow(size_t old_pages, size_t new_pages) {
@@ -17,8 +17,8 @@ index 108089b..8d9d6a1 100644
 +//  - env-gated: AFEYE_TRACE_WASMMEMDUMP=0 disables content (grow events stay)
 +//  - the dump races a worker thread mutating memory: bytes may tear between
 +//    read and ring-copy. Accepted and documented - a torn head still carries
-+//    the deterministic burst pattern; exactness needs a stop-the-world dump
-+//    (a pause antifraud would detect, defeating the stealth).
++//    the deterministic burst pattern; exactness needs stop-the-world, which
++//    antifraud would detect.
 +void EmitWasmMemContent(const void* mem_id, const uint8_t* base,
 +                        size_t byte_length) {
 +  static std::atomic<uint64_t> g_afeye_wmdump{0};
@@ -43,18 +43,18 @@ index 108089b..8d9d6a1 100644
  // v12.4: ring drops AND write errors - the 0023 witness must see both or
  // ENOSPC is an invisible gap the graph then misreads as dead-end evidence.
 diff --git a/v8/src/afeye/sink.h b/v8/src/afeye/sink.h
-index 28fc833..d9a5142 100644
+index 28fc833..366c16f 100644
 --- a/v8/src/afeye/sink.h
 +++ b/v8/src/afeye/sink.h
 @@ -51,6 +51,13 @@ void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
  void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s);
  void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b);
  void EmitWasmMemGrow(size_t old_pages, size_t new_pages);
-+// afeye (0026): wasm linear-memory CONTENT head dump at every Grow exit -
-+// closes the SERIES.md-admitted "memory CONTENTS are a black box" hole.
-+// The backing store is off-heap and GC-stable, so this capture is sound
-+// across compaction (unlike heap-value taint). Head-capped by EmitSpan's
-+// kSpanCap; per-dump throttle + env gate AFEYE_TRACE_WASMMEMDUMP=0 off.
++// afeye (0026): wasm linear-memory CONTENT head dump at every Grow exit
++// and every Memory.buffer read-out - closes the SERIES.md-admitted
++// "memory CONTENTS are a black box" hole. Off-heap backing store: sound
++// across compaction. Head-capped by EmitSpan kSpanCap; 512-dump throttle;
++// AFEYE_TRACE_WASMMEMDUMP=0 off.
 +void EmitWasmMemContent(const void* mem_id, const uint8_t* base,
 +                        size_t byte_length);
  void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
