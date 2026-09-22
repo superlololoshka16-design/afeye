@@ -256,12 +256,86 @@
  ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
                                                      GLenum pname) {
 +#ifdef BLINK_AFEYE
++  // v12.4 (antifraud attack): the parameter VALUE is the fingerprint -
++  // pname alone names the probe, the ANSWER is what gets hashed into the
++  // token. UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL (the
++  // WEBGL_debug_renderer_info pair), GL_VERSION / GL_RENDERER /
++  // GL_SHADING_LANGUAGE_VERSION (the masked strings), and the numeric
++  // caps (MAX_TEXTURE_SIZE, MAX_VIEWPORT_DIMS, ...) all ride the SAME
++  // return path. Read them here BEFORE the switch: ContextGL()->GetString
++  // is the same call the switch makes, reading it early does not change
++  // any observable behavior (the GL driver string is cached by ANGLE -
++  // a second GetString is a hit, not a re-query).
 +  if (blink::afeye::Enabled()) {
-+    char afeye_buf[96];
-+    std::snprintf(afeye_buf, sizeof(afeye_buf), "webgl/get-parameter pname=%u",
-+                  static_cast<unsigned>(pname));
-+    blink::afeye::EmitStr(blink::afeye::kFingerprint,
-+                          blink::afeye::NowNs(), afeye_buf);
++    switch (pname) {
++      case 0x9245:  // UNMASKED_VENDOR_WEBGL
++      case 0x9246:  // UNMASKED_RENDERER_WEBGL
++      case GL_VERSION:
++      case GL_RENDERER:
++      case GL_VENDOR:
++      case GL_SHADING_LANGUAGE_VERSION: {
++        char afeye_buf[192];
++        const char* afeye_what = "webgl/param";
++        unsigned afeye_p = pname;
++        std::string afeye_val;
++        if (pname == 0x9245 || pname == 0x9246) {
++          // the unmasked pair: extension gate mirrors the switch below
++          afeye_what = (pname == 0x9245) ? "webgl/unmasked-vendor"
++                                         : "webgl/unmasked-renderer";
++          afeye_p = (pname == 0x9245) ? GL_VENDOR : GL_RENDERER;
++        }
++        if (ContextGL() && !isContextLost()) {
++          afeye_val = String(ContextGL()->GetString(
++              static_cast<GLenum>(afeye_p))).Utf8();
++        }
++        std::snprintf(afeye_buf, sizeof(afeye_buf),
++                      "%s pname=%u val=%.120s", afeye_what,
++                      static_cast<unsigned>(pname), afeye_val.c_str());
++        blink::afeye::EmitStr(blink::afeye::kFingerprint,
++                              blink::afeye::NowNs(), afeye_buf);
++        break;
++      }
++      case GL_MAX_TEXTURE_SIZE:
++      case GL_MAX_RENDERBUFFER_SIZE:
++      case GL_MAX_VIEWPORT_DIMS:
++      case GL_MAX_VERTEX_ATTRIBS:
++      case GL_MAX_VARYING_VECTORS:
++      case GL_MAX_VERTEX_UNIFORM_VECTORS:
++      case GL_MAX_FRAGMENT_UNIFORM_VECTORS:
++      case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS:
++      case GL_MAX_TEXTURE_IMAGE_UNITS:
++      case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS:
++      case GL_ALIASED_LINE_WIDTH_RANGE:
++      case GL_ALIASED_POINT_SIZE_RANGE:
++      case GL_SAMPLE_BUFFERS:
++      case GL_SAMPLES:
++      case GL_DEPTH_BITS:
++      case GL_STENCIL_BITS: {
++        // numeric caps: the switch answers these from the driver; the
++        // exact GL query is cheap and side-effect-free
++        if (ContextGL() && !isContextLost()) {
++          GLint afeye_v2[2] = {0, 0};
++          ContextGL()->GetIntegerv(static_cast<GLenum>(pname), afeye_v2);
++          char afeye_buf[128];
++          std::snprintf(afeye_buf, sizeof(afeye_buf),
++                        "webgl/param-int pname=%u v0=%d v1=%d",
++                        static_cast<unsigned>(pname), afeye_v2[0],
++                        afeye_v2[1]);
++          blink::afeye::EmitStr(blink::afeye::kFingerprint,
++                                blink::afeye::NowNs(), afeye_buf);
++        }
++        break;
++      }
++      default: {
++        char afeye_buf[96];
++        std::snprintf(afeye_buf, sizeof(afeye_buf),
++                      "webgl/get-parameter pname=%u",
++                      static_cast<unsigned>(pname));
++        blink::afeye::EmitStr(blink::afeye::kFingerprint,
++                              blink::afeye::NowNs(), afeye_buf);
++        break;
++      }
++    }
 +  }
 +#endif
    if (isContextLost())
