@@ -85,12 +85,15 @@ fn chrome_flags(f: &Flags) -> Vec<String> {
     if !f.ua.is_empty() {
         a.push(format!("--user-agent={}", f.ua));
     }
-    // afeye: per-bytecode V8 instruction trace (extreme volume) - explicit
-    // opt-in; the sinks themselves activate through the AFEYE_SINK env var,
-    // not through chrome flags.
-    if std::env::var("AFEYE_V8_TRACE").is_ok() {
-        a.push("--js-flags=--afeye-trace".into());
-    }
+    // afeye: NO v8/js chrome flags are passed. The capture layer activates
+    // entirely through the AFEYE_SINK / AFEYE_TRACE_* env vars read by the
+    // in-process sinks (see launch_chrome_local / launch_chrome below). A
+    // previous revision pushed "--js-flags=--afeye-trace" under AFEYE_V8_TRACE,
+    // but no patch ever DEFINED an `afeye_trace` v8 flag - v8 aborts with
+    // "unrecognized option --afeye-trace" and chrome never launches (zero
+    // capture). Per-bytecode instruction tracing was never implemented; the
+    // execution surface is covered by kind-34 exec records (0025 log.cc
+    // JitLogger::LogRecordedBuffer) instead. Dead crash-path removed (v12.5).
     if std::env::var("AF_TEST_HEADLESS").is_ok() {
         a.push("--headless".into());
         a.push("--disable-gpu".into());
