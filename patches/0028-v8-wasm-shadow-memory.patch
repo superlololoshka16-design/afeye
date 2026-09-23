@@ -18,10 +18,10 @@ index 6f63a62..ad1e764 100644
    }
 diff --git a/v8/src/afeye/wasm_shadow.cc b/v8/src/afeye/wasm_shadow.cc
 new file mode 100644
-index 0000000..6d46bfb
+index 0000000..fff6929
 --- /dev/null
 +++ b/v8/src/afeye/wasm_shadow.cc
-@@ -0,0 +1,807 @@
+@@ -0,0 +1,809 @@
 +#include "src/afeye/wasm_shadow.h"
 +
 +#ifdef V8_AFEYE
@@ -125,7 +125,7 @@ index 0000000..6d46bfb
 +// COMMIT callout takes ZERO arguments and needs no frame-slot or rsp
 +// assumption - which is what makes it arch-generic.
 +struct StagedBulk {
-+  uint32_t op = 0;  // kWasmShadowOpCopy / Fill / Init; 0 = nothing staged
++  uint32_t op = 0;  // kOpCopy/kOpFill/kOpInit below; 0 = nothing staged
 +  void* dst_base = nullptr;
 +  size_t dst_off = 0;
 +  void* src_base = nullptr;
@@ -665,10 +665,12 @@ index 0000000..6d46bfb
 +  if (region == nullptr) return;
 +
 +  const uint32_t before = ReduceRange(region + off, n);
-+  // Take the tag the interpreter/boundary layer parked when the value was pushed,
-+  // and CONSUME it so a stale tag cannot leak onto the next store. This is the
-+  // documented precision limit - see the header. It over-attributes (a store may
-+  // pick up a tag from an earlier push on this thread) and never under-attributes.
++  // Take the tag the boundary layer parked when the value was pushed, and
++  // CONSUME it so a stale tag cannot leak onto the next store. This is the
++  // documented precision limit - see the header's REQUIRED CALLER note, which
++  // also states that as of 0001-0032 nothing parks a tag yet, so this currently
++  // reads 0. It over-attributes (a store may pick up a tag from an earlier push
++  // on this thread) and never under-attributes.
 +  const uint32_t t = t_store_taint;
 +  t_store_taint = 0;
 +  ApplyStoreTag(base, region + off, n, augment != 0, t, before, kOpStore, off);
@@ -831,10 +833,10 @@ index 0000000..6d46bfb
 +#endif  // V8_AFEYE
 diff --git a/v8/src/afeye/wasm_shadow.h b/v8/src/afeye/wasm_shadow.h
 new file mode 100644
-index 0000000..30134cf
+index 0000000..88769f0
 --- /dev/null
 +++ b/v8/src/afeye/wasm_shadow.h
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,247 @@
 +#ifndef V8_AFEYE_WASM_SHADOW_H_
 +#define V8_AFEYE_WASM_SHADOW_H_
 +
@@ -893,13 +895,28 @@ index 0000000..30134cf
 +//   - byte-range to byte-range flows (memory.copy / memory.fill / memory.init,
 +//     and each load/store's own tag bytes) - exact, no approximation;
 +//   - the tag a LOAD reads out, published for the JS boundary seam;
-+//   - the tag a STORE writes, taken from a thread-local set by the
-+//     interpreter/boundary layer (0027) when a tainted value was pushed.
++//   - the tag a STORE writes, taken from the thread-local declared below.
 +// The thread-local handoff means a store may CONSERVATIVELY over-attribute a tag
 +// left by an earlier push on the same thread; it never under-attributes.
 +// Over-attribution is the accepted trade - for capture, a plausible false link
 +// beats a silent hole. Threading a real per-register taint table through every
 +// liftoff handler is the follow-up this layer is staged for.
++//
++// REQUIRED CALLER - INTEGRATION PREREQUISITE, NOT A GAP IN THIS FILE.
++// WasmShadowPushStoreTaint() must be called by the layer that KNOWS a JS value
++// is tainted at the moment it is pushed into wasm. That is the 0027
++// interpreter/Factory propagation seam (src/afeye/taint.cc + the interpreter
++// handlers), which this patch does not and may not edit. As of patches
++// 0001-0032 NOTHING calls it, so the consequence is exactly this: t_store_taint
++// stays 0, every store/fill therefore applies tag 0 (which by the overwrite law
++// below CLEARS), no range ever becomes non-zero, and because every emission is
++// gated on a non-zero tag the shadow ALLOCATES and TRACKS lifetimes correctly
++// but emits no records. The byte-range machinery (copy/fill/init/rekey) and the
++// load read-back are wired and exercised; only the initial injection of taint
++// INTO linear memory is pending that one call. Wiring it is a single call site
++// and is deliberately left to the owner of the taint core rather than faked
++// here by inventing a source bit - tagging every wasm store as tainted would be
++// precisely the false precision this comment refuses.
 +//
 +// Discipline matches sink.cc / taint.cc: no-alloc on the hot path (regions are
 +// pre-mapped, the table is a fixed array), bounded (kMaxTracked instances,
@@ -940,7 +957,8 @@ index 0000000..30134cf
 +void WasmShadowOnLoad(uintptr_t mem_id, uintptr_t offset, uintptr_t size);
 +
 +// Store hook. OVERWRITES [offset, offset+size) with the tag the boundary layer
-+// parked for this thread, and emits on a moved OR an erased tag.
++// parked for this thread (currently always 0 - see REQUIRED CALLER above), and
++// emits on a moved OR an erased tag.
 +// {augment} != 0 ORs the tag in instead of overwriting - required for the
 +// atomic read-modify-write ops (atomic.rmw / atomic.cmpxchg), whose result
 +// combines the old memory value with the operand, so erasing the old tag there
@@ -1044,8 +1062,10 @@ index 0000000..30134cf
 +// The store/load tag handoff (see the HONEST PRECISION LIMIT above).
 +// ---------------------------------------------------------------------------
 +
-+// Called by the interpreter/boundary layer (0027) when a TAINTED value is pushed
-+// into wasm: records the tag the next store on this thread applies.
++// Called by the 0027 interpreter/Factory propagation seam when a TAINTED value is
++// pushed into wasm: records the tag the next store on this thread applies. As of
++// 0001-0032 no caller exists yet - see REQUIRED CALLER in the header comment
++// above for exactly what is wired and what that leaves pending.
 +void WasmShadowPushStoreTaint(uint32_t tag);
 +
 +// The tag the most recent LOAD read out of the shadow on this thread (0 if none
@@ -1065,7 +1085,7 @@ index 0000000..30134cf
 +
 +#endif  // V8_AFEYE_WASM_SHADOW_H_
 diff --git a/v8/src/wasm/baseline/liftoff-compiler.cc b/v8/src/wasm/baseline/liftoff-compiler.cc
-index 7a5aba2..22954c4 100644
+index 7a5aba2..1168950 100644
 --- a/v8/src/wasm/baseline/liftoff-compiler.cc
 +++ b/v8/src/wasm/baseline/liftoff-compiler.cc
 @@ -39,6 +39,10 @@
@@ -1079,7 +1099,7 @@ index 7a5aba2..22954c4 100644
  namespace v8::internal::wasm {
  
  using VarState = LiftoffAssembler::VarState;
-@@ -4385,6 +4389,296 @@ class LiftoffCompiler {
+@@ -4385,6 +4389,299 @@ class LiftoffCompiler {
      __ DeallocateStackSlot(sizeof(MemoryTracingInfo));
    }
  
@@ -1258,7 +1278,10 @@ index 7a5aba2..22954c4 100644
 +    } else {
 +      if (!slot.is_reg()) return slot;  // already a frame slot or a constant
 +      const int base = std::max(__ GetTotalFrameSize(), __ TopSpillOffset());
-+      const int off = __ NextSpillOffset(slot.kind(), base);
++      // The 3-arg static overload (liftoff-assembler.h:493, defined at
++      // liftoff-assembler-inl.h:39-45, which this TU includes) takes an explicit
++      // base, so it is called class-qualified rather than through {asm_}.
++      const int off = LiftoffAssembler::NextSpillOffset(slot.kind(), base);
 +      __ RecordUsedSpillOffset(off);
 +      __ Spill(off, slot.reg(), slot.kind());
 +      return VarState{slot.kind(), off};
@@ -1376,7 +1399,7 @@ index 7a5aba2..22954c4 100644
    bool IndexStaticallyInBounds(const WasmMemory* memory,
                                 const VarState& index_slot, int access_size,
                                 uintptr_t* offset) {
-@@ -4518,6 +4812,14 @@ class LiftoffCompiler {
+@@ -4518,6 +4815,14 @@ class LiftoffCompiler {
                             type.mem_type().representation(), index, offset,
                             decoder->position());
      }
@@ -1391,7 +1414,7 @@ index 7a5aba2..22954c4 100644
    }
  
    void LoadTransform(FullDecoder* decoder, LoadType type,
-@@ -4566,6 +4868,13 @@ class LiftoffCompiler {
+@@ -4566,6 +4871,13 @@ class LiftoffCompiler {
        TraceMemoryOperation(false, imm.mem_index, mem_rep, index, offset,
                             decoder->position());
      }
@@ -1405,7 +1428,7 @@ index 7a5aba2..22954c4 100644
    }
  
    void LoadLane(FullDecoder* decoder, LoadType type, const Value& _value,
-@@ -4610,6 +4919,10 @@ class LiftoffCompiler {
+@@ -4610,6 +4922,10 @@ class LiftoffCompiler {
                             type.mem_type().representation(), index, offset,
                             decoder->position());
      }
@@ -1416,7 +1439,7 @@ index 7a5aba2..22954c4 100644
    }
  
    void StoreMem(FullDecoder* decoder, StoreType type,
-@@ -4675,6 +4988,11 @@ class LiftoffCompiler {
+@@ -4675,6 +4991,11 @@ class LiftoffCompiler {
        TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), index, offset,
                             decoder->position());
      }
@@ -1428,7 +1451,7 @@ index 7a5aba2..22954c4 100644
    }
  
    void StoreLane(FullDecoder* decoder, StoreType type,
-@@ -4714,6 +5032,9 @@ class LiftoffCompiler {
+@@ -4714,6 +5035,9 @@ class LiftoffCompiler {
        TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), index, offset,
                             decoder->position());
      }
@@ -1438,7 +1461,7 @@ index 7a5aba2..22954c4 100644
    }
  
    void CurrentMemoryPages(FullDecoder* /* decoder */,
-@@ -6400,6 +6721,11 @@ class LiftoffCompiler {
+@@ -6400,6 +6724,11 @@ class LiftoffCompiler {
        TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), index, offset,
                             decoder->position());
      }
@@ -1450,7 +1473,7 @@ index 7a5aba2..22954c4 100644
    }
  
    void AtomicLoadMem(FullDecoder* decoder, LoadType type,
-@@ -6436,6 +6762,10 @@ class LiftoffCompiler {
+@@ -6436,6 +6765,10 @@ class LiftoffCompiler {
                             type.mem_type().representation(), index, offset,
                             decoder->position());
      }
@@ -1461,7 +1484,7 @@ index 7a5aba2..22954c4 100644
    }
  
    void AtomicBinop(
-@@ -6487,6 +6817,12 @@ class LiftoffCompiler {
+@@ -6487,6 +6820,12 @@ class LiftoffCompiler {
      (asm_.*emit_fn)(addr, index, offset, value, result, type, nullptr,
                      i64_offset, LiftoffAssembler::kLittle);
      __ PushRegister(result_kind, result);
@@ -1474,7 +1497,7 @@ index 7a5aba2..22954c4 100644
    }
  
    void AtomicCompareExchange(FullDecoder* decoder, StoreType type,
-@@ -6565,6 +6901,15 @@ class LiftoffCompiler {
+@@ -6565,6 +6904,15 @@ class LiftoffCompiler {
      __ AtomicCompareExchange(addr, index, offset, expected, new_value, result,
                               type, nullptr, i64_offset);
      __ PushRegister(result_kind, result);
@@ -1490,7 +1513,7 @@ index 7a5aba2..22954c4 100644
  #endif
    }
  
-@@ -7557,6 +7902,23 @@ class LiftoffCompiler {
+@@ -7557,6 +7905,23 @@ class LiftoffCompiler {
      DCHECK(MatchingMemTypeOnTopOfStack(imm.memory.memory));
      VarState dst = PopIndexToVarState(&mem_offsets_high_word, &pinned);
  
@@ -1514,7 +1537,7 @@ index 7a5aba2..22954c4 100644
      Register instance_data = __ cache_state() -> cached_instance_data;
      if (instance_data == no_reg) {
        instance_data = __ GetUnusedRegister(kGpReg, pinned).gp();
-@@ -7588,6 +7950,12 @@ class LiftoffCompiler {
+@@ -7588,6 +7953,12 @@ class LiftoffCompiler {
          AddOutOfLineTrap(decoder, Builtin::kThrowWasmTrapMemOutOfBounds);
      __ emit_cond_jump(kEqual, trap.label(), kI32, result.gp(), no_reg,
                        trap.frozen());
@@ -1527,7 +1550,7 @@ index 7a5aba2..22954c4 100644
    }
  
    void DataDrop(FullDecoder* decoder, const IndexImmediate& imm) {
-@@ -7620,6 +7988,16 @@ class LiftoffCompiler {
+@@ -7620,6 +7991,16 @@ class LiftoffCompiler {
      DCHECK(MatchingMemTypeOnTopOfStack(imm.memory_dst.memory));
      VarState dst = PopIndexToVarState(&mem_offsets_high_word, &pinned);
  
@@ -1544,7 +1567,7 @@ index 7a5aba2..22954c4 100644
      Register instance_data = __ cache_state() -> cached_instance_data;
      if (instance_data == no_reg) {
        instance_data = __ GetUnusedRegister(kGpReg, pinned).gp();
-@@ -7651,6 +8029,8 @@ class LiftoffCompiler {
+@@ -7651,6 +8032,8 @@ class LiftoffCompiler {
          AddOutOfLineTrap(decoder, Builtin::kThrowWasmTrapMemOutOfBounds);
      __ emit_cond_jump(kEqual, trap.label(), kI32, result.gp(), no_reg,
                        trap.frozen());
@@ -1553,7 +1576,7 @@ index 7a5aba2..22954c4 100644
    }
  
    void MemoryFill(FullDecoder* decoder, const MemoryIndexImmediate& imm,
-@@ -7665,6 +8045,16 @@ class LiftoffCompiler {
+@@ -7665,6 +8048,16 @@ class LiftoffCompiler {
      DCHECK(MatchingMemTypeOnTopOfStack(imm.memory));
      VarState dst = PopIndexToVarState(&mem_offsets_high_word, &pinned);
  
@@ -1570,7 +1593,7 @@ index 7a5aba2..22954c4 100644
      Register instance_data = __ cache_state() -> cached_instance_data;
      if (instance_data == no_reg) {
        instance_data = __ GetUnusedRegister(kGpReg, pinned).gp();
-@@ -7694,6 +8084,8 @@ class LiftoffCompiler {
+@@ -7694,6 +8087,8 @@ class LiftoffCompiler {
          AddOutOfLineTrap(decoder, Builtin::kThrowWasmTrapMemOutOfBounds);
      __ emit_cond_jump(kEqual, trap.label(), kI32, result.gp(), no_reg,
                        trap.frozen());
@@ -1579,7 +1602,7 @@ index 7a5aba2..22954c4 100644
    }
  
    void LoadSmi(LiftoffRegister reg, int value) {
-@@ -11319,6 +11711,18 @@ class LiftoffCompiler {
+@@ -11319,6 +11714,18 @@ class LiftoffCompiler {
    const uint32_t deopt_info_bytecode_offset_;
    const LocationKindForDeopt deopt_location_kind_;
  
