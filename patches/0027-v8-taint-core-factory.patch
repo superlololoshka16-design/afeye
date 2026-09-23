@@ -653,28 +653,27 @@ index debbaae..67732bf 100644
  }
  
 diff --git a/v8/src/heap/factory.cc b/v8/src/heap/factory.cc
-index 9716d02..db5da17 100644
+index 9716d02..a87f693 100644
 --- a/v8/src/heap/factory.cc
 +++ b/v8/src/heap/factory.cc
-@@ -2,7 +2,9 @@
- // Use of this source code is governed by a BSD-style license that can be
+@@ -3,6 +3,9 @@
  // found in the LICENSE file.
  
--#include "src/heap/factory.h"
-+#include "src/heap/factory.h"#ifdef V8_AFEYE
+ #include "src/heap/factory.h"
++#ifdef V8_AFEYE
 +#include "src/afeye/taint.h"
 +#endif
  
  #include <algorithm>  // For copy
  #include <memory>     // For shared_ptr<>
-@@ -1470,7 +1472,22 @@ Handle<String> Factory::NewProperSubString(DirectHandle<String> str,
+@@ -1470,7 +1473,22 @@ Handle<String> Factory::NewProperSubString(DirectHandle<String> str,
    }
  
    if (!v8_flags.string_slices || length < SlicedString::kMinLength) {
 +#ifdef V8_AFEYE
 +    // 0027: the copied-substring branch (short slices / string_slices off).
 +    {
-+      DirectHandle<String> afeye_r = NewCopiedSubstring(str, begin, length);
++      Handle<String> afeye_r = NewCopiedSubstring(str, begin, length);
 +      if (v8::afeye::TaintEnabled()) {
 +        v8::afeye::TaintTag t = v8::afeye::TaintGet(
 +            v8::afeye::kKeyHeap, static_cast<uint64_t>(str->address()));
@@ -690,7 +689,7 @@ index 9716d02..db5da17 100644
    }
  
    int offset = begin;
-@@ -1496,6 +1513,18 @@ Handle<String> Factory::NewProperSubString(DirectHandle<String> str,
+@@ -1496,6 +1514,18 @@ Handle<String> Factory::NewProperSubString(DirectHandle<String> str,
    slice->set_length(length);
    slice->set_parent(*str);
    slice->set_offset(offset);
