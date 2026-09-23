@@ -1,3 +1,5 @@
+diff --git a/v8/src/builtins/builtins-date.cc b/v8/src/builtins/builtins-date.cc
+index ad5c62f..a473d73 100644
 --- a/v8/src/builtins/builtins-date.cc
 +++ b/v8/src/builtins/builtins-date.cc
 @@ -3,6 +3,11 @@
@@ -12,13 +14,11 @@
  #include "src/builtins/builtins.h"
  #include "src/codegen/code-factory.h"
  #include "src/date/date.h"
-@@ -149,6 +154,22 @@ BUILTIN(DateConstructor) {
+@@ -149,6 +154,20 @@ BUILTIN(DateConstructor) {
  // ES6 section 20.3.3.1 Date.now ( )
  BUILTIN(DateNow) {
    HandleScope scope(isolate);
 +#ifdef V8_AFEYE
-+  // afeye (v6): Date.now() is the clock every antifraud timing check reads.
-+  // One record per call (capped) - the filter reads cadence from this.
 +  if (v8::afeye::Enabled()) {
 +    static std::atomic<uint64_t> g_afeye_clock{0};
 +    static bool g_afeye_clock_off = []() {
@@ -35,6 +35,8 @@
    return *isolate->factory()->NewNumberFromInt64(
        JSDate::CurrentTimeValue(isolate));
  }
+diff --git a/v8/src/builtins/builtins-function.cc b/v8/src/builtins/builtins-function.cc
+index b511c42..c4011ee 100644
 --- a/v8/src/builtins/builtins-function.cc
 +++ b/v8/src/builtins/builtins-function.cc
 @@ -3,6 +3,12 @@
@@ -50,33 +52,22 @@
  #include "src/builtins/builtins.h"
  #include "src/codegen/code-factory.h"
  #include "src/codegen/compiler.h"
-@@ -10,6 +16,12 @@
+@@ -10,6 +16,10 @@
  #include "src/logging/counters.h"
  #include "src/numbers/conversions.h"
  #include "src/objects/api-callbacks.h"
 +#ifdef V8_AFEYE
-+// no-alloc heap-object reads for the toString integrity hook (see
-+// AfeyeLogToString below). After the standard objects/api-callbacks.h include.
 +#include "src/objects/script-inl.h"
 +#include "src/objects/string-inl.h"
 +#endif
  #include "src/objects/lookup.h"
  #include "src/objects/objects-inl.h"
  #include "src/strings/string-builder-inl.h"
-@@ -245,10 +257,106 @@ BUILTIN(FunctionPrototypeBind) {
+@@ -245,10 +255,89 @@ BUILTIN(FunctionPrototypeBind) {
    return DoFunctionBind(isolate, args, ProtoSource::kUseTargetPrototype);
  }
  
 +#ifdef V8_AFEYE
-+// afeye (v6): Function.prototype.toString is THE antifraud integrity-check
-+// surface (native-code probes, eval'd-source diffs). We record WHO was
-+// inspected (receiver's script:line, name) before the original runs - no
-+// result tampering, pure observation. The receiver identity uses the same
-+// v8::Function introspection the 0003 call-origin hook proved against this
-+// tree.
-+// Copies up to `cap` flat string bytes into `dst` under `no_gc`, sanitizing
-+// to printable ASCII, NUL-terminating, and returning the copied length.
-+// No allocation: reads straight off the String's flat content.
 +static int AfeyeCopyString(Tagged<String> str, const DisallowGarbageCollection& no_gc,
 +                           char* dst, uint32_t cap) {
 +  String::FlatContent flat = str->GetFlatContent(no_gc);
@@ -109,16 +100,8 @@
 +    return;
 +  }
 +  char afeye_buf[320];
-+  // NO-ALLOC (v8): toString is THE antifraud integrity surface and fires
-+  // during the very checks the capture runs alongside. The previous body
-+  // built a GetName()/GetScriptOrigin()/Utf8Value/std::string heap chain per
-+  // call. This reads name + script + line off the Tagged<> heap objects under
-+  // DisallowGarbageCollection - stack scratch only, no Local, no HandleScope,
-+  // no heap buffer. Bound functions unwrap to their target so the record still
-+  // names the real callee.
 +  DisallowGarbageCollection no_gc;
 +  Tagged<Object> afeye_recv = *recv;
-+  // unwrap JSBoundFunction -> its target JSFunction (no allocation)
 +  int afeye_hops = 0;
 +  while (IsJSBoundFunction(afeye_recv) && afeye_hops < 8) {
 +    afeye_recv = Cast<JSBoundFunction>(afeye_recv)->bound_target_function();
@@ -170,6 +153,8 @@
    if (IsJSBoundFunction(*receiver)) {
      return *JSBoundFunction::ToString(isolate, Cast<JSBoundFunction>(receiver));
    }
+diff --git a/v8/src/execution/microtask-queue.cc b/v8/src/execution/microtask-queue.cc
+index dfde348..4480536 100644
 --- a/v8/src/execution/microtask-queue.cc
 +++ b/v8/src/execution/microtask-queue.cc
 @@ -3,6 +3,10 @@

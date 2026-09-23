@@ -224,24 +224,8 @@ async fn run() -> Result<(), String> {
     let rid = timefmt::run_id(t0ms);
     let stage_run = stage.join(&slot);
     std::fs::create_dir_all(&stage_run).map_err(|e| e.to_string())?;
-    // C++ sink collector: up before any chrome exists, drained after every
-    // chrome is dead, so the raw record timeline lands inside the zip.
-    // The raw dir must start EMPTY: FileTail rescans unseen files from
-    // offset 0, so stale <layer>-<pid>.rec from a previous run would blend
-    // into this timeline and the sink-hello liveness probe could pass from
-    // a PREVIOUS run's records (pid reuse even re-opens them for append).
     let raw_dir = std::env::var("AF_RAW_DIR").unwrap_or_else(|_| "/tmp/afeye-raw".into());
     let _ = std::fs::create_dir_all(&raw_dir);
-    // v12.4 (the empty-collect fix): main runs as root (sudo -E in CI) while
-    // tunnel chrome runs as `fxN` inside a netns. create_dir_all honors the
-    // root umask (typically 022 -> 0755 root:root): the sinks inside fxN
-    // chrome then CANNOT create <layer>-<pid>.rec (EACCES), every open()
-    // fails, and the whole capture dies silently - stats.json records=0,
-    // sink_alive=false, an empty collect/, and a filtered zip with zero
-    // chains. The C++ sinks chmod 0777 on THEIR init, but init never runs
-    // when the sink can't even open the dir for writing... actually it CAN
-    // (mkdir/chmod succeed on an existing dir only with write perms).
-    // Widen here, owner-agnostic, BEFORE any chrome exists.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -290,11 +274,6 @@ async fn run() -> Result<(), String> {
         ctx.interner.intern(&t.endpoint.replace(':', "_"));
     }
     let writer = writer::spawn(rx, arx, ctx.clone());
-    // afeye: probe the sink layer once, early. A chrome without the afeye
-    // patches (stock upstream) writes zero sink-hello records, and without
-    // this check the run stays silent about the deep layer being dead while
-    // the zip pretends to be a deep capture. Warn once, fact goes into the
-    // manifest at the end (sink_alive).
     {
         let probe = collector.hellos_handle();
         std::thread::Builder::new()
@@ -526,10 +505,6 @@ async fn run() -> Result<(), String> {
     for f in futs {
         let _ = f.await;
     }
-    // graceful first: CDP Browser.close / SIGTERM lets the C++ atexit
-    // Flush(500) drain the 8 MiB rings (a SIGKILL-only shutdown loses the
-    // tail records AND the loss is invisible to the kind-39 witness, which
-    // would turn "ring backlog lost at kill" into a false dead-end-proven).
     for mut c in children {
         #[cfg(unix)]
         {
@@ -542,8 +517,6 @@ async fn run() -> Result<(), String> {
         }
         let _ = c.kill().await;
     }
-    // grace window: drain threads write out their rings before the collector
-    // takes its final scan (the drain loop flushes on atexit within 500 ms).
     tokio::time::sleep(Duration::from_millis(1200)).await;
     #[cfg(unix)]
     {
@@ -571,10 +544,6 @@ async fn run() -> Result<(), String> {
         "[afeye] collect: records={} bytes={} truncated={} corrupt={} files={}",
         cstats.records, cstats.bytes, cstats.truncated, cstats.corrupt, cstats.files
     );
-    // deep sink filter: merge script fragments into chains, index wasm
-    // imports/exports, slice cold branches out, link input -> event ->
-    // timer -> network timing chains, then prune the per-record raw files
-    // (the 10k one-kilo-file problem) - index.jsonl keeps every hash/ts.
     let mut sf_stats = sinkfilter::SinkFilterStats::default();
     match sinkfilter::run(&stage_run.join("collect")) {
         Ok(sf) => {
@@ -639,20 +608,9 @@ async fn run() -> Result<(), String> {
             eprintln!("[afeye] filtered copy failed: {e}");
         } else {
             classify::strict(&fdir);
-            // v7 dead-end cut: this FILTERED zip keeps ONLY the chains that
-            // feed the challenge token (token_forming in report.json). The
-            // run zip above stays untouched - it still carries every kept
-            // chain, token or not; nothing is lost, the two zips just sort
-            // the same capture by different rules.
             let mut dropped = 0usize;
             if let Ok(rep) = std::fs::read(fdir.join("collect/filtered/report.json")) {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&rep) {
-                    // v9: the authoritative cut set is report.prunes (EVERY
-                    // not-token-forming chain, uncapped). The old chains[]
-                    // walk silently missed chains past the 4000-entry report
-                    // cap - eval storms leaked dead ends into the token-only
-                    // zip. Fall back to chains[] for reports written by older
-                    // filter versions.
                     if let Some(prune) = v.get("prune").and_then(|p| p.as_array()) {
                         for ch in prune {
                             let path = ch.get("path").and_then(|p| p.as_str()).unwrap_or("");
@@ -760,9 +718,6 @@ async fn run() -> Result<(), String> {
     if size > 95 * 1024 * 1024 {
         eprintln!("[afeye] WARN zip > 95MB, lower AF_BUDGET_MB");
     }
-    // sidecar manifest with the REAL zip size: the in-zip manifest is written
-    // before packing, so its zip_bytes cannot know the archive size. The
-    // sidecar lands next to the zip in dumps/ and is the observable truth.
     let ms = out.join(format!("{stem}.manifest.json"));
     mt.zip_bytes = size;
     let _ = std::fs::write(&ms, serde_json::to_vec_pretty(&mt).unwrap_or_default());
@@ -789,9 +744,6 @@ unsafe fn geteuid() -> u32 {
     }
 }
 
-/// Build a headed Linux Chrome UA from the binary's own --version output.
-/// Headless builds send `HeadlessChrome/x.y` in every request header and
-/// expose it to `navigator.userAgent` - anti-fraud keys on exactly that.
 fn user_agent_for(chrome: &PathBuf) -> String {
     let out = std::process::Command::new(chrome)
         .arg("--version")
@@ -808,7 +760,6 @@ fn user_agent_for(chrome: &PathBuf) -> String {
         .unwrap_or("")
         .to_owned();
     if ver.is_empty() {
-        // keep the token-free shape even when detection fails
         return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36".into();
     }
     eprintln!("[afeye] chrome {ver} -> UA override (no HeadlessChrome token)");

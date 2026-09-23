@@ -1,14 +1,12 @@
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index 739b283..c417144 100644
 --- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 +++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-@@ -530,6 +530,20 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+@@ -530,6 +530,16 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
      }
    }
  
 +#ifdef BLINK_AFEYE
-+  // afeye (0014): the getImageData RESULT. 0007 logs the ask (rect+ctx); this
-+  // logs the pixels - the actual canvas-2d fingerprint digest the antifraud
-+  // hashes. Head-span only (kSpanCap in the sink bounds it); RawByteSpan is
-+  // the same accessor GetSkPixmap uses, so the bytes are the delivered ones.
 +  if (blink::afeye::Enabled() && image_data) {
 +    base::span<uint8_t> afeye_px = image_data->RawByteSpan();
 +    if (!afeye_px.empty()) {
@@ -21,6 +19,8 @@
    return image_data;
  }
  
+diff --git a/third_party/blink/renderer/modules/webaudio/analyser_node.cc b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
+index 688a2fe..d89c3f9 100644
 --- a/third_party/blink/renderer/modules/webaudio/analyser_node.cc
 +++ b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
 @@ -25,6 +25,12 @@
@@ -36,18 +36,13 @@
  #include "third_party/blink/renderer/bindings/modules/v8/v8_analyser_options.h"
  #include "third_party/blink/renderer/modules/webaudio/analyser_handler.h"
  #include "third_party/blink/renderer/modules/webaudio/audio_graph_tracer.h"
-@@ -116,22 +122,85 @@ double AnalyserNode::smoothingTimeConstant() const {
+@@ -116,22 +122,80 @@ double AnalyserNode::smoothingTimeConstant() const {
    return GetAnalyserHandler().SmoothingTimeConstant();
  }
  
 +#ifdef BLINK_AFEYE
 +namespace {
 +
-+// afeye (0014): the realtime audio fingerprint - AnalyserNode getters are the
-+// AudioContext-fingerprint surface 0007 missed (it only hooked the OFFLINE
-+// render destination). Every read delivers bytes into the caller's typed
-+// array; emit a head-span of the filled buffer. One shared cap: an audio
-+// cadence loop polls these per frame.
 +constexpr uint64_t kAfeyeAnalyserCap = 2000000;
 +std::atomic<uint64_t> g_afeye_analyser{0};
 +
@@ -72,7 +67,7 @@
 +      static_cast<uint32_t>(len * sizeof(float)));
 +}
 +
-+}  // namespace
++}
 +#endif
 +
  void AnalyserNode::getFloatFrequencyData(NotShared<DOMFloat32Array> array) {
@@ -122,19 +117,15 @@
  }
  
  void AnalyserNode::ReportDidCreate() {
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index 8804690..5606cf6 100644
 --- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-@@ -5340,6 +5340,23 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
+@@ -5400,6 +5400,17 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
                                                   GLenum type,
                                                   DOMArrayBufferView* pixels,
                                                   int64_t offset) {
 +#ifdef BLINK_AFEYE
-+  // afeye (0014): WebGL readPixels is THE WebGL-fingerprint readback - the
-+  // rendered digest FingerprintJS/CreepJS hash. 0007 covered getParameter/
-+  // getExtension/getShaderPrecisionFormat but readPixels was invisible: only
-+  // the ASK was nameable via kind-29, never the geometry or the pixels. This
-+  // logs the ask here (the single funnel WebGL1 and WebGL2 readPixels both
-+  // call) and the result head-span below.
 +  if (blink::afeye::Enabled()) {
 +    char afeye_buf[160];
 +    std::snprintf(afeye_buf, sizeof(afeye_buf),
@@ -148,15 +139,11 @@
    if (isContextLost())
      return;
    // Due to WebGL's same-origin restrictions, it is not possible to
-@@ -5406,6 +5423,19 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
+@@ -5466,6 +5477,15 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
        return;
      }
      ContextGL()->ReadPixels(x, y, width, height, format, type, data);
 +#ifdef BLINK_AFEYE
-+    // the RESULT: the pixels are now in `data`. Emit a head-span (the digest
-+    // signal; the full buffer is caller-owned and can be megabytes). Capped
-+    // by the sink span limit; content-slice links this blob to the send that
-+    // consumed it. No copy beyond the head-span, no re-render.
 +    if (blink::afeye::Enabled() && data && buffer_size.IsValid()) {
 +      size_t afeye_n = buffer_size.ValueOrDie();
 +      blink::afeye::EmitSpan(blink::afeye::kFingerprint, blink::afeye::NowNs(),

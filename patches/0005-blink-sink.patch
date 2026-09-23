@@ -1,97 +1,53 @@
-diff --git a/third_party/blink/renderer/platform/afeye/sink.h b/third_party/blink/renderer/platform/afeye/sink.h
-new file mode 100644
---- /dev/null
-+++ b/third_party/blink/renderer/platform/afeye/sink.h
-@@ -0,0 +0,73 @@
-+#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
-+#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
-+
-+#include <stddef.h>
-+#include <stdint.h>
-+
-+#ifdef BLINK_AFEYE
-+#include <atomic>
-+
-+namespace blink {
-+namespace afeye {
-+
-+enum EventKind : uint8_t {
-+  kSinkHello = 0,
-+  kCryptoOp = 11,
-+  kTimer = 12,
-+  kPerfEntry = 13,
-+  kMessage = 14,
-+  kStructuredClone = 15,
-+  kFingerprint = 16,
-+  kWebSocket = 19,
-+  kClientHints = 20,
-+  kSwCache = 21,
-+  kScriptSource = 22,
-+  kInput = 23,
-+  kEventDispatch = 24,
-+  kDomMetric = 25,
-+  kAudio = 26,
-+  kWebrtc = 27,
-+  kFetch = 28,
-+  // v6 additions (wire-compatible, new records only)
-+  kDomApi = 29,
-+  // v8 additions (wire-compatible; kind 33 already named "clock" by the
-+  // collector - the blink layer joins the v8 clock stream: Date.now (v8)
-+  // + performance.now (blink, 0012)
-+  kClock = 33,
-+  kWorker = 35,
-+  kNavStart = 36,
-+  // v9: the plaintext-boundary carriers (0016): TextEncoder/TextDecoder,
-+  // atob/btoa, FormData entries, URLSearchParams. Body = <src_tag>\0<bytes>,
-+  // EmitSpan convention - the exact bytes at each string->bytes boundary of
-+  // the token pipeline, so the Rust filter can run content-runs across them
-+  // (backward slice by DATA, not by timer).
-+  kTaintEdge = 37,
-+};
-+
-+bool Enabled();
-+uint64_t NowNs();
-+void EmitFlags(uint8_t kind, uint64_t ts_ns, uint8_t flags, const void* data,
-+               uint32_t len);
-+void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
-+void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s);
-+void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b);
-+void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
-+              const uint8_t* bytes, uint32_t n);
-+uint64_t SinkDropped();
-+// v12.1 (0016): ONE shared taint-edge record counter for all five
-+// funnels (TextEncoder/TextDecoder/atob/btoa/FormData/URLSearchParams)
-+// - five per-TU atomics were 5x the documented 100k/process cap.
-+extern std::atomic<uint64_t> g_afeye_taint;
-+bool Flush(uint32_t timeout_ms);
-+// Ambient per-thread execution context ("what is running right now"):
-+// the input/event/timer hooks set it, the script/fetch hooks read it,
-+// so every captured script and request carries its cause.
-+void SetTag(const char* s);
-+const char* Tag();
-+
+diff --git a/third_party/blink/renderer/platform/BUILD.gn b/third_party/blink/renderer/platform/BUILD.gn
+index 9bfa956..8311aa5 100644
+--- a/third_party/blink/renderer/platform/BUILD.gn
++++ b/third_party/blink/renderer/platform/BUILD.gn
+@@ -270,9 +270,15 @@ declare_args() {
+ 
+   # Enable TRACE_EVENT instrumentation for Blink bindings.
+   # Disabled by default as it increases binary size.
++  # afeye: env-activated record sink compiled into blink (patches/SERIES.md).
++  blink_enable_afeye = false
+   enable_blink_bindings_tracing = extended_tracing_enabled
+ }
+ 
++config("afeye_config") {
++  defines = [ "BLINK_AFEYE" ]
 +}
-+}  // namespace blink
 +
-+#endif
+ # ZSTD compression is available on Fuchsia (crbug.com/534838085) but disable in
+ # Blink to disable features that depend on it.
+ has_zstd_compression = !is_fuchsia
+@@ -1708,6 +1714,14 @@ component("platform") {
+     }
+   }
+ 
++  if (blink_enable_afeye) {
++    sources += [
++      "afeye/sink.cc",
++      "afeye/sink.h",
++    ]
++    public_configs = [ ":afeye_config" ]
++  }
 +
-+#endif
+   if (current_cpu == "loong64") {
+     cflags = [
+       "-mlsx",
 diff --git a/third_party/blink/renderer/platform/afeye/sink.cc b/third_party/blink/renderer/platform/afeye/sink.cc
 new file mode 100644
+index 0000000..1e6d75f
 --- /dev/null
 +++ b/third_party/blink/renderer/platform/afeye/sink.cc
-@@ -0,0 +73,348 @@
+@@ -0,0 +1,323 @@
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +
 +#ifdef BLINK_AFEYE
 +
 +namespace blink {
 +namespace afeye {
-+// v12.1 (0016): the ONE taint-edge counter the five funnels share
-+// (extern in sink.h; 0016's per-TU copies deleted).
 +std::atomic<uint64_t> g_afeye_taint{0};
-+}  // namespace afeye
-+}  // namespace blink
++}
++}
 +
 +#include <atomic>
 +#include <cerrno>
@@ -123,13 +79,6 @@ new file mode 100644
 +std::atomic<bool> g_on{false};
 +std::atomic<uint64_t> g_dropped{0};
 +std::once_flag g_init_once;
-+// v12.4: fork safety - see Enabled(). Blink lives in zygote-forked
-+// renderers; without this check the child inherits a completed once_flag,
-+// fills the 8 MiB ring with no drain thread, and every blink record is
-+// dropped (the exact bug v12.1 fixed for v8/net but missed here).
-+// atomic + CAS: two child threads entering Enabled() concurrently must
-+// not both spawn DrainLoop - two writers interleave WriteAll chunks and
-+// the collector resyncs them away as corrupt bytes.
 +std::atomic<pid_t> g_pid{0};
 +
 +struct Ring {
@@ -160,8 +109,6 @@ new file mode 100644
 +  return kDir;
 +}
 +
-+// v12.4 (0001 pattern): write errors are COUNTED and folded into the
-+// drop witness - a silent return made ENOSPC/EIO invisible loss.
 +std::atomic<uint64_t> g_write_err{0};
 +
 +void WriteAll(int fd, const uint8_t* p, size_t n) {
@@ -202,8 +149,6 @@ new file mode 100644
 +  std::string path = std::string(RawDir()) + "/" + kLayer + "-" + pid + ".rec";
 +  int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
 +  if (fd >= 0) EmitHello(fd);
-+  // v12.4 (N6, 0001 pattern): pre-sized buffer, memcpy under lock, write
-+  // outside it - buf.assign() malloc'd up to 1 MiB INSIDE the ring lock.
 +  static thread_local std::vector<uint8_t> buf;
 +  buf.resize(kMaxRecord);
 +  for (;;) {
@@ -235,7 +180,6 @@ new file mode 100644
 +    if (have) {
 +      if (fd >= 0) {
 +        WriteAll(fd, buf.data(), len);
-+        // v12.4 (0001 pattern): failed write -> force reopen next cycle.
 +        if (g_write_err.load(std::memory_order_relaxed) != werr_before) {
 +          ::close(fd);
 +          fd = -1;
@@ -261,14 +205,6 @@ new file mode 100644
 +  std::atexit([] { Flush(500); });
 +}
 +
-+// v12.4: fork safety, 0001 pattern hardened. The child of a zygote fork
-+// inherits the ring and a COMPLETED once_flag but not the drain thread.
-+// CAS on the atomic g_pid guarantees exactly ONE reinit wins the race when
-+// several child threads hit Enabled() at once; the lock is cleared
-+// unconditionally first because the (dead) parent thread may have held it
-+// at fork time - in the fresh child only one thread exists at that moment,
-+// so the clear cannot race. Early-exit when the sink is off: a disabled
-+// build must never spawn a drain thread or leave a .rec file behind.
 +void ReinitAfterFork() {
 +  if (!g_on.load(std::memory_order_acquire)) {
 +    g_pid.store(::getpid(), std::memory_order_release);
@@ -282,15 +218,13 @@ new file mode 100644
 +  std::thread(DrainLoop).detach();
 +}
 +
-+}  // namespace
++}
 +
 +bool Enabled() {
 +  std::call_once(g_init_once, InitOnce);
 +  pid_t me = ::getpid();
 +  if (g_pid.load(std::memory_order_acquire) != me) {
 +    pid_t old = g_pid.load(std::memory_order_acquire);
-+    // CAS: the winner re-inits, the losers fall through - two threads
-+    // post-fork must never both spawn DrainLoop on one file.
 +    if (g_pid.compare_exchange_strong(old, me, std::memory_order_acq_rel)) {
 +      ReinitAfterFork();
 +    }
@@ -388,7 +322,6 @@ new file mode 100644
 +            static_cast<uint32_t>(buf.size()));
 +}
 +
-+// v12.4 (0001 pattern): ring drops AND write errors - see SinkDropped.
 +uint64_t SinkDropped() {
 +  return g_dropped.load(std::memory_order_relaxed) +
 +         g_write_err.load(std::memory_order_relaxed);
@@ -426,37 +359,70 @@ new file mode 100644
 +const char* Tag() { return g_afeye_tag; }
 +
 +}
-+}  // namespace blink
-+
-+#endif
---- a/third_party/blink/renderer/platform/BUILD.gn
-+++ b/third_party/blink/renderer/platform/BUILD.gn
-@@ -270,7 +629,13 @@
- 
-   # Enable TRACE_EVENT instrumentation for Blink bindings.
-   # Disabled by default as it increases binary size.
-+  # afeye: env-activated record sink compiled into blink (patches/SERIES.md).
-+  blink_enable_afeye = false
-   enable_blink_bindings_tracing = extended_tracing_enabled
 +}
 +
-+config("afeye_config") {
-+  defines = [ "BLINK_AFEYE" ]
- }
- 
- # ZSTD compression is available on Fuchsia (crbug.com/534838085) but disable in
-@@ -1708,6 +2073,14 @@
-     }
-   }
- 
-+  if (blink_enable_afeye) {
-+    sources += [
-+      "afeye/sink.cc",
-+      "afeye/sink.h",
-+    ]
-+    public_configs = [ ":afeye_config" ]
-+  }
++#endif
+diff --git a/third_party/blink/renderer/platform/afeye/sink.h b/third_party/blink/renderer/platform/afeye/sink.h
+new file mode 100644
+index 0000000..00c61df
+--- /dev/null
++++ b/third_party/blink/renderer/platform/afeye/sink.h
+@@ -0,0 +1,58 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
++#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
 +
-   if (current_cpu == "loong64") {
-     cflags = [
-       "-mlsx",
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef BLINK_AFEYE
++#include <atomic>
++
++namespace blink {
++namespace afeye {
++
++enum EventKind : uint8_t {
++  kSinkHello = 0,
++  kCryptoOp = 11,
++  kTimer = 12,
++  kPerfEntry = 13,
++  kMessage = 14,
++  kStructuredClone = 15,
++  kFingerprint = 16,
++  kWebSocket = 19,
++  kClientHints = 20,
++  kSwCache = 21,
++  kScriptSource = 22,
++  kInput = 23,
++  kEventDispatch = 24,
++  kDomMetric = 25,
++  kAudio = 26,
++  kWebrtc = 27,
++  kFetch = 28,
++  kDomApi = 29,
++  kClock = 33,
++  kWorker = 35,
++  kNavStart = 36,
++  kTaintEdge = 37,
++};
++
++bool Enabled();
++uint64_t NowNs();
++void EmitFlags(uint8_t kind, uint64_t ts_ns, uint8_t flags, const void* data,
++               uint32_t len);
++void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
++void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s);
++void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b);
++void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
++              const uint8_t* bytes, uint32_t n);
++uint64_t SinkDropped();
++extern std::atomic<uint64_t> g_afeye_taint;
++bool Flush(uint32_t timeout_ms);
++void SetTag(const char* s);
++const char* Tag();
++
++}
++}
++
++#endif
++
++#endif

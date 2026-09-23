@@ -1,22 +1,12 @@
+diff --git a/services/network/websocket.cc b/services/network/websocket.cc
+index 89673ec..697c6df 100644
 --- a/services/network/websocket.cc
 +++ b/services/network/websocket.cc
-@@ -1001,6 +1001,29 @@ bool WebSocket::ReadAndSendFrameFromDataPipe(DataFrame* data_frame) {
+@@ -1001,6 +1001,17 @@ bool WebSocket::ReadAndSendFrameFromDataPipe(DataFrame* data_frame) {
        if (bytes_reassembled_ == data_frame->data_length) {
          bytes_reassembled_ = 0;
          blocked_on_websocket_channel_ = true;
 +#ifdef NET_AFEYE
-+        // afeye (0017): OUTBOUND ws frame, reassembled path. The inbound hook
-+        // (0011) sits in WebSocketEventHandler::OnDataFrame and only ever sees
-+        // channel->client frames; the token LEAVING over WS (Kasada/HUMAN
-+        // telemetry channels) never crossed any sink before this. Symmetric
-+        // record: "ws-frame-out" span, same head-cap as the inbound hook.
-+        // v12.1: the old guard read bytes_reassembled_ AFTER the context
-+        // line above zeroed it - always false, the reassembled outbound
-+        // path NEVER emitted (SERIES.md claimed both paths covered).
-+        // data_frame->data_length IS the reassembled message length here
-+        // (bytes_reassembled_ == data_frame->data_length was the branch
-+        // condition); message_under_reassembly_ is alive - the std::move
-+        // happens in SendFrame below.
 +        if (network::afeye::Enabled() && data_frame->data_length > 0) {
 +          network::afeye::EmitSpan(
 +              network::afeye::kWebSocket, network::afeye::NowNs(),
@@ -30,13 +20,11 @@
          if (channel_->SendFrame(
                  /*fin=*/true, MessageTypeToOpCode(data_frame->type),
                  std::move(message_under_reassembly_),
-@@ -1020,6 +1043,17 @@ bool WebSocket::ReadAndSendFrameFromDataPipe(DataFrame* data_frame) {
+@@ -1020,6 +1031,15 @@ bool WebSocket::ReadAndSendFrameFromDataPipe(DataFrame* data_frame) {
      auto data_to_pass =
          base::MakeRefCounted<net::IOBufferWithSize>(size_to_send);
      data_to_pass->span().copy_prefix_from(buffer.first(size_to_send));
 +#ifdef NET_AFEYE
-+    // afeye (0017): OUTBOUND ws frame, direct path - bytes just copied into
-+    // data_to_pass; one span from the copy, no second buffer.
 +    if (network::afeye::Enabled() && size_to_send > 0) {
 +      network::afeye::EmitSpan(
 +          network::afeye::kWebSocket, network::afeye::NowNs(), "ws-frame-out",

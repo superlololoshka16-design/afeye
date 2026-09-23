@@ -1,3 +1,5 @@
+diff --git a/v8/src/runtime/runtime-wasm.cc b/v8/src/runtime/runtime-wasm.cc
+index f739fed..1f11668 100644
 --- a/v8/src/runtime/runtime-wasm.cc
 +++ b/v8/src/runtime/runtime-wasm.cc
 @@ -27,6 +27,13 @@
@@ -14,15 +16,11 @@
  #include "src/strings/unicode-inl.h"
  #include "src/trap-handler/trap-handler.h"
  #include "src/wasm/module-compiler.h"
-@@ -99,6 +106,22 @@ class FrameFinder {
+@@ -99,6 +106,18 @@ class FrameFinder {
  Tagged<Object> ThrowWasmError(
      Isolate* isolate, MessageTemplate message,
      std::initializer_list<DirectHandle<Object>> args = {}) {
 +#ifdef V8_AFEYE
-+  // afeye (0023, G4): every wasm TRAP. Kasada-style sensors deliberately
-+  // trigger and catch traps (OOB, null-deref, table-OOB) to detect a modified
-+  // environment; the MessageTemplate id IS the trap kind. Zero-alloc (int
-+  // only) - this can fire per-trap under an induced-trap antifraud probe.
 +  if (v8::afeye::Enabled()) {
 +    static std::atomic<uint64_t> g_afeye_wasmtrap{0};
 +    if (g_afeye_wasmtrap.fetch_add(1, std::memory_order_relaxed) < 2000000) {
@@ -37,18 +35,11 @@
  #if V8_ENABLE_DRUMBRAKE
    if (v8_flags.wasm_jitless) {
      // Store the trap reason to be retrieved later when the interpreter will
-@@ -369,6 +392,26 @@ RUNTIME_FUNCTION(Runtime_WasmCompileLazy) {
+@@ -369,6 +388,19 @@ RUNTIME_FUNCTION(Runtime_WasmCompileLazy) {
    isolate->set_context(trusted_instance_data->native_context());
    wasm::CompileLazy(isolate, native_module, func_index);
    native_module->counter_updates()->Publish(isolate);
 +#ifdef V8_AFEYE
-+  // afeye (0023, G4): which wasm functions ACTUALLY executed, and when. With
-+  // wasm_lazy_compilation on (default), every lazily-compiled function crosses
-+  // here on its FIRST call - so this converts the static module blob (kind 3)
-+  // into an execution trace: the Rust filter can prove a wasm branch was live
-+  // rather than dead. ZERO allocation: this runs under DisallowGarbageCollection
-+  // (the "must not cause a GC" contract above) - snprintf into stack scratch
-+  // only, no std::string, no ImportName(), no handle creation.
 +  if (v8::afeye::Enabled()) {
 +    static std::atomic<uint64_t> g_afeye_wasmfc{0};
 +    if (g_afeye_wasmfc.fetch_add(1, std::memory_order_relaxed) < 2000000) {
@@ -64,6 +55,8 @@
    return Smi::FromInt(
        wasm::JumpTableOffset(native_module->module(), func_index));
  }
+diff --git a/v8/src/wasm/module-compiler.cc b/v8/src/wasm/module-compiler.cc
+index 49cee05..8039b20 100644
 --- a/v8/src/wasm/module-compiler.cc
 +++ b/v8/src/wasm/module-compiler.cc
 @@ -3,6 +3,9 @@
@@ -76,17 +69,11 @@
  
  #include <algorithm>
  #include <atomic>
-@@ -3188,6 +3191,20 @@ void AsyncStreamingProcessor::OnFinishedStream(
+@@ -3188,6 +3191,14 @@ void AsyncStreamingProcessor::OnFinishedStream(
              std::memory_order_relaxed);
    }
  
 +#ifdef V8_AFEYE
-+  // afeye (0021, G1): THE wasm-bytes funnel for the way antifraud actually
-+  // ships wasm. 0003 hooks WasmEngine::SyncCompile/AsyncCompile - but
-+  // compileStreaming/instantiateStreaming jobs are created with EMPTY bytes
-+  // and the module arrives here when the stream finishes, never crossing
-+  // Sync/AsyncCompile. Kasada/Cloudflare/DataDome wasm sensors stream. Log
-+  // the full wire bytes (same kind-3 shape as 0003) BEFORE the move.
 +  if (v8::afeye::Enabled() && bytes.size() > 0) {
 +    uint32_t afeye_n = static_cast<uint32_t>(
 +        bytes.size() > 0xFFFFF0 ? 0xFFFFF0 : bytes.size());
@@ -97,15 +84,11 @@
    job_->wire_bytes_ = ModuleWireBytes(bytes.as_vector());
    job_->bytes_copy_ = std::move(bytes);
  
-@@ -3349,6 +3366,18 @@ bool AsyncStreamingProcessor::Deserialize(
+@@ -3349,6 +3360,14 @@ bool AsyncStreamingProcessor::Deserialize(
      base::Vector<const uint8_t> module_bytes,
      base::OwnedVector<const uint8_t>& wire_bytes) {
    TRACE_EVENT("v8.wasm", "wasm.Deserialize");
 +#ifdef V8_AFEYE
-+  // afeye (0021, G1): the HTTP-code-cache path - a wasm module restored from
-+  // a v8 cache deserializes without ever crossing SyncCompile/AsyncCompile or
-+  // OnFinishedStream. Distinct tag so the filter can tell "decoded from wire"
-+  // from "restored from cache".
 +  if (v8::afeye::Enabled() && wire_bytes.size() > 0) {
 +    uint32_t afeye_n = static_cast<uint32_t>(
 +        wire_bytes.size() > 0xFFFFF0 ? 0xFFFFF0 : wire_bytes.size());

@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
-index ac0fdf8..bf7d20a 100644
+index ac0fdf8..cdad5fe 100644
 --- a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
 +++ b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
 @@ -3,6 +3,13 @@
@@ -16,25 +16,11 @@ index ac0fdf8..bf7d20a 100644
  
  #include "third_party/blink/renderer/platform/bindings/dom_wrapper_world.h"
  #include "third_party/blink/renderer/platform/bindings/v8_binding.h"
-@@ -15,6 +22,80 @@ namespace bindings {
+@@ -15,6 +22,63 @@ namespace bindings {
  
  namespace {
  
 +#ifdef BLINK_AFEYE
-+// afeye (v6): THE dom-api choke. In 153 every WebIDL attribute and operation
-+// of every interface installs through this file (bindings codegen emits
-+// IDLMemberInstaller::{InstallAttributes,InstallOperations} calls; the old
-+// V8DOMConfiguration is gone). Each getter/setter/method callback is wrapped
-+// in a thunk that logs "dom <Interface>.<get|set|call> <member>" and calls
-+// the original. The identity rides in the FunctionTemplate data slot, which
-+// blink leaves EMPTY for these installs (CreateFunctionTemplate passes
-+// v8::Local<v8::Value>()), so no existing generated callback can observe
-+// the swap - they never read info.Data() because it was always empty.
-+// navigator.*, screen.*, document.*, window.*: every fingerprint read and
-+// every DOM method call now lands in the stream with its exact name.
-+// Fast-API overloads (NoAllocDirectCall) still take the CFunction fast path
-+// when argument types match - the thunk only sees the slow path. Honest
-+// limit, documented in SERIES.md.
 +struct AfeyeApiCell {
 +  v8::FunctionCallback orig;
 +  const char* prop;
@@ -52,7 +38,6 @@ index ac0fdf8..bf7d20a 100644
 +    cell = static_cast<AfeyeApiCell*>(data.As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault));
 +  }
 +  if (cell) {
-+    // hard cap keeps the dom-api stream from starving the script stream
 +    if (g_afeye_api_calls.fetch_add(1, std::memory_order_relaxed) <
 +        8000000) {
 +      blink::afeye::EmitStr(blink::afeye::kDomApi,
@@ -85,19 +70,17 @@ index ac0fdf8..bf7d20a 100644
 +      return v8::External::New(isolate, &c, v8::kExternalPointerTypeTagDefault);
 +    }
 +    if (c.orig == orig && c.prop == property_name) {
-+      // already wrapped (another world re-installing the same member):
-+      // reuse the cell, do not consume another one
 +      return v8::External::New(isolate, &c, v8::kExternalPointerTypeTagDefault);
 +    }
 +  }
-+  return v8::Local<v8::Value>();  // table full: member stays unwrapped
++  return v8::Local<v8::Value>();
 +}
 +#endif
 +
  template <typename Config>
  bool DoesWorldMatch(const Config& config, const DOMWrapperWorld& world) {
    const unsigned world_bit = static_cast<unsigned>(
-@@ -134,12 +215,33 @@ v8::Local<v8::FunctionTemplate> CreateFunctionTemplate(
+@@ -134,12 +198,33 @@ v8::Local<v8::FunctionTemplate> CreateFunctionTemplate(
      v8::Local<v8::String> interface_name,
      v8::ExceptionContext exception_context,
      const Config& config,
@@ -131,7 +114,7 @@ index ac0fdf8..bf7d20a 100644
    int length = GetConfigLength<kind>(config);
    v8::SideEffectType v8_side_effect = GetConfigSideEffect<kind>(config);
    V8PrivateProperty::CachedAccessor v8_cached_accessor =
-@@ -151,7 +253,7 @@ v8::Local<v8::FunctionTemplate> CreateFunctionTemplate(
+@@ -151,7 +236,7 @@ v8::Local<v8::FunctionTemplate> CreateFunctionTemplate(
             V8PrivateProperty::CachedAccessor::kWindowDocument &&
         !world.IsMainWorld())) {
      function_template = v8::FunctionTemplate::NewWithCFunctionOverloads(
@@ -140,7 +123,7 @@ index ac0fdf8..bf7d20a 100644
          v8::ConstructorBehavior::kThrow, v8_side_effect,
          {v8_cfunction_table_data, v8_cfunction_table_size});
    } else {
-@@ -161,7 +263,7 @@ v8::Local<v8::FunctionTemplate> CreateFunctionTemplate(
+@@ -161,7 +246,7 @@ v8::Local<v8::FunctionTemplate> CreateFunctionTemplate(
          isolate, callback,
          V8PrivateProperty::GetCachedAccessor(isolate, v8_cached_accessor)
              .GetPrivate(),
@@ -149,7 +132,7 @@ index ac0fdf8..bf7d20a 100644
      function_template->RemovePrototype();
    }
  
-@@ -186,6 +288,7 @@ v8::Local<v8::Function> CreateFunction(
+@@ -186,6 +271,7 @@ v8::Local<v8::Function> CreateFunction(
      v8::Local<v8::String> interface_name,
      v8::ExceptionContext exception_context,
      const Config& config,
@@ -157,7 +140,7 @@ index ac0fdf8..bf7d20a 100644
      const v8::CFunction* v8_cfunction_table_data = nullptr,
      uint32_t v8_cfunction_table_size = 0) {
    if (!GetConfigCallback<kind>(config))
-@@ -193,6 +296,7 @@ v8::Local<v8::Function> CreateFunction(
+@@ -193,6 +279,7 @@ v8::Local<v8::Function> CreateFunction(
  
    return CreateFunctionTemplate<kind>(isolate, world, signature, property_name,
                                        interface_name, exception_context, config,
@@ -165,7 +148,7 @@ index ac0fdf8..bf7d20a 100644
                                        v8_cfunction_table_data,
                                        v8_cfunction_table_size)
        ->GetFunction(context)
-@@ -233,11 +337,12 @@ void InstallAttribute(v8::Isolate* isolate,
+@@ -233,11 +320,12 @@ void InstallAttribute(v8::Isolate* isolate,
    v8::Local<v8::FunctionTemplate> get_func =
        CreateFunctionTemplate<v8::ExceptionContext::kAttributeGet>(
            isolate, world, signature, get_name, interface_name,
@@ -180,7 +163,7 @@ index ac0fdf8..bf7d20a 100644
            v8_cfunction_for_set == nullptr ? 0 : 1);
  
    v8::Local<v8::Template> target_template;
-@@ -293,11 +398,12 @@ void InstallAttribute(v8::Isolate* isolate,
+@@ -293,11 +381,12 @@ void InstallAttribute(v8::Isolate* isolate,
    v8::Local<v8::Function> get_func =
        CreateFunction<v8::ExceptionContext::kAttributeGet>(
            isolate, context, world, signature, get_name, interface_name,
@@ -195,7 +178,7 @@ index ac0fdf8..bf7d20a 100644
            v8_cfunction_for_set == nullptr ? 0 : 1);
  
    v8::Local<v8::Object> target_object;
-@@ -347,8 +453,8 @@ void InstallOperation(v8::Isolate* isolate,
+@@ -347,8 +436,8 @@ void InstallOperation(v8::Isolate* isolate,
    v8::Local<v8::FunctionTemplate> func =
        CreateFunctionTemplate<v8::ExceptionContext::kOperation>(
            isolate, world, signature, property_name, interface_name,
@@ -206,7 +189,7 @@ index ac0fdf8..bf7d20a 100644
  
    v8::Local<v8::Template> target_template;
    switch (location) {
-@@ -398,8 +504,8 @@ void InstallOperation(v8::Isolate* isolate,
+@@ -398,8 +487,8 @@ void InstallOperation(v8::Isolate* isolate,
    v8::Local<v8::Function> func =
        CreateFunction<v8::ExceptionContext::kOperation>(
            isolate, context, world, signature, property_name, interface_name,

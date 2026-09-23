@@ -1,3 +1,5 @@
+diff --git a/v8/src/api/api.cc b/v8/src/api/api.cc
+index d1a9678..31c6251 100644
 --- a/v8/src/api/api.cc
 +++ b/v8/src/api/api.cc
 @@ -128,6 +128,10 @@
@@ -38,6 +40,8 @@
    return v8_isolate;
  }
  
+diff --git a/v8/src/execution/execution.cc b/v8/src/execution/execution.cc
+index 74d96a8..1b8dadc 100644
 --- a/v8/src/execution/execution.cc
 +++ b/v8/src/execution/execution.cc
 @@ -4,6 +4,13 @@
@@ -54,15 +58,11 @@
  #include "include/cppgc/macros.h"
  #include "src/api/api-inl.h"
  #include "src/debug/debug.h"
-@@ -12,6 +19,15 @@
+@@ -12,6 +19,11 @@
  #include "src/execution/vm-state-inl.h"
  #include "src/logging/runtime-call-stats-scope.h"
  
 +#ifdef V8_AFEYE
-+// no-alloc heap-object reads for the Invoke funnel: script name + line come
-+// straight off the Tagged<> heap objects under DisallowGarbageCollection, so
-+// these inline accessor definitions must be visible. Placed AFTER the core
-+// -inl.h chain above to keep V8 include order valid.
 +#include "src/objects/script-inl.h"
 +#include "src/objects/string-inl.h"
 +#endif
@@ -70,18 +70,11 @@
  #if V8_ENABLE_WEBASSEMBLY
  #include "src/wasm/code-space-access.h"
  #include "src/wasm/wasm-code-manager.h"
-@@ -302,9 +318,97 @@ MaybeDirectHandle<Context> NewScriptContext(
+@@ -302,9 +314,79 @@ MaybeDirectHandle<Context> NewScriptContext(
    return result;
  }
  
 +#ifdef V8_AFEYE
-+// afeye (v7): THE C++ -> JS funnel. Every entry passes through Invoke:
-+// v8::Function::Call, Script::Run / RunModule, Execution::New, microtask
-+// callbacks (TryRunMicrotasks), JSON revivers, sort comparators, v8's own
-+// internal callers. This replaces the v6 api.cc Function::Call hook that
-+// only saw the public API surface - nothing C++-initiated slips past this
-+// point. The callee's script:line is the "who got invoked" linkage the Rust
-+// filter joins with input events and network sends on the timeline.
 +static void AfeyeLogInvoke(Isolate* isolate, const InvokeParams& params) {
 +  static std::atomic<uint64_t> g_afeye_calls{0};
 +  static bool g_afeye_calls_off = []() {
@@ -89,7 +82,6 @@
 +    return v != nullptr && *v != '\0' && v[0] == '0';
 +  }();
 +  if (g_afeye_calls_off) return;
-+  // hard cap: the call stream must never starve the script-source stream
 +  if (g_afeye_calls.fetch_add(1, std::memory_order_relaxed) >= 4000000) {
 +    return;
 +  }
@@ -98,16 +90,6 @@
 +                              static_cast<unsigned>(params.args.size()),
 +                              params.is_construct ? " c=1" : "");
 +  if (afeye_n > 0 && IsJSFunction(*params.target)) {
-+    // NO-ALLOC (v8): the previous body built a v8::ScriptOrigin, a
-+    // v8::String::Utf8Value (heap) and a std::string PER Invoke. Invoke is
-+    // THE C++->JS funnel - every Script::Run, microtask, reviver, comparator
-+    // and v8-internal call crosses it, including callers running under GC.
-+    // Reading script name + line through the internal Tagged<> objects under
-+    // DisallowGarbageCollection touches only stack scratch: no Local, no
-+    // HandleScope, no heap buffer, no isolate re-entry. Script::GetLineNumber
-+    // (the member, not the DirectHandle static) runs under DisallowGC too -
-+    // fast path reads the cached line_ends, slow path iterates the flat
-+    // source; neither allocates.
 +    DisallowGarbageCollection no_gc;
 +    Tagged<JSFunction> afeye_fn = Cast<JSFunction>(*params.target);
 +    Tagged<SharedFunctionInfo> afeye_sfi = afeye_fn->shared();
@@ -168,6 +150,8 @@
    DCHECK(!IsJSGlobalObject(*params.receiver));
    DCHECK_LE(params.args.size(), FixedArray::kMaxLength);
    DCHECK(!isolate->has_exception());
+diff --git a/v8/src/wasm/module-instantiate.cc b/v8/src/wasm/module-instantiate.cc
+index f17a554..f99f166 100644
 --- a/v8/src/wasm/module-instantiate.cc
 +++ b/v8/src/wasm/module-instantiate.cc
 @@ -3,6 +3,10 @@
@@ -208,6 +192,8 @@
  
      DirectHandle<Object> value = sanitized_imports_[index];
  
+diff --git a/v8/src/wasm/wasm-engine.cc b/v8/src/wasm/wasm-engine.cc
+index 637bbed..d880dca 100644
 --- a/v8/src/wasm/wasm-engine.cc
 +++ b/v8/src/wasm/wasm-engine.cc
 @@ -3,6 +3,9 @@

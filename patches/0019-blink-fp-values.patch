@@ -1,3 +1,5 @@
+diff --git a/third_party/blink/renderer/core/css/css_computed_style_declaration.cc b/third_party/blink/renderer/core/css/css_computed_style_declaration.cc
+index 0bc2cf8..b64b431 100644
 --- a/third_party/blink/renderer/core/css/css_computed_style_declaration.cc
 +++ b/third_party/blink/renderer/core/css/css_computed_style_declaration.cc
 @@ -24,6 +24,13 @@
@@ -21,25 +23,17 @@
 +#ifdef BLINK_AFEYE
 +namespace {
 +std::atomic<uint64_t> g_afeye_css{0};
-+}  // namespace
++}
 +#endif
 +
  namespace {
  
  CSSValueID CssIdentifierForFontSizeKeyword(int keyword_size) {
-@@ -383,6 +396,26 @@ const CSSValue* CSSComputedStyleDeclaration::GetPropertyCSSValue(
+@@ -383,6 +396,18 @@ const CSSValue* CSSComputedStyleDeclaration::GetPropertyCSSValue(
        *style, StyledLayoutObject(), allow_visited_style_,
        CSSValuePhase::kResolvedValue);
    if (value) {
 +#ifdef BLINK_AFEYE
-+    // afeye (0019): getComputedStyle per-property READ. This is THE funnel -
-+    // getPropertyValue / item() / the camelCase named-getter interceptor
-+    // (cs.fontFamily, which the kind-29 dom-api thunk CANNOT see: interceptors
-+    // install via SetHandler, not IDLMemberInstaller) all converge here. Font-
-+    // metric fingerprinting (CreepJS/FingerprintJS/DataDome/Kasada) reads
-+    // computed width/font-family/-webkit-font-smoothing on probe spans; the
-+    // property name + resolved value are the fingerprint bits. Capped (2M):
-+    // layout code reads computed styles heavily.
 +    if (blink::afeye::Enabled() &&
 +        g_afeye_css.fetch_add(1, std::memory_order_relaxed) < 2000000) {
 +      char afeye_buf[224];
@@ -54,6 +48,8 @@
      return value;
    }
  
+diff --git a/third_party/blink/renderer/core/css/font_face_set.cc b/third_party/blink/renderer/core/css/font_face_set.cc
+index 783e00a..d860e6c 100644
 --- a/third_party/blink/renderer/core/css/font_face_set.cc
 +++ b/third_party/blink/renderer/core/css/font_face_set.cc
 @@ -4,6 +4,13 @@
@@ -77,23 +73,17 @@
 +#ifdef BLINK_AFEYE
 +namespace {
 +std::atomic<uint64_t> g_afeye_c19{0};
-+}  // namespace
++}
 +#endif
 +
  const int FontFaceSet::kDefaultFontSize = 10;
  
  // static
-@@ -232,6 +245,23 @@ ScriptPromise<IDLSequence<FontFace>> FontFaceSet::load(
+@@ -232,6 +245,17 @@ ScriptPromise<IDLSequence<FontFace>> FontFaceSet::load(
  bool FontFaceSet::check(const String& font_string,
                          const String& text,
                          ExceptionState& exception_state) {
 +#ifdef BLINK_AFEYE
-+  // afeye (0019): document.fonts.check - the DIRECT font-enumeration API. A
-+  // fingerprint loop calls check('16px "Candidate"') over a font list to build
-+  // the installed-fonts bitmap. kind-29 names the call; this captures WHICH
-+  // font was probed. (The bool availability result returns through several
-+  // early paths; the ASK is the fingerprint bit, availability is secondary and
-+  // left out to keep the hook at the single entry funnel - documented.)
 +  if (blink::afeye::Enabled() &&
 +      g_afeye_c19.fetch_add(1, std::memory_order_relaxed) < 200000) {
 +    char afeye_buf[224];
@@ -107,6 +97,8 @@
    if (!InActiveContext()) {
      return false;
    }
+diff --git a/third_party/blink/renderer/core/css/media_query_list.cc b/third_party/blink/renderer/core/css/media_query_list.cc
+index f4ae930..af18e2b 100644
 --- a/third_party/blink/renderer/core/css/media_query_list.cc
 +++ b/third_party/blink/renderer/core/css/media_query_list.cc
 @@ -19,6 +19,13 @@
@@ -130,19 +122,17 @@
 +#ifdef BLINK_AFEYE
 +namespace {
 +std::atomic<uint64_t> g_afeye_mqm{0};
-+}  // namespace
++}
 +#endif
 +
  MediaQueryList::MediaQueryList(ExecutionContext* context,
                                 MediaQueryMatcher* matcher,
                                 MediaQuerySet* media)
-@@ -118,6 +131,18 @@ bool MediaQueryList::matches() {
+@@ -118,6 +131,16 @@ bool MediaQueryList::matches() {
      }
    }
    UpdateMatches();
 +#ifdef BLINK_AFEYE
-+  // afeye (0019): the matchMedia ANSWER - query + result bit. The device
-+  // signature that enters the token hash.
 +  if (blink::afeye::Enabled() &&
 +      g_afeye_mqm.fetch_add(1, std::memory_order_relaxed) < 200000) {
 +    char afeye_buf[224];
@@ -155,6 +145,8 @@
    return matches_;
  }
  
+diff --git a/third_party/blink/renderer/core/frame/local_dom_window.cc b/third_party/blink/renderer/core/frame/local_dom_window.cc
+index 74cc1c0..a745227 100644
 --- a/third_party/blink/renderer/core/frame/local_dom_window.cc
 +++ b/third_party/blink/renderer/core/frame/local_dom_window.cc
 @@ -26,6 +26,13 @@
@@ -178,21 +170,17 @@
 +#ifdef BLINK_AFEYE
 +namespace {
 +std::atomic<uint64_t> g_afeye_mm{0};
-+}  // namespace
++}
 +#endif
 +
  namespace {
  bool IsRunningMicrotasks(ScriptState* script_state) {
    if (auto* microtask_queue = ToMicrotaskQueue(script_state)) {
-@@ -1106,6 +1119,20 @@ LocalDOMWindow* LocalDOMWindow::ToLocalDOMWindow() {
+@@ -1106,6 +1119,16 @@ LocalDOMWindow* LocalDOMWindow::ToLocalDOMWindow() {
  }
  
  MediaQueryList* LocalDOMWindow::matchMedia(const String& media) {
 +#ifdef BLINK_AFEYE
-+  // afeye (0019): matchMedia QUERY - each probe tests one device/OS/rendering
-+  // dimension (prefers-color-scheme, pointer, color-gamut, min-resolution,
-+  // forced-colors). kind-29 names the call; this captures WHICH feature was
-+  // asked. The answer rides in MediaQueryList::matches below.
 +  if (blink::afeye::Enabled() &&
 +      g_afeye_mm.fetch_add(1, std::memory_order_relaxed) < 200000) {
 +    char afeye_buf[224];
@@ -205,6 +193,8 @@
    return document()->GetMediaQueryMatcher().MatchMedia(media);
  }
  
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index c417144..f448350 100644
 --- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 +++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 @@ -4,6 +4,7 @@
@@ -222,23 +212,17 @@
 +#ifdef BLINK_AFEYE
 +namespace {
 +std::atomic<uint64_t> g_afeye_drawtext{0};
-+}  // namespace
++}
 +#endif
 +
  class MemoryManagedPaintCanvas;
  
  namespace {
-@@ -1029,6 +1036,27 @@ void BaseRenderingContext2D::DrawTextInternal(
+@@ -1025,6 +1032,21 @@ void BaseRenderingContext2D::DrawTextInternal(
      unsigned run_end,
      double* max_width,
      const Font* cluster_font) {
 +#ifdef BLINK_AFEYE
-+  // afeye (0019): the canvas draw-text INPUT - text + font + position. This is
-+  // the single funnel for fillText/strokeText/fillTextCluster/strokeTextCluster
-+  // (all forward here). 0012/0014 capture the EXPORT (toDataURL length, getImageData
-+  // pixels); this captures WHAT was drawn - without it the filter cannot answer
-+  // "which string in which font produced that digest". The unparsed font comes
-+  // from the same GetState().UnparsedFont() accessor 0007 measureText uses.
 +  if (blink::afeye::Enabled() &&
 +      g_afeye_drawtext.fetch_add(1, std::memory_order_relaxed) < 2000000) {
 +    char afeye_buf[256];
@@ -256,6 +240,8 @@
    HTMLCanvasElement* canvas = HostAsHTMLCanvasElement();
    if (canvas) {
      // The style resolution required for fonts is not available in frame-less
+diff --git a/third_party/blink/renderer/modules/notifications/notification.cc b/third_party/blink/renderer/modules/notifications/notification.cc
+index 643d833..2d7af6c 100644
 --- a/third_party/blink/renderer/modules/notifications/notification.cc
 +++ b/third_party/blink/renderer/modules/notifications/notification.cc
 @@ -30,6 +30,13 @@
@@ -272,12 +258,11 @@
  #include <memory>
  #include <utility>
  
-@@ -421,6 +428,13 @@ V8NotificationPermission::Enum Notification::PermissionToV8Enum(
+@@ -421,6 +428,12 @@ V8NotificationPermission::Enum Notification::PermissionToV8Enum(
  V8NotificationPermission Notification::permission(ExecutionContext* context) {
    // Permission is always denied for insecure contexts. Skip the sync IPC call.
    if (!context->IsSecureContext()) {
 +#ifdef BLINK_AFEYE
-+    // afeye (0019): insecure-context early return - itself a fingerprint fact
 +    if (blink::afeye::Enabled()) {
 +      blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
 +                            "perm/notification value=denied ctx=insecure");
@@ -286,7 +271,7 @@
      return V8NotificationPermission(V8NotificationPermission::Enum::kDenied);
    }
  
-@@ -429,6 +443,12 @@ V8NotificationPermission Notification::permission(ExecutionContext* context) {
+@@ -429,6 +442,12 @@ V8NotificationPermission Notification::permission(ExecutionContext* context) {
    // https://wicg.github.io/nav-speculation/prerendering.html#patch-notifications
    if (auto* window = DynamicTo<LocalDOMWindow>(context)) {
      if (Document* document = window->document(); document->IsPrerendering()) {
@@ -299,15 +284,11 @@
        return V8NotificationPermission(V8NotificationPermission::Enum::kDefault);
      }
    }
-@@ -448,6 +468,24 @@ V8NotificationPermission Notification::permission(ExecutionContext* context) {
+@@ -448,6 +467,20 @@ V8NotificationPermission Notification::permission(ExecutionContext* context) {
        status = mojom::blink::PermissionStatus::DENIED;
    }
  
 +#ifdef BLINK_AFEYE
-+  // afeye (0019): Notification.permission VALUE - the other half of the
-+  // headless mismatch tell (see permissions.cc). Logged off the mojom status
-+  // directly (no dependency on the generated V8 enum string API). Low
-+  // frequency, no cap needed.
 +  if (blink::afeye::Enabled()) {
 +    const char* afeye_pv =
 +        status == mojom::blink::PermissionStatus::GRANTED
@@ -324,6 +305,8 @@
    return V8NotificationPermission(PermissionToV8Enum(status));
  }
  
+diff --git a/third_party/blink/renderer/modules/permissions/permissions.cc b/third_party/blink/renderer/modules/permissions/permissions.cc
+index e36c344..2742de3 100644
 --- a/third_party/blink/renderer/modules/permissions/permissions.cc
 +++ b/third_party/blink/renderer/modules/permissions/permissions.cc
 @@ -4,6 +4,13 @@
@@ -340,16 +323,11 @@
  #include <memory>
  #include <utility>
  
-@@ -113,6 +120,20 @@ ScriptPromise<PermissionStatus> Permissions::query(
+@@ -113,6 +120,15 @@ ScriptPromise<PermissionStatus> Permissions::query(
  
    RecordTopLevelStorageAccessQueryMetrics(
        descriptor->name == PermissionName::TOP_LEVEL_STORAGE_ACCESS);
 +#ifdef BLINK_AFEYE
-+  // afeye (0019): Permissions.query NAME. The headless tell is a MISMATCH
-+  // between Notification.permission and permissions.query({name:
-+  // 'notifications'}); DataDome/CreepJS check exactly that. kind-29 names the
-+  // query call but not WHICH permission - this logs the descriptor name so the
-+  // filter can pair it against the Notification.permission value.
 +  if (blink::afeye::Enabled()) {
 +    char afeye_buf[160];
 +    std::snprintf(afeye_buf, sizeof(afeye_buf), "perm/query name=%.40s",

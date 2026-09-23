@@ -201,9 +201,6 @@ pub struct Ctx {
     pub gl_spoof: bool,
     pub budget: AtomicU64,
     pub chrome: PathBuf,
-    /// Full --user-agent value built from the real chrome version. Kills the
-    /// HeadlessChrome token that stock headless builds leak into every
-    /// request and into navigator.userAgent.
     pub ua: String,
     pub display: String,
     pub endpoints: DashMap<u32, u64>,

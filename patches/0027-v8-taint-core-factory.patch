@@ -1,44 +1,29 @@
 diff --git a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
-index 4c72860..40eea6e 100644
+index cdec501..d228b45 100644
 --- a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
 +++ b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
-@@ -11,6 +11,16 @@
+@@ -11,6 +11,8 @@
  #include <mutex>
  #include "v8/include/v8-container.h"
  #include "third_party/blink/renderer/platform/afeye/sink.h"
-+// afeye (0027): the v8 taint ABI. Blink cannot include v8-internal headers
-+// (different component), so declare the exported extern "C" symbols here -
-+// identical signatures to v8/src/afeye/taint_abi.h. The key is the String's
-+// heap address: reinterpret_cast<uintptr_t>(*v8::Local<String>) ==
-+// Tagged<String>::address() == ptr() - kHeapObjectTag (verified at
-+// v8-handle-base.h:139 DirectHandleBase::value<T>()=reinterpret_cast<T*>(ptr_)
-+// and tagged.h:508). So a tag set HERE matches the v8 Factory propagation
-+// keys by construction. source_bit 1 = kSrcFingerprint (taint.h).
 +extern "C" void afeye_taint_tag_string(uint64_t key, uint32_t source_bit);
 +extern "C" int afeye_taint_active(void);
  #endif
  
  #include "third_party/blink/renderer/platform/bindings/dom_wrapper_world.h"
-@@ -80,6 +90,19 @@ void AfeyeCaptureValue(v8::Isolate* isolate,
+@@ -53,6 +55,12 @@ void AfeyeCaptureValue(v8::Isolate* isolate,
      std::snprintf(buf, buf_sz, "%.17g", rv->NumberValue(isolate->GetCurrentContext()).FromMaybe(0));
    } else if (rv->IsString()) {
      v8::Local<v8::String> str = rv.As<v8::String>();
 +#ifdef BLINK_AFEYE
-+    // v12.5 (0027): SOURCE TAG BIRTH for a fingerprint read that returns a
-+    // String (navigator.userAgent, screen-ish string props, plugin names,
-+    // WebGL renderer strings via 0024). Tag the returned String's address
-+    // kSrcFingerprint so every concat/slice of it (Factory hooks, 0027) and
-+    // every socket write of it (0032) inherits the tag - the causality-backed
-+    // `proven` path. Gated by afeye_taint_active() so a taint-off build does
-+    // zero work beyond one predictable branch.
 +    if (afeye_taint_active()) {
 +      afeye_taint_tag_string(
 +          reinterpret_cast<uint64_t>(*str), 1u /* kSrcFingerprint */);
 +    }
 +#endif
-     // v12.1: WriteUtf8 (returns UTF-8 BYTES written) replaces the broken
-     // Utf8Length/WriteOneByte pairing (WriteOneByte copies CODE UNITS, not
-     // bytes - multi-byte strings were truncated and the tail leaked stale
+     size_t len = str->Utf8Length(isolate);
+     if (len > buf_sz - 1) len = buf_sz - 1;
+     size_t written = str->WriteUtf8(isolate, buf, len);
 diff --git a/v8/BUILD.gn b/v8/BUILD.gn
 index 2d4799e..6f63a62 100644
 --- a/v8/BUILD.gn
@@ -67,10 +52,10 @@ index 2d4799e..6f63a62 100644
    }
 diff --git a/v8/src/afeye/taint.cc b/v8/src/afeye/taint.cc
 new file mode 100644
-index 0000000..76678ce
+index 0000000..d0b3c51
 --- /dev/null
 +++ b/v8/src/afeye/taint.cc
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,171 @@
 +#include "src/afeye/taint.h"
 +
 +#ifdef V8_AFEYE
@@ -84,22 +69,6 @@ index 0000000..76678ce
 +namespace v8 {
 +namespace afeye {
 +
-+// ---------------------------------------------------------------------------
-+// the shadow store. ONE open-addressing table keyed by (space,key) -> u32 tag.
-+//
-+// Why a fixed table and not a std::unordered_map: this is read/written from
-+// inside interpreter handlers and wasm Load/Store on the HOT path. No malloc,
-+// no rehash-on-insert stall, no iterator invalidation under the drain thread.
-+// A power-of-two open table with linear probing, atomic slots, bounded size.
-+// Overflow is COUNTED (TaintDropped) and folded into the sink-drop witness so
-+// a taint gap is never silently mistaken for a dead end - the same honesty
-+// contract sink.cc holds for ring drops.
-+//
-+// Capacity: 1<<20 slots (1M) x 16 B = 16 MB. Sized for a single page's
-+// fingerprint-collection burst (a few thousand distinct tainted values); the
-+// table is cleared at every compacting GC epilogue, so it never grows without
-+// bound across a session.
-+// ---------------------------------------------------------------------------
 +
 +namespace {
 +
@@ -107,8 +76,6 @@ index 0000000..76678ce
 +constexpr uint64_t kTaintKeyMask = kTaintSlots - 1;
 +
 +struct TaintSlot {
-+  // 0 = empty. A real entry always has key != 0 because the composite key
-+  // folds in the space in the high bits (space 0 = kKeyHeap is offset by 1).
 +  std::atomic<uint64_t> key{0};
 +  std::atomic<uint32_t> tag{0};
 +};
@@ -116,11 +83,8 @@ index 0000000..76678ce
 +TaintSlot g_taint[kTaintSlots];
 +std::atomic<uint64_t> g_taint_dropped{0};
 +std::atomic<uint64_t> g_taint_live{0};
-+// 0032: every tag that ever reached an in-renderer sink (TaintEmitSink).
 +std::atomic<uint32_t> g_sunk_union{0};
 +
-+// env gate: AFEYE_TAINT=0 disables the whole DTT layer (falls back to the
-+// boundary sieve). Read once, cached.
 +bool TaintEnvOn() {
 +  static const bool off = []() {
 +    const char* v = ::getenv("AFEYE_TAINT");
@@ -129,16 +93,10 @@ index 0000000..76678ce
 +  return !off;
 +}
 +
-+// composite key: space in the top 3 bits, the 61-bit identity below. The
-+// caller-supplied key is already a cage-offset / (instance<<32|off) / frame
-+// value that fits in 61 bits; folding the space in makes (space,key) unique
-+// across all four spaces in one table.
 +inline uint64_t CompositeKey(uint8_t space, uint64_t key) {
 +  return (static_cast<uint64_t>(space + 1) << 61) | (key & ((1ull << 61) - 1));
 +}
 +
-+// FNV-1a over the 8-byte composite key -> slot index. Cheap, good spread for
-+// the structured keys (offsets, frame slots) this sees.
 +inline uint64_t HashKey(uint64_t ck) {
 +  uint64_t h = 1469598103934665603ull;
 +  for (int i = 0; i < 8; ++i) {
@@ -148,10 +106,6 @@ index 0000000..76678ce
 +  return h & kTaintKeyMask;
 +}
 +
-+// Linear-probe find. Returns the slot holding `ck`, or the first empty slot
-+// (for insert), or nullptr if the table is full along the probe (caller
-+// counts a drop). Bounded probe: kTaintSlots/64 steps before giving up, so a
-+// pathological cluster cannot spin the hot path.
 +inline TaintSlot* FindSlot(uint64_t ck, bool for_insert) {
 +  uint64_t idx = HashKey(ck);
 +  TaintSlot* first_empty = nullptr;
@@ -163,34 +117,28 @@ index 0000000..76678ce
 +    if (k == 0) {
 +      if (!for_insert) return nullptr;
 +      if (first_empty == nullptr) first_empty = s;
-+      // keep probing a bounded window is unnecessary for insert; take the
-+      // first empty.
 +      return first_empty;
 +    }
 +    ++idx;
 +  }
-+  return nullptr;  // probe budget exhausted
++  return nullptr;
 +}
 +
-+// Insert-or-find under a CAS so two threads racing on the same new key cannot
-+// both claim the empty slot. Returns the slot, or nullptr on a lost race that
-+// could not be re-won within the probe budget (counted as a drop).
 +inline TaintSlot* AcquireSlot(uint64_t ck) {
 +  TaintSlot* s = FindSlot(ck, true);
 +  if (s == nullptr) return nullptr;
 +  uint64_t expected = 0;
-+  if (s->key.load(std::memory_order_relaxed) == ck) return s;  // already ours
++  if (s->key.load(std::memory_order_relaxed) == ck) return s;
 +  if (s->key.compare_exchange_strong(expected, ck,
 +                                     std::memory_order_acq_rel,
 +                                     std::memory_order_relaxed)) {
 +    g_taint_live.fetch_add(1, std::memory_order_relaxed);
 +    return s;
 +  }
-+  // lost the race: the winner installed either our key or another. Re-find.
 +  return FindSlot(ck, false);
 +}
 +
-+}  // namespace
++}
 +
 +bool TaintEnabled() { return Enabled() && TaintEnvOn(); }
 +
@@ -201,7 +149,6 @@ index 0000000..76678ce
 +    g_taint_dropped.fetch_add(1, std::memory_order_relaxed);
 +    return;
 +  }
-+  // union: existing bits survive (DTT law)
 +  uint32_t cur = s->tag.load(std::memory_order_relaxed);
 +  while (!s->tag.compare_exchange_weak(cur, cur | tag,
 +                                       std::memory_order_relaxed,
@@ -219,7 +166,7 @@ index 0000000..76678ce
 +                    uint64_t src_key) {
 +  if (!TaintEnabled()) return;
 +  TaintTag src_tag = TaintGet(src_space, src_key);
-+  if (src_tag == kSrcNone) return;  // fast path: untainted source, no write
++  if (src_tag == kSrcNone) return;
 +  TaintSet(dst_space, dst_key, src_tag);
 +}
 +
@@ -230,19 +177,13 @@ index 0000000..76678ce
 +}
 +
 +void TaintOnGCEpilogue(bool compacting) {
-+  if (!compacting) return;  // minor/scavenges that don't move: keep tags
-+  // A compacting GC moves heap objects and frames, so kKeyHeap / kKeyStack /
-+  // kKeyContext identities dangle. Clear them; KEEP kKeyWasm (the linear
-+  // memory backing store is fixed and does not move). Losing an epoch of
-+  // heap taint is honest; a dangling tag on a recycled object is a false
-+  // link, which is worse. The boundary records (sink.cc) are the cross-epoch
-+  // backstop for exactly this case.
++  if (!compacting) return;
 +  for (size_t i = 0; i < kTaintSlots; ++i) {
 +    TaintSlot* s = &g_taint[i];
 +    uint64_t k = s->key.load(std::memory_order_relaxed);
 +    if (k == 0) continue;
 +    uint8_t space = static_cast<uint8_t>((k >> 61) - 1);
-+    if (space == kKeyWasm) continue;  // survives
++    if (space == kKeyWasm) continue;
 +    s->key.store(0, std::memory_order_relaxed);
 +    s->tag.store(0, std::memory_order_relaxed);
 +    g_taint_live.fetch_sub(1, std::memory_order_relaxed);
@@ -252,17 +193,12 @@ index 0000000..76678ce
 +void TaintEmitSink(const char* sink, uint8_t space, uint64_t key,
 +                   TaintTag tag) {
 +  if (tag == kSrcNone || !TaintEnabled()) return;
-+  // record: "taint-sink <sink> space=<n> key=<hex> tag=<hex>" via EmitStr.
-+  // The Rust filter reads the tag bitmask to attribute WHICH fingerprint
-+  // sources reached the wire - the causality-backed `proven` verdict.
 +  char buf[160];
 +  std::snprintf(buf, sizeof(buf), "taint-sink %s space=%u key=%llx tag=%x",
 +                sink, static_cast<unsigned>(space),
 +                static_cast<unsigned long long>(key),
 +                static_cast<unsigned>(tag));
 +  EmitStr(kFingerprint, NowNs(), buf);
-+  // 0032: feed the sunk-source union - gc_witness computes the conservative
-+  // in-renderer dead-end as (live heap union & ~sunk union) at compaction.
 +  g_sunk_union.fetch_or(tag, std::memory_order_relaxed);
 +}
 +
@@ -273,7 +209,7 @@ index 0000000..76678ce
 +    const uint64_t k = s->key.load(std::memory_order_relaxed);
 +    if (k == 0) continue;
 +    const uint8_t space = static_cast<uint8_t>((k >> 61) - 1);
-+    if (space == kKeyWasm) continue;  // survives compaction - not swept
++    if (space == kKeyWasm) continue;
 +    u |= s->tag.load(std::memory_order_relaxed);
 +  }
 +  return u;
@@ -287,16 +223,16 @@ index 0000000..76678ce
 +  return g_taint_dropped.load(std::memory_order_relaxed);
 +}
 +
-+}  // namespace afeye
-+}  // namespace v8
++}
++}
 +
-+#endif  // V8_AFEYE
++#endif
 diff --git a/v8/src/afeye/taint.h b/v8/src/afeye/taint.h
 new file mode 100644
-index 0000000..41c88aa
+index 0000000..142e189
 --- /dev/null
 +++ b/v8/src/afeye/taint.h
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,63 @@
 +#ifndef V8_AFEYE_TAINT_H_
 +#define V8_AFEYE_TAINT_H_
 +
@@ -308,130 +244,70 @@ index 0000000..41c88aa
 +namespace v8 {
 +namespace afeye {
 +
-+// afeye dynamic taint tracking (DTT) core. The boundary sieve (sink.cc) can
-+// only see values that CROSS a C++ API edge; ~90% of modern antifraud logic
-+// (custom alphabets, manual byte shuffling, pure-JS deflate/RSA, closure
-+// handoff) never crosses one, so the content graph drops those chains to
-+// `unresolved` or false `dead-end-proven`. This module carries a taint TAG
-+// through the VM itself, so a fingerprint byte that entered a tracked slot is
-+// followed to the socket even across ten pure-JS re-encodings.
-+//
-+// A taint tag is a 32-bit SOURCE BITMASK: bit i = "touched source i". Tags
-+// union with bitwise-OR (the DTT propagation law), so a value assembled from
-+// two fingerprint reads carries both bits. 0 = untainted.
 +typedef uint32_t TaintTag;
 +
-+// Source bits (assigned at the capture sites; 32 distinct sources per the
-+// u32 mask). A site that needs more folds into kSrcOther and rides its
-+// identity in the emitted record's tag string, not in a bit.
 +enum TaintSource : uint32_t {
 +  kSrcNone = 0u,
-+  kSrcFingerprint = 1u << 0,  // navigator/screen/webgl/canvas/audio reads
-+  kSrcClock = 1u << 1,        // Date.now / performance.now
-+  kSrcInput = 1u << 2,        // mouse/keyboard/pointer events
-+  kSrcRandom = 1u << 3,       // crypto.getRandomValues
-+  kSrcStorage = 1u << 4,      // cookie / localStorage / sessionStorage read
-+  kSrcNetwork = 1u << 5,      // a challenge response body (atob/TextDecoder)
-+  kSrcStack = 1u << 6,        // Error().stack materialization
-+  kSrcWasm = 1u << 7,         // a value that entered wasm linear memory
-+  kSrcOther = 1u << 31,       // folded source; identity in the record tag
++  kSrcFingerprint = 1u << 0,
++  kSrcClock = 1u << 1,
++  kSrcInput = 1u << 2,
++  kSrcRandom = 1u << 3,
++  kSrcStorage = 1u << 4,
++  kSrcNetwork = 1u << 5,
++  kSrcStack = 1u << 6,
++  kSrcWasm = 1u << 7,
++  kSrcOther = 1u << 31,
 +};
 +
-+// Key spaces. The 64-bit shadow key is namespaced by space so heap values,
-+// wasm bytes, interpreter registers and Context slots never collide in one
-+// table. Which spaces SURVIVE a compacting GC is the whole soundness story:
-+//   kKeyWasm   - wasm linear memory is a fixed, non-moving backing store, so
-+//                (instance,offset) keys stay valid across GC. SOUND forever.
-+//   kKeyHeap/kKeyContext/kKeyStack - keyed by an address or frame slot that a
-+//                compacting GC moves. These are CLEARED at a compacting GC
-+//                epilogue (TaintOnGCEpilogue) so taint can never dangle onto
-+//                a recycled object (a false link is worse than a lost one).
-+//                Within a GC epoch they are exact; the boundary records are
-+//                the cross-epoch backstop.
 +enum TaintKeySpace : uint8_t {
-+  kKeyHeap = 0,     // key = object cage-offset >> kObjectAlignmentBits
-+  kKeyWasm = 1,     // key = (instance_id << 32) | byte_offset
-+  kKeyStack = 2,    // key = (frame_fp >> 4) | register_index
-+  kKeyContext = 3,  // key = (context_cage_off >> align) << 12 | slot_index
++  kKeyHeap = 0,
++  kKeyWasm = 1,
++  kKeyStack = 2,
++  kKeyContext = 3,
 +};
 +
-+// Number of distinct source bits the u32 mask carries.
 +constexpr int kTaintSourceBits = 32;
 +
 +bool TaintEnabled();
 +
-+// Store/union a tag for (space,key). Union semantics: an existing tag keeps
-+// its bits (a value touched by two sources stays touched by both). no-alloc,
-+// bounded, drop-counted like the sink ring.
 +void TaintSet(uint8_t space, uint64_t key, TaintTag tag);
 +
-+// Read the tag for (space,key). 0 if absent. no-alloc.
 +TaintTag TaintGet(uint8_t space, uint64_t key);
 +
-+// The DTT primitive: dst inherits (ORs in) src's tag. Used at every move /
-+// arithmetic / store handler. no-alloc.
 +void TaintPropagate(uint8_t dst_space, uint64_t dst_key, uint8_t src_space,
 +                    uint64_t src_key);
 +
-+// Clear a (space,key) - a slot overwritten by an untainted value.
 +void TaintClear(uint8_t space, uint64_t key);
 +
-+// GC epilogue hook (wired via Heap::AddGCEpilogueCallback). `compacting` is
-+// true for mark-compact / scavenges that move objects. Wasm space is never
-+// cleared (its backing store does not move).
 +void TaintOnGCEpilogue(bool compacting);
 +
-+// Emit a taint-flow record when a tainted value reaches a SINK (socket write,
-+// fetch body, postMessage). This is what turns the byte-graph `proven` verdict
-+// from "shares bytes with a sink" into "carries fingerprint taint into a sink"
-+// - the honest, causality-backed version. The tag bitmask rides verbatim so
-+// the Rust side can attribute WHICH sources reached the wire.
 +void TaintEmitSink(const char* sink, uint8_t space, uint64_t key,
 +                   TaintTag tag);
 +
-+// 0032 (gc_witness): OR of tags over entries a compacting GC CLEARS
-+// (kKeyHeap/kKeyStack/kKeyContext - NOT kKeyWasm, which survives because the
-+// wasm backing store is off-heap). Lets gc_witness report WHICH sources were
-+// live in the heap shadow at sweep time without enumerating the private
-+// store. Single pass over g_taint. Call BEFORE TaintOnGCEpilogue wipes.
 +TaintTag TaintLiveHeapTagUnion();
 +
-+// 0032 (gc_witness): OR of every tag ever passed to TaintEmitSink - i.e. the
-+// sources that reached an IN-RENDERER sink (socket-side emission is a
-+// separate process; cross-process proven is the Rust content-match's job).
-+// (live_heap & ~sunk) at a compaction = conservative in-renderer dead-end:
-+// those sources were swept without ever hitting a wire sink in this process.
 +TaintTag TaintSunkUnion();
 +
-+// Records dropped because the shadow table was full (the honest-witness
-+// counter, folded into the sink-drop stream so a taint gap is never mistaken
-+// for a dead end).
 +uint64_t TaintDropped();
 +
-+}  // namespace afeye
-+}  // namespace v8
++}
++}
 +
-+#endif  // V8_AFEYE
++#endif
 +
-+#endif  // V8_AFEYE_TAINT_H_
++#endif
 diff --git a/v8/src/afeye/taint_abi.cc b/v8/src/afeye/taint_abi.cc
 new file mode 100644
-index 0000000..90b71ab
+index 0000000..3e349b9
 --- /dev/null
 +++ b/v8/src/afeye/taint_abi.cc
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,38 @@
 +#include "src/afeye/taint_abi.h"
 +
 +#ifdef V8_AFEYE
 +
 +#include "src/afeye/taint.h"
 +
-+// afeye (0027): the extern "C" bridge bodies. Thin wrappers over the v8
-+// taint store (taint.cc), exported with default visibility so blink capture
-+// sites - which cannot include v8-internal headers - can tag a String by its
-+// heap address. The address key matches the v8 Factory propagation hooks
-+// exactly, so blink-tagged values and v8-propagated values are the same
-+// identity. See taint_abi.h for the GC-epoch soundness contract.
 +
 +extern "C" {
 +
@@ -461,15 +337,15 @@ index 0000000..90b71ab
 +                           static_cast<v8::afeye::TaintTag>(tag));
 +}
 +
-+}  // extern "C"
++}
 +
-+#endif  // V8_AFEYE
++#endif
 diff --git a/v8/src/afeye/taint_abi.h b/v8/src/afeye/taint_abi.h
 new file mode 100644
-index 0000000..dd561db
+index 0000000..9de59d9
 --- /dev/null
 +++ b/v8/src/afeye/taint_abi.h
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,25 @@
 +#ifndef V8_AFEYE_TAINT_ABI_H_
 +#define V8_AFEYE_TAINT_ABI_H_
 +
@@ -477,61 +353,26 @@ index 0000000..dd561db
 +
 +#ifdef V8_AFEYE
 +
-+// afeye (0027): the taint ABI bridge. The taint STORE lives in v8
-+// (src/afeye/taint.cc) and is keyed by a tagged value's heap address, which
-+// is a v8-internal concept (Tagged<String>::address()). Blink capture sites
-+// (TextDecoder.decode -> kSrcNetwork, SubtleCrypto output, StorageArea read
-+// -> kSrcStorage, document.cookie -> kSrcStorage) CANNOT include v8-internal
-+// headers - they live in a different component. So v8 EXPORTS these four
-+// extern "C" entry points (default visibility) and blink DECLARES them with
-+// the identical signatures, passing the raw address() of the String it just
-+// produced. The address is the same identity v8's Factory concat/slice
-+// propagation (factory-base.cc / factory.cc, 0027) keys on, so a blink tag
-+// and a v8 propagation agree by construction.
-+//
-+// GC soundness: an address tag is only valid within a GC epoch. v8's
-+// TaintOnGCEpilogue(compacting) (registered by 0032) clears all kKeyHeap
-+// tags at compaction, so a recycled address can never inherit a stale tag.
-+// Between collections the tag follows the object exactly. This is the same
-+// epoch model the whole heap-taint layer uses - documented, not hidden.
-+//
-+// Values are passed as uint64_t (the address) so the ABI is identical on
-+// every platform and needs no shared struct layout.
 +extern "C" {
 +
-+// Tag a freshly-captured blink String as carrying taint `source_bit`
-+// (one of v8::afeye::TaintSource, passed as its u32 value). Union semantics:
-+// an existing tag keeps its bits. `key` is the String's address().
 +void afeye_taint_tag_string(uint64_t key, uint32_t source_bit);
 +
-+// Read the accumulated tag for a String address. Returns 0 if untainted or
-+// if taint is disabled. Lets a blink site decide whether to emit.
 +uint32_t afeye_taint_get_string(uint64_t key);
 +
-+// Propagate src -> dst (OR the tags). Used when blink moves a value between
-+// two heap Strings without going through v8's Factory (rare; most string
-+// creation funnels through Factory and is caught by the 0027 v8 hooks).
 +void afeye_taint_propagate_string(uint64_t dst_key, uint64_t src_key);
 +
-+// True when the DTT layer is active (sink enabled AND AFEYE_TAINT != 0).
-+// Lets a blink site skip the address() read entirely when taint is off.
 +int afeye_taint_active(void);
 +
-+// 0032: emit a taint-sink record from blink (postMessage funnel -
-+// message_port.cc, same renderer process as v8, taint store LIVE). Wraps
-+// v8::afeye::TaintEmitSink verbatim: record "taint-sink <sink> space=<n>
-+// key=<hex> tag=<hex>" AND feeds the in-renderer sunk-source union that
-+// gc_witness uses for the swept-without-sink dead-end fact.
 +void afeye_taint_emit_sink(const char* sink, uint8_t space, uint64_t key,
 +                           uint32_t tag);
 +
-+}  // extern "C"
++}
 +
-+#endif  // V8_AFEYE
++#endif
 +
-+#endif  // V8_AFEYE_TAINT_ABI_H_
++#endif
 diff --git a/v8/src/builtins/builtins-json.cc b/v8/src/builtins/builtins-json.cc
-index 9e3e9d7..3829b1b 100644
+index e67cbc4..eb12443 100644
 --- a/v8/src/builtins/builtins-json.cc
 +++ b/v8/src/builtins/builtins-json.cc
 @@ -9,6 +9,7 @@
@@ -542,21 +383,10 @@ index 9e3e9d7..3829b1b 100644
  #include "src/objects/string-inl.h"
  #endif
  #include "src/builtins/builtins.h"
-@@ -119,6 +120,23 @@ BUILTIN(JsonStringify) {
+@@ -100,6 +101,12 @@ BUILTIN(JsonStringify) {
                              reinterpret_cast<const uint8_t*>(afeye_head),
                              static_cast<uint32_t>(afeye_n > 0 ? afeye_n : 0));
        }
-+      // v12.5 (0027): SOURCE TAG BIRTH. The JSON.stringify result IS the
-+      // assembled fingerprint object - the single highest-value taint source
-+      // in the whole pipeline. Tag it kSrcFingerprint so every downstream
-+      // concat (FactoryBase::NewConsString) / slice (NewProperSubString) of
-+      // this string inherits the tag through pure-JS reshaping, all the way
-+      // to the socket sink (0032 TaintEmitSink -> `proven` verdict). The key
-+      // is Cast<String>(*afeye_r).address() - the SAME full tag-stripped heap
-+      // address the Factory hooks and the blink ABI use, so the identity
-+      // matches across layers by construction (tagged.h:508 address() =
-+      // ptr() - kHeapObjectTag; blink passes reinterpret_cast<uintptr_t>
-+      // (*v8::Local) = the same uncompressed address).
 +      if (v8::afeye::TaintEnabled()) {
 +        Tagged<String> afeye_s = Cast<String>(*afeye_r);
 +        v8::afeye::TaintSet(v8::afeye::kKeyHeap,
@@ -567,7 +397,7 @@ index 9e3e9d7..3829b1b 100644
    }
  #endif
 diff --git a/v8/src/heap/factory-base.cc b/v8/src/heap/factory-base.cc
-index debbaae..67732bf 100644
+index debbaae..41267f0 100644
 --- a/v8/src/heap/factory-base.cc
 +++ b/v8/src/heap/factory-base.cc
 @@ -34,6 +34,9 @@
@@ -580,22 +410,12 @@ index debbaae..67732bf 100644
  
  namespace v8 {
  namespace internal {
-@@ -924,6 +927,38 @@ MaybeHandle<SeqTwoByteString> FactoryBase<Impl>::NewRawSharedTwoByteString(
+@@ -924,6 +927,28 @@ MaybeHandle<SeqTwoByteString> FactoryBase<Impl>::NewRawSharedTwoByteString(
        AllocationType::kSharedOld, AllocationHint());
  }
  
 +#ifdef V8_AFEYE
 +namespace {
-+// afeye (0027): heap-object taint key. A Tagged<String>'s address() is
-+// stable within a GC epoch; TaintOnGCEpilogue(compacting) (registered by
-+// 0032 via Heap::AddGCEpilogueCallback) clears all kKeyHeap entries at
-+// compaction, so a recycled address can never inherit a stale tag. This is
-+// the tier-independent seam: EVERY string concat (a+b, template literals,
-+// Array.join, += accumulation) bottoms out in FactoryBase::NewConsString,
-+// whether the caller is Ignition bytecode OR TurboFan/Maglev machine code -
-+// the compiled tier still calls into this C++ funnel to allocate the result.
-+// That is why per-bytecode interpreter taint (a frame-layout fork) is not
-+// needed to follow pure-JS string assembly to the wire.
 +V8_INLINE uint64_t AfeyeStrKey(Tagged<String> s) {
 +  return static_cast<uint64_t>(s.address());
 +}
@@ -613,13 +433,13 @@ index debbaae..67732bf 100644
 +  v8::afeye::TaintPropagate(v8::afeye::kKeyHeap, AfeyeStrKey(result),
 +                            v8::afeye::kKeyHeap, AfeyeStrKey(src));
 +}
-+}  // namespace
++}
 +#endif  // V8_AFEYE
 +
  template <typename Impl>
  template <template <typename> typename HandleType>
    requires(std::is_convertible_v<HandleType<String>, DirectHandle<String>>)
-@@ -997,6 +1032,9 @@ HandleType<String>::MaybeType FactoryBase<Impl>::NewConsString(
+@@ -997,6 +1022,9 @@ HandleType<String>::MaybeType FactoryBase<Impl>::NewConsString(
              right->template GetDirectStringChars<uint8_t>(no_gc, access_guard);
          CopyChars(dest + left_length, src, right_length);
        }
@@ -629,7 +449,7 @@ index debbaae..67732bf 100644
        return result;
      }
  
-@@ -1009,6 +1047,9 @@ HandleType<String>::MaybeType FactoryBase<Impl>::NewConsString(
+@@ -1009,6 +1037,9 @@ HandleType<String>::MaybeType FactoryBase<Impl>::NewConsString(
      String::WriteToFlat(*left, sink, 0, left->length(), access_guard);
      String::WriteToFlat(*right, sink + left->length(), 0, right->length(),
                          access_guard);
@@ -639,21 +459,18 @@ index debbaae..67732bf 100644
      return result;
    }
  
-@@ -1041,6 +1082,12 @@ Handle<String> FactoryBase<Impl>::NewConsString(DirectHandle<String> left,
+@@ -1041,6 +1072,9 @@ Handle<String> FactoryBase<Impl>::NewConsString(DirectHandle<String> left,
    result->set_length(length);
    result->set_first(*left, *mode);
    result->set_second(*right, *mode);
 +#ifdef V8_AFEYE
-+  // 0027: the cons-string (lazy concat) path. Taint unions the same way as
-+  // the flat path; when this ConsString is later flattened the flat result
-+  // inherits via the flat hook above reading THIS object's tag.
 +  AfeyeTaintConcat(result, *left, *right);
 +#endif
    return handle(result, isolate());
  }
  
 diff --git a/v8/src/heap/factory.cc b/v8/src/heap/factory.cc
-index 9716d02..a87f693 100644
+index 9716d02..1128ec0 100644
 --- a/v8/src/heap/factory.cc
 +++ b/v8/src/heap/factory.cc
 @@ -3,6 +3,9 @@
@@ -666,12 +483,11 @@ index 9716d02..a87f693 100644
  
  #include <algorithm>  // For copy
  #include <memory>     // For shared_ptr<>
-@@ -1470,7 +1473,22 @@ Handle<String> Factory::NewProperSubString(DirectHandle<String> str,
+@@ -1470,7 +1473,21 @@ Handle<String> Factory::NewProperSubString(DirectHandle<String> str,
    }
  
    if (!v8_flags.string_slices || length < SlicedString::kMinLength) {
 +#ifdef V8_AFEYE
-+    // 0027: the copied-substring branch (short slices / string_slices off).
 +    {
 +      Handle<String> afeye_r = NewCopiedSubstring(str, begin, length);
 +      if (v8::afeye::TaintEnabled()) {
@@ -689,14 +505,11 @@ index 9716d02..a87f693 100644
    }
  
    int offset = begin;
-@@ -1496,6 +1514,18 @@ Handle<String> Factory::NewProperSubString(DirectHandle<String> str,
+@@ -1496,6 +1513,15 @@ Handle<String> Factory::NewProperSubString(DirectHandle<String> str,
    slice->set_length(length);
    slice->set_parent(*str);
    slice->set_offset(offset);
 +#ifdef V8_AFEYE
-+  // 0027: slice/substring taint. A slice of a tainted string is tainted -
-+  // this is how a token substring (or a fingerprint field extracted by
-+  // .slice/.substring) keeps its lineage through pure-JS reshaping.
 +  if (v8::afeye::TaintEnabled()) {
 +    v8::afeye::TaintTag t = v8::afeye::TaintGet(
 +        v8::afeye::kKeyHeap, static_cast<uint64_t>(str->address()));

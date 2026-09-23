@@ -1,3 +1,41 @@
+diff --git a/third_party/blink/renderer/core/input/keyboard_event_manager.cc b/third_party/blink/renderer/core/input/keyboard_event_manager.cc
+index 6d86e2c..4550584 100644
+--- a/third_party/blink/renderer/core/input/keyboard_event_manager.cc
++++ b/third_party/blink/renderer/core/input/keyboard_event_manager.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include "third_party/blink/renderer/core/input/keyboard_event_manager.h"
++#ifdef BLINK_AFEYE
++#include <cstdio>
++#include "third_party/blink/renderer/platform/afeye/sink.h"
++#endif
+ 
+ #include <memory>
+ 
+@@ -226,6 +230,20 @@ bool KeyboardEventManager::HandleAccessKey(const WebKeyboardEvent& evt) {
+ WebInputEventResult KeyboardEventManager::KeyEvent(
+     const WebKeyboardEvent& initial_key_event) {
+   base::AutoReset<bool> is_handling_key_event(&is_handling_key_event_, true);
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[160];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "input/key type=%d vk=%d code=%d key=%u mods=%d",
++                  static_cast<int>(initial_key_event.GetType()),
++                  initial_key_event.windows_key_code,
++                  initial_key_event.dom_code,
++                  static_cast<unsigned>(initial_key_event.dom_key),
++                  initial_key_event.GetModifiers());
++    blink::afeye::EmitStr(blink::afeye::kInput, blink::afeye::NowNs(),
++                          afeye_buf);
++  }
++#endif
+   if (initial_key_event.windows_key_code == VK_CAPITAL)
+     CapsLockStateMayHaveChanged();
+ 
+diff --git a/third_party/blink/renderer/core/input/mouse_event_manager.cc b/third_party/blink/renderer/core/input/mouse_event_manager.cc
+index 09de09b..3640bf5 100644
 --- a/third_party/blink/renderer/core/input/mouse_event_manager.cc
 +++ b/third_party/blink/renderer/core/input/mouse_event_manager.cc
 @@ -3,6 +3,10 @@
@@ -11,16 +49,11 @@
  
  #include "base/metrics/histogram_functions.h"
  #include "build/build_config.h"
-@@ -219,6 +223,29 @@
+@@ -219,6 +223,24 @@ MouseEventManager::DispatchMouseEvent(
  
    WebInputEventResult input_event_result = WebInputEventResult::kNotHandled;
  
 +#ifdef BLINK_AFEYE
-+  // afeye (v6): mouse input at the SOURCE - the full WebMouseEvent geometry
-+  // (widget + screen coords, button, click count, modifiers) before any
-+  // DOM dispatch decision. Events reaching this funnel come from the input
-+  // pipeline (trusted by construction); the EventDispatcher records carry
-+  // the isTrusted flag for the DOM-side view.
 +  if (blink::afeye::Enabled()) {
 +    const std::string afeye_t = mouse_event_type.Utf8();
 +    const gfx::PointF& afeye_pw = mouse_event.PositionInWidget();
@@ -41,39 +74,3 @@
    if (target && target->ToNode()) {
      Node* target_node = target->ToNode();
      int click_count = 0;
---- a/third_party/blink/renderer/core/input/keyboard_event_manager.cc
-+++ b/third_party/blink/renderer/core/input/keyboard_event_manager.cc
-@@ -3,6 +3,10 @@
- // found in the LICENSE file.
- 
- #include "third_party/blink/renderer/core/input/keyboard_event_manager.h"
-+#ifdef BLINK_AFEYE
-+#include <cstdio>
-+#include "third_party/blink/renderer/platform/afeye/sink.h"
-+#endif
- 
- #include <memory>
- 
-@@ -226,6 +230,22 @@
- WebInputEventResult KeyboardEventManager::KeyEvent(
-     const WebKeyboardEvent& initial_key_event) {
-   base::AutoReset<bool> is_handling_key_event(&is_handling_key_event_, true);
-+#ifdef BLINK_AFEYE
-+  // afeye (v6): keyboard input at the source: type, key codes (windows /
-+  // dom_code / dom_key), modifiers - before any handling decision.
-+  if (blink::afeye::Enabled()) {
-+    char afeye_buf[160];
-+    std::snprintf(afeye_buf, sizeof(afeye_buf),
-+                  "input/key type=%d vk=%d code=%d key=%u mods=%d",
-+                  static_cast<int>(initial_key_event.GetType()),
-+                  initial_key_event.windows_key_code,
-+                  initial_key_event.dom_code,
-+                  static_cast<unsigned>(initial_key_event.dom_key),
-+                  initial_key_event.GetModifiers());
-+    blink::afeye::EmitStr(blink::afeye::kInput, blink::afeye::NowNs(),
-+                          afeye_buf);
-+  }
-+#endif
-   if (initial_key_event.windows_key_code == VK_CAPITAL)
-     CapsLockStateMayHaveChanged();
- 

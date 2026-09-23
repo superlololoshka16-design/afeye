@@ -34,7 +34,7 @@ index 9907307..9f60518 100644
  void SerializedScriptValue::SetImageBitmapContentsArray(
      ImageBitmapContentsArray contents) {
 diff --git a/third_party/blink/renderer/core/dom/element.cc b/third_party/blink/renderer/core/dom/element.cc
-index 46a9172..25ed60e 100644
+index 46a9172..19b8bfb 100644
 --- a/third_party/blink/renderer/core/dom/element.cc
 +++ b/third_party/blink/renderer/core/dom/element.cc
 @@ -25,6 +25,10 @@
@@ -138,7 +138,7 @@ index 46a9172..25ed60e 100644
    Vector<gfx::RectF> rects = GetClientRectsNoAdjustment();
    if (rects.empty()) {
      return MakeGarbageCollected<DOMRectList>();
-@@ -3465,7 +3524,31 @@ DOMRect* Element::GetBoundingClientRectForBinding() {
+@@ -3465,7 +3524,29 @@ DOMRect* Element::GetBoundingClientRectForBinding() {
    // TODO(crbug.com/1499981): This should be removed once synchronized scrolling
    // impact is understood.
    SyncScrollAttemptHeuristic::DidAccessScrollOffset();
@@ -155,8 +155,6 @@ index 46a9172..25ed60e 100644
 +#endif
 +  DOMRect* afeye_rect = GetBoundingClientRect();
 +#ifdef BLINK_AFEYE
-+  // the RESULT of the measurement: the font-probe string's geometry lands
-+  // here, not just the ask
 +  if (blink::afeye::Enabled() && afeye_rect) {
 +    char afeye_buf[192];
 +    std::snprintf(afeye_buf, sizeof(afeye_buf),
@@ -261,7 +259,7 @@ index 8e2ed29..f99b04d 100644
  }
  
 diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-index 38528f7..9368cf8 100644
+index 38528f7..739b283 100644
 --- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 +++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 @@ -3,6 +3,10 @@
@@ -292,7 +290,7 @@ index 38528f7..9368cf8 100644
    if (!base::CheckMul(sw, sh).IsValid<int>()) {
      exception_state.ThrowRangeError("Out of memory at ImageData creation");
      return nullptr;
-@@ -1167,31 +1181,57 @@ void BaseRenderingContext2D::DrawTextInternal(
+@@ -1167,31 +1181,53 @@ void BaseRenderingContext2D::DrawTextInternal(
  }
  
  TextMetrics* BaseRenderingContext2D::measureText(const String& text) {
@@ -354,10 +352,6 @@ index 38528f7..9368cf8 100644
 +        afeye_state.GetTextAlign(), text, afeye_host->GetPlainTextPainter());
 +  }
 +#ifdef BLINK_AFEYE
-+  // v12.4 (antifraud attack): the WIDTH is the measurement - the font
-+  // fingerprint is sub-pixel text metrics. The ask (text+font) was
-+  // already logged above; without the RESULT the two sides of the
-+  // fingerprint (what was probed vs what it measured) never meet.
 +  if (blink::afeye::Enabled() && afeye_tm) {
 +    char afeye_buf[224];
 +    std::snprintf(afeye_buf, sizeof(afeye_buf),
@@ -404,7 +398,7 @@ index 5cd2723..8354e24 100644
  }
  
 diff --git a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
-index b456ecc..c686ccf 100644
+index b456ecc..40d1755 100644
 --- a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
 +++ b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
 @@ -29,6 +29,10 @@
@@ -418,7 +412,7 @@ index b456ecc..c686ccf 100644
  
  #include "base/check_deref.h"
  #include "base/task/single_thread_task_runner.h"
-@@ -234,6 +238,38 @@ bool supportsInternal(ScriptState* script_state,
+@@ -234,6 +238,35 @@ bool supportsInternal(ScriptState* script_state,
  
  }  // namespace
  
@@ -435,9 +429,6 @@ index b456ecc..c686ccf 100644
 +      n = b->ByteLength();
 +    }
 +  } else if (raw_data->IsArrayBufferView()) {
-+    // v12.1: the union accessor returns NotShared<DOMArrayBufferView> - a
-+    // raw-pointer assignment does not compile (in-tree precedent:
-+    // GetAsArrayBufferView().Get() at subtle_crypto.cc:587).
 +    NotShared<DOMArrayBufferView> v = raw_data->GetAsArrayBufferView();
 +    if (v) {
 +      const DOMArrayBufferView* view = v.Get();
@@ -457,7 +448,7 @@ index b456ecc..c686ccf 100644
  SubtleCrypto::SubtleCrypto() = default;
  
  ScriptPromise<DOMArrayBuffer> SubtleCrypto::encrypt(
-@@ -242,6 +278,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::encrypt(
+@@ -242,6 +275,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::encrypt(
      CryptoKey* key,
      const V8BufferSource* raw_data,
      ExceptionState& exception_state) {
@@ -468,7 +459,7 @@ index b456ecc..c686ccf 100644
    // Method described by:
    // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-encrypt
  
-@@ -292,6 +332,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::decrypt(
+@@ -292,6 +329,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::decrypt(
      CryptoKey* key,
      const V8BufferSource* raw_data,
      ExceptionState& exception_state) {
@@ -479,7 +470,7 @@ index b456ecc..c686ccf 100644
    // Method described by:
    // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-decrypt
  
-@@ -342,6 +386,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::sign(
+@@ -342,6 +383,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::sign(
      CryptoKey* key,
      const V8BufferSource* raw_data,
      ExceptionState& exception_state) {
@@ -490,7 +481,7 @@ index b456ecc..c686ccf 100644
    // Method described by:
    // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-sign
  
-@@ -447,6 +495,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::digest(
+@@ -447,6 +492,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::digest(
      const V8AlgorithmIdentifier* raw_algorithm,
      const V8BufferSource* raw_data,
      ExceptionState& exception_state) {
@@ -501,7 +492,7 @@ index b456ecc..c686ccf 100644
    // Method described by:
    // https://w3c.github.io/webcrypto/Overview.html#SubtleCrypto-method-digest
  
-@@ -823,6 +875,7 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::deriveBits(
+@@ -823,6 +872,7 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::deriveBits(
      CryptoKey* base_key,
      std::optional<unsigned> length_bits,
      ExceptionState& exception_state) {
@@ -632,7 +623,7 @@ index eb3a939..0a483cb 100644
    // The actual rendering has been completed. Notify the context.
    PostCrossThreadTask(
 diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index 403e1b3..e571f3f 100644
+index 403e1b3..8804690 100644
 --- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 @@ -24,6 +24,11 @@
@@ -663,25 +654,15 @@ index 403e1b3..e571f3f 100644
    ExecutionContext* context = ExecutionContext::From(script_state);
  
    if (name == WebGLDebugRendererInfo::ExtensionName()) {
-@@ -3989,6 +4003,89 @@ void WebGLRenderingContextBase::RecordANGLEImplementation() {
+@@ -3989,6 +4003,76 @@ void WebGLRenderingContextBase::RecordANGLEImplementation() {
  
  ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
                                                      GLenum pname) {
 +#ifdef BLINK_AFEYE
-+  // v12.4 (antifraud attack): the parameter VALUE is the fingerprint -
-+  // pname alone names the probe, the ANSWER is what gets hashed into the
-+  // token. UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL (the
-+  // WEBGL_debug_renderer_info pair), GL_VERSION / GL_RENDERER /
-+  // GL_SHADING_LANGUAGE_VERSION (the masked strings), and the numeric
-+  // caps (MAX_TEXTURE_SIZE, MAX_VIEWPORT_DIMS, ...) all ride the SAME
-+  // return path. Read them here BEFORE the switch: ContextGL()->GetString
-+  // is the same call the switch makes, reading it early does not change
-+  // any observable behavior (the GL driver string is cached by ANGLE -
-+  // a second GetString is a hit, not a re-query).
 +  if (blink::afeye::Enabled()) {
 +    switch (pname) {
-+      case 0x9245:  // UNMASKED_VENDOR_WEBGL
-+      case 0x9246:  // UNMASKED_RENDERER_WEBGL
++      case 0x9245:
++      case 0x9246:
 +      case GL_VERSION:
 +      case GL_RENDERER:
 +      case GL_VENDOR:
@@ -691,7 +672,6 @@ index 403e1b3..e571f3f 100644
 +        unsigned afeye_p = pname;
 +        std::string afeye_val;
 +        if (pname == 0x9245 || pname == 0x9246) {
-+          // the unmasked pair: extension gate mirrors the switch below
 +          afeye_what = (pname == 0x9245) ? "webgl/unmasked-vendor"
 +                                         : "webgl/unmasked-renderer";
 +          afeye_p = (pname == 0x9245) ? GL_VENDOR : GL_RENDERER;
@@ -723,8 +703,6 @@ index 403e1b3..e571f3f 100644
 +      case GL_SAMPLES:
 +      case GL_DEPTH_BITS:
 +      case GL_STENCIL_BITS: {
-+        // numeric caps: the switch answers these from the driver; the
-+        // exact GL query is cheap and side-effect-free
 +        if (ContextGL() && !isContextLost()) {
 +          GLint afeye_v2[2] = {0, 0};
 +          ContextGL()->GetIntegerv(static_cast<GLenum>(pname), afeye_v2);
@@ -753,7 +731,7 @@ index 403e1b3..e571f3f 100644
    if (isContextLost())
      return ScriptValue::CreateNull(script_state->GetIsolate());
    const int kIntZero = 0;
-@@ -4487,6 +4584,17 @@ String WebGLRenderingContextBase::getShaderInfoLog(WebGLShader* shader) {
+@@ -4487,6 +4571,17 @@ String WebGLRenderingContextBase::getShaderInfoLog(WebGLShader* shader) {
  WebGLShaderPrecisionFormat* WebGLRenderingContextBase::getShaderPrecisionFormat(
      GLenum shader_type,
      GLenum precision_type) {
@@ -771,13 +749,12 @@ index 403e1b3..e571f3f 100644
    if (isContextLost())
      return nullptr;
    if (!ValidateShaderType("getShaderPrecisionFormat", shader_type)) {
-@@ -4533,6 +4641,23 @@ WebGLRenderingContextBase::getSupportedExtensions() {
+@@ -4533,6 +4628,22 @@ WebGLRenderingContextBase::getSupportedExtensions() {
      }
    }
  
 +#ifdef BLINK_AFEYE
 +  if (blink::afeye::Enabled()) {
-+    // the enumerated extension list IS the fingerprint signal
 +    std::string afeye_list;
 +    for (const String& afeye_s : result) {
 +      if (!afeye_list.empty()) afeye_list.push_back(',');

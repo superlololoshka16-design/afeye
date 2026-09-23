@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/modules/webgpu/gpu_buffer.cc b/third_party/blink/renderer/modules/webgpu/gpu_buffer.cc
-index 6b2c153..454b097 100644
+index 6b2c153..753053b 100644
 --- a/third_party/blink/renderer/modules/webgpu/gpu_buffer.cc
 +++ b/third_party/blink/renderer/modules/webgpu/gpu_buffer.cc
 @@ -4,6 +4,15 @@
@@ -18,24 +18,12 @@ index 6b2c153..454b097 100644
  #include <cinttypes>
  #include <utility>
  
-@@ -29,6 +38,33 @@
+@@ -29,6 +38,21 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+// afeye (0030): WebGPU capture. WebGPU is a full compute+storage stack that
-+// bypasses EVERY other afeye hook - GPUBuffer/GPUQueue traffic is not HTTP
-+// (url_loader 0011), not WS frames (0017), not WebTransport (0029), not a
-+// structured clone (0007). Modern antifraud uses it two ways: (a) GPU compute
-+// fingerprinting / PoW where the WGSL shader IS the algorithm, and (b) an
-+// exfil channel (writeBuffer -> queue.submit -> mapAsync readback). Before
-+// this patch a token assembled and sent over WebGPU crossed no sink at all.
-+//   - WGSL shader source + mapAsync readback -> kFingerprint (the executed
-+//     code / its result; the collector names kind 16 "fingerprint").
-+//   - writeBuffer/writeTexture bytes -> kWebSocket (kind 19, the non-HTTP
-+//     wire bucket 0029 uses) so the Rust content graph links them by bytes.
-+// Per-TU throttle + AFEYE_TRACE_WEBGPU=0 gate; EmitSpan caps at kSpanCap.
 +std::atomic<uint64_t> g_afeye_wgb{0};
 +inline bool AfeyeWebGpuOn() {
 +  static const bool off = []() {
@@ -45,22 +33,18 @@ index 6b2c153..454b097 100644
 +  return !off &&
 +         g_afeye_wgb.fetch_add(1, std::memory_order_relaxed) < 200000;
 +}
-+}  // namespace
++}
 +#endif  // BLINK_AFEYE
 +
 +
  namespace {
  
  // A size that if used to create a dawn_wire buffer, will guarantee we'll OOM
-@@ -530,6 +566,20 @@ DOMArrayBuffer* GPUBuffer::CreateArrayBufferForMappedData(v8::Isolate* isolate,
+@@ -530,6 +554,16 @@ DOMArrayBuffer* GPUBuffer::CreateArrayBufferForMappedData(v8::Isolate* isolate,
                                                            size_t data_length) {
    DCHECK(data);
    DCHECK_LE(static_cast<uint64_t>(data_length), v8::TypedArray::kMaxByteLength);
 +#ifdef BLINK_AFEYE
-+  // afeye (0030): mapAsync READBACK - this is where a GPU-computed result
-+  // (PoW solution, derived token, fingerprint hash) re-enters JS as an
-+  // ArrayBuffer. The single funnel every mapped read crosses (getMappedRange
-+  // builds on it). Captured as kFingerprint; head-capped by EmitSpan.
 +  if (blink::afeye::Enabled() && AfeyeWebGpuOn() && data_length > 0) {
 +    char afeye_tag[64];
 +    std::snprintf(afeye_tag, sizeof(afeye_tag), "webgpu/map-readback len=%zu",
@@ -74,7 +58,7 @@ index 6b2c153..454b097 100644
    ArrayBufferContents contents(v8::ArrayBuffer::NewBackingStore(
        data, data_length, v8::BackingStore::EmptyDeleter, nullptr));
 diff --git a/third_party/blink/renderer/modules/webgpu/gpu_queue.cc b/third_party/blink/renderer/modules/webgpu/gpu_queue.cc
-index b51671d..28b7df2 100644
+index b51671d..e353216 100644
 --- a/third_party/blink/renderer/modules/webgpu/gpu_queue.cc
 +++ b/third_party/blink/renderer/modules/webgpu/gpu_queue.cc
 @@ -4,6 +4,15 @@
@@ -93,24 +77,12 @@ index b51671d..28b7df2 100644
  #include "build/build_config.h"
  #include "gpu/command_buffer/client/shared_image_interface.h"
  #include "gpu/command_buffer/client/webgpu_interface.h"
-@@ -44,6 +53,33 @@
+@@ -44,6 +53,21 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+// afeye (0030): WebGPU capture. WebGPU is a full compute+storage stack that
-+// bypasses EVERY other afeye hook - GPUBuffer/GPUQueue traffic is not HTTP
-+// (url_loader 0011), not WS frames (0017), not WebTransport (0029), not a
-+// structured clone (0007). Modern antifraud uses it two ways: (a) GPU compute
-+// fingerprinting / PoW where the WGSL shader IS the algorithm, and (b) an
-+// exfil channel (writeBuffer -> queue.submit -> mapAsync readback). Before
-+// this patch a token assembled and sent over WebGPU crossed no sink at all.
-+//   - WGSL shader source + mapAsync readback -> kFingerprint (the executed
-+//     code / its result; the collector names kind 16 "fingerprint").
-+//   - writeBuffer/writeTexture bytes -> kWebSocket (kind 19, the non-HTTP
-+//     wire bucket 0029 uses) so the Rust content graph links them by bytes.
-+// Per-TU throttle + AFEYE_TRACE_WEBGPU=0 gate; EmitSpan caps at kSpanCap.
 +std::atomic<uint64_t> g_afeye_wq{0};
 +inline bool AfeyeWebGpuOn() {
 +  static const bool off = []() {
@@ -120,22 +92,18 @@ index b51671d..28b7df2 100644
 +  return !off &&
 +         g_afeye_wq.fetch_add(1, std::memory_order_relaxed) < 200000;
 +}
-+}  // namespace
++}
 +#endif  // BLINK_AFEYE
 +
 +
  namespace {
  
  bool IsValidExternalImageDestinationFormat(
-@@ -248,6 +284,22 @@ void GPUQueue::WriteBufferImpl(ScriptState* script_state,
+@@ -248,6 +272,18 @@ void GPUQueue::WriteBufferImpl(ScriptState* script_state,
  
    auto data_span = data.subspan(static_cast<size_t>(data_byte_offset),
                                  static_cast<size_t>(write_byte_size));
 +#ifdef BLINK_AFEYE
-+  // afeye (0030): writeBuffer egress - ALL FOUR writeBuffer overloads funnel
-+  // through WriteBufferImpl, so this is the single point every GPU-bound
-+  // upload crosses. data_span is the EXACT byte range handed to Dawn's
-+  // WriteBuffer (the wire bytes), not the whole input ArrayBuffer.
 +  if (blink::afeye::Enabled() && AfeyeWebGpuOn() && !data_span.empty()) {
 +    char afeye_tag[96];
 +    std::snprintf(afeye_tag, sizeof(afeye_tag),
@@ -150,19 +118,11 @@ index b51671d..28b7df2 100644
    GetHandle().WriteBuffer(buffer->GetHandle(), buffer_offset, data_span.data(),
                            data_span.size());
    EnsureFlush(ToEventLoop(script_state));
-@@ -318,6 +370,24 @@ void GPUQueue::WriteTextureImpl(ScriptState* script_state,
+@@ -318,6 +354,16 @@ void GPUQueue::WriteTextureImpl(ScriptState* script_state,
        dawn_destination.aspect);
    size_t required_copy_size = std::min(data_span.size(), data_size_upper_bound);
  
 +#ifdef BLINK_AFEYE
-+  // afeye (0030): writeTexture egress - the texture-upload half of the
-+  // WebGPU exfil/compute surface. A GPU fingerprint (canvas raster,
-+  // image-derived texture) or a compute input staged as a texture crosses
-+  // here; like writeBuffer it bypasses url_loader/websocket/WebTransport.
-+  // required_copy_size is the TIGHT upper bound of bytes actually handed to
-+  // Dawn's WriteTexture (not the whole input span), so this is the wire
-+  // extent. data_span is already offset-adjusted (dawn_data_layout.offset
-+  // folded into the pointer above).
 +  if (blink::afeye::Enabled() && AfeyeWebGpuOn() && required_copy_size > 0) {
 +    char afeye_tag[96];
 +    std::snprintf(afeye_tag, sizeof(afeye_tag),
@@ -176,7 +136,7 @@ index b51671d..28b7df2 100644
                             required_copy_size, &dawn_data_layout,
                             &dawn_write_size);
 diff --git a/third_party/blink/renderer/modules/webgpu/gpu_shader_module.cc b/third_party/blink/renderer/modules/webgpu/gpu_shader_module.cc
-index c8f1321..d9fcd4c 100644
+index c8f1321..70dbd70 100644
 --- a/third_party/blink/renderer/modules/webgpu/gpu_shader_module.cc
 +++ b/third_party/blink/renderer/modules/webgpu/gpu_shader_module.cc
 @@ -4,6 +4,15 @@
@@ -195,24 +155,12 @@ index c8f1321..d9fcd4c 100644
  #include "base/numerics/clamped_math.h"
  #include "gpu/command_buffer/client/webgpu_interface.h"
  #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
-@@ -19,6 +28,33 @@
+@@ -19,6 +28,21 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+// afeye (0030): WebGPU capture. WebGPU is a full compute+storage stack that
-+// bypasses EVERY other afeye hook - GPUBuffer/GPUQueue traffic is not HTTP
-+// (url_loader 0011), not WS frames (0017), not WebTransport (0029), not a
-+// structured clone (0007). Modern antifraud uses it two ways: (a) GPU compute
-+// fingerprinting / PoW where the WGSL shader IS the algorithm, and (b) an
-+// exfil channel (writeBuffer -> queue.submit -> mapAsync readback). Before
-+// this patch a token assembled and sent over WebGPU crossed no sink at all.
-+//   - WGSL shader source + mapAsync readback -> kFingerprint (the executed
-+//     code / its result; the collector names kind 16 "fingerprint").
-+//   - writeBuffer/writeTexture bytes -> kWebSocket (kind 19, the non-HTTP
-+//     wire bucket 0029 uses) so the Rust content graph links them by bytes.
-+// Per-TU throttle + AFEYE_TRACE_WEBGPU=0 gate; EmitSpan caps at kSpanCap.
 +std::atomic<uint64_t> g_afeye_wgsl{0};
 +inline bool AfeyeWebGpuOn() {
 +  static const bool off = []() {
@@ -222,21 +170,18 @@ index c8f1321..d9fcd4c 100644
 +  return !off &&
 +         g_afeye_wgsl.fetch_add(1, std::memory_order_relaxed) < 200000;
 +}
-+}  // namespace
++}
 +#endif  // BLINK_AFEYE
 +
 +
  // static
  GPUShaderModule* GPUShaderModule::Create(
      GPUDevice* device,
-@@ -30,6 +66,20 @@ GPUShaderModule* GPUShaderModule::Create(
+@@ -30,6 +54,17 @@ GPUShaderModule* GPUShaderModule::Create(
    const String& wtf_wgsl_code = webgpu_desc->code();
    std::string wgsl_code = wtf_wgsl_code.Utf8();
    wgsl_desc.code = wgsl_code.c_str();
 +#ifdef BLINK_AFEYE
-+  // afeye (0030): the WGSL shader source - for a compute-PoW antifraud this
-+  // IS the algorithm being run on the GPU (the wasm-equivalent of "что
-+  // исполняется"). Captured as a kFingerprint span; head-capped by EmitSpan.
 +  if (blink::afeye::Enabled() && AfeyeWebGpuOn() && !wgsl_code.empty()) {
 +    char afeye_tag[64];
 +    std::snprintf(afeye_tag, sizeof(afeye_tag), "webgpu/wgsl len=%zu",

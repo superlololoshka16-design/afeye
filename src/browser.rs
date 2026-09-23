@@ -79,30 +79,13 @@ fn chrome_flags(f: &Flags) -> Vec<String> {
         "--window-size=1280,832".into(),
         format!("--window-position={},{}", (idx % 4) * 320, (idx / 4) * 250),
     ];
-    // afeye: UA override built from the chrome binary's real version - the
-    // headless token (HeadlessChrome/x.y) leaks into request headers and
-    // navigator.userAgent otherwise and anti-fraud keys on it.
     if !f.ua.is_empty() {
         a.push(format!("--user-agent={}", f.ua));
     }
-    // afeye: NO v8/js chrome flags are passed. The capture layer activates
-    // entirely through the AFEYE_SINK / AFEYE_TRACE_* env vars read by the
-    // in-process sinks (see launch_chrome_local / launch_chrome below). A
-    // previous revision pushed "--js-flags=--afeye-trace" under AFEYE_V8_TRACE,
-    // but no patch ever DEFINED an `afeye_trace` v8 flag - v8 aborts with
-    // "unrecognized option --afeye-trace" and chrome never launches (zero
-    // capture). Per-bytecode instruction tracing was never implemented; the
-    // execution surface is covered by kind-34 exec records (0025 log.cc
-    // JitLogger::LogRecordedBuffer) instead. Dead crash-path removed (v12.5).
     if std::env::var("AF_TEST_HEADLESS").is_ok() {
         a.push("--headless".into());
         a.push("--disable-gpu".into());
     }
-    // v7: the CI build target is the REAL `chrome` (full platform - the
-    // antifraud self-checks stay alive). It runs headed under the crawl's
-    // Xvfb display, or --headless when AF_TEST_HEADLESS is set (since 132
-    // --headless IS the full new headless - the old stripped one is gone).
-    // Only a legacy headless_shell build takes the old path.
     if f.headless_shell {
         a.push("--headless".into());
         a.push("--disable-gpu".into());
@@ -132,18 +115,6 @@ pub async fn launch_chrome(ctx: &Ctx, t: &Tunnel) -> Result<Child, String> {
         .arg(format!("HOME=/tmp/afeye/h{}", t.i))
         .arg(format!("USER={}", t.user))
         .arg(format!("DISPLAY={}", ctx.display));
-    // afeye: the sinks read AFEYE_SINK / AFEYE_RAW_DIR at process start;
-    // runuser strips the parent environment, so pass them explicitly.
-    // v12.4 (the empty-collect fix): pass ALWAYS, with the collector's own
-    // defaults when the parent does not set them. Before, a scrubbed
-    // parent (CI sudo -E carries AFEYE_SINK but not AFEYE_RAW_DIR) meant
-    // the sinks wrote to THEIR default /tmp/afeye-raw while main.rs's
-    // collector tailed AF_RAW_DIR... also /tmp/afeye-raw - the SAME dir,
-    // so this pair accidentally worked, but only by default-coincidence.
-    // Making it explicit closes the whole class: any AF_RAW_DIR override
-    // now reaches the chrome side too (before it silently DIDN'T - the
-    // collector tailed the override dir, the sinks kept writing the
-    // default, zero records, empty collect, empty filtered zip).
     {
         let raw_dir = std::env::var("AFEYE_RAW_DIR").unwrap_or_else(|_| {
             std::env::var("AF_RAW_DIR").unwrap_or_else(|_| "/tmp/afeye-raw".into())
@@ -182,15 +153,6 @@ pub async fn launch_chrome_local(ctx: &Ctx, port: u16) -> Result<Child, String> 
         headless_shell: is_headless_shell(&ctx.chrome),
     });
     let mut c = Command::new(&ctx.chrome);
-    // v12.4 (the empty-collect fix): the sinks inside chrome activate on
-    // AFEYE_SINK and write to AFEYE_RAW_DIR - the SAME vars main.rs's
-    // collector reads (AF_RAW_DIR for the tail side). A plain spawn
-    // inherits the parent env, but a scrubbed parent (CI, systemd) meant
-    // the sinks stayed OFF, chrome ran stock, and the capture died at the
-    // very first record: collect/stats.json records=0, sink_alive=false,
-    // filtered zip empty of chains. Force-inject the pair with the same
-    // defaults the collector uses - the tunnel path (run_tunnel) has
-    // passed them explicitly since v6; the local path simply forgot.
     let raw_dir = std::env::var("AFEYE_RAW_DIR")
         .unwrap_or_else(|_| std::env::var("AF_RAW_DIR").unwrap_or_else(|_| "/tmp/afeye-raw".into()));
     c.env("AFEYE_SINK", std::env::var("AFEYE_SINK").unwrap_or_else(|_| "1".into()));

@@ -1,16 +1,12 @@
+diff --git a/v8/src/builtins/builtins-date.cc b/v8/src/builtins/builtins-date.cc
+index a473d73..9464d71 100644
 --- a/v8/src/builtins/builtins-date.cc
 +++ b/v8/src/builtins/builtins-date.cc
-@@ -63,6 +63,29 @@ Tagged<Object> SetDateValue(Isolate* isolate, DirectHandle<JSDate> date,
+@@ -63,6 +63,23 @@ Tagged<Object> SetDateValue(Isolate* isolate, DirectHandle<JSDate> date,
  // https://tc39.es/ecma262/#sec-date-constructor
  BUILTIN(DateConstructor) {
    HandleScope scope(isolate);
 +#ifdef V8_AFEYE
-+  // afeye (0023, G7): the Date CONSTRUCTOR clock read - `Date()` and
-+  // `new Date()` with no args call JSDate::CurrentTimeValue exactly like
-+  // Date.now() (0004). Antifraud timing checks cross-check Date.now() against
-+  // new Date().getTime(); a clock hook that moves only one of them is itself a
-+  // detector, and half the clock stream was invisible. Zero-arg reads only:
-+  // Date(2020,1,1) parses an argument, it is not a clock read.
 +  {
 +    const bool afeye_no_args = (args.length() - 1) == 0;
 +    if (afeye_no_args && v8::afeye::Enabled()) {
@@ -30,6 +26,8 @@
    if (IsUndefined(*args.new_target())) {
      double const time_val =
          static_cast<double>(JSDate::CurrentTimeValue(isolate));
+diff --git a/v8/src/codegen/compiler.cc b/v8/src/codegen/compiler.cc
+index eb5d461..3a2d013 100644
 --- a/v8/src/codegen/compiler.cc
 +++ b/v8/src/codegen/compiler.cc
 @@ -4,12 +4,16 @@
@@ -49,22 +47,11 @@
  #endif
  
  #include <memory>
-@@ -3053,10 +3057,97 @@ bool Compiler::CollectSourcePositions(
+@@ -3061,10 +3065,86 @@ bool Compiler::CollectSourcePositions(
  }
  
  // static
 +#ifdef V8_AFEYE
-+// afeye (0023, G6): the LAZY-COMPILE funnel. With lazy compilation (default)
-+// every function body compiles here on its FIRST call - so this is the
-+// cheapest "which functions ACTUALLY executed, and when" signal in the engine.
-+// NO-ALLOC: reads the SFI name + its script name:line off the Tagged<> heap
-+// objects under DisallowGarbageCollection via GetFlatContent (the exact 0003
-+// Invoke pattern). Reuses kind 8 (kCallCompleted) so the Rust timeline needs
-+// no new decoder; tagged "lazy-compile" to distinguish from Invoke entries.
-+// The JS->JS CALLER edge is NOT walked here on purpose: this runs on every
-+// function's first call, and a frame-walk I cannot compile-test risks bricking
-+// the whole capture. Caller chains come from Error.stack (0022, G2) at the
-+// moments antifraud introspects, and from Invoke (0003) for C++->JS entries.
 +static void AfeyeLogLazyCompile(Tagged<SharedFunctionInfo> sfi) {
 +  static std::atomic<uint64_t> g_afeye_lazy{0};
 +  if (g_afeye_lazy.fetch_add(1, std::memory_order_relaxed) >= 4000000) {
@@ -147,16 +134,11 @@
    // We should never reach here if the function is already compiled.
    DCHECK(!shared_info->is_compiled());
    DCHECK(!is_compiled_scope->is_compiled());
-@@ -4250,6 +4341,16 @@ MaybeDirectHandle<JSFunction> Compiler::GetWrappedFunction(
+@@ -4258,6 +4338,11 @@ MaybeDirectHandle<JSFunction> Compiler::GetWrappedFunction(
    ScriptCompileTimerScope compile_timer(isolate, no_cache_reason,
                                          &compilation_details);
  
 +#ifdef V8_AFEYE
-+  // afeye (0023, G9): the FOURTH compile funnel - ScriptCompiler::CompileFunction
-+  // (wrapped-function API). It has its own cache/deserialize/NewScript/
-+  // CompileToplevel path and never passes the three funnels 0002 hooks, so
-+  // wrapped-function sources were the one gap in "every line of JS exactly
-+  // once". Same helper, same kind-1 record, same iso: prefix.
 +  AfeyeDumpScriptSource(isolate, direct_handle(*source, isolate), "wrapped",
 +                        script_details.name_obj);
 +#endif
@@ -164,6 +146,8 @@
    if (compile_options & ScriptCompiler::kConsumeCodeCache) {
      DCHECK(cached_data);
      DCHECK_EQ(script_details.repl_mode, REPLMode::kNo);
+diff --git a/v8/src/objects/js-objects.cc b/v8/src/objects/js-objects.cc
+index b8786f9..6a65510 100644
 --- a/v8/src/objects/js-objects.cc
 +++ b/v8/src/objects/js-objects.cc
 @@ -7,6 +7,15 @@
@@ -182,21 +166,11 @@
  #include "src/api/api-arguments-inl.h"
  #include "src/api/api-natives.h"
  #include "src/base/strong-alias.h"
-@@ -2034,6 +2043,71 @@ Maybe<bool> JSReceiver::GetOwnPropertyDescriptor(LookupIterator* it,
+@@ -2034,6 +2043,61 @@ Maybe<bool> JSReceiver::GetOwnPropertyDescriptor(LookupIterator* it,
    desc->set_enumerable((attrs & DONT_ENUM) == 0);
    // 8. Set D.[[Configurable]] to the value of X's [[Configurable]] attribute.
    desc->set_configurable((attrs & DONT_DELETE) == 0);
 +#ifdef V8_AFEYE
-+  // afeye (0023, G5): Object.getOwnPropertyDescriptor over a DOM object is how
-+  // antifraud VERIFIES navigator.webdriver / plugins / document.cookie /
-+  // window.chrome were NOT tampered with: a patched browser emits a data
-+  // descriptor where stock emits an accessor, or wrong attribute bits - that
-+  // delta changes the token. 0008 sees getter invocations, never descriptor
-+  // introspection. Reached only for special receivers / proxies (plain-object
-+  // GOPD stays in the CSA fast path - correct: the antifraud-relevant targets
-+  // are blink DOM objects and proxies). Logs holder instance-type + key + the
-+  // result attributes (the tamper evidence). GetName() allocates a Handle;
-+  // this function already allocates (ToPropertyDescriptor path), so in-budget.
 +  if (v8::afeye::Enabled()) {
 +    static std::atomic<uint64_t> g_afeye_gopd{0};
 +    static bool g_afeye_gopd_off = []() {

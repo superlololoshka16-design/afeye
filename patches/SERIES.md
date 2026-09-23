@@ -1030,3 +1030,78 @@ disables the call stream, `AFEYE_TRACE_CLOCK=0` the clock stream.
   `sink layer DEAD` and the manifest carries `sink_alive=false`.
   v7 adds the CI-side teeth: `tools/rec_census.py` assertions on real
   captured kinds - a layer that compiled to nothing fails the smoke.
+
+---
+
+# v12.5 appendix (the code carries NO comments - this file is the record)
+
+All comments were stripped from patches/, src/, scripts/, tools/ by direct
+order. The load-bearing facts that lived in comments are here, short.
+
+## target
+Chromium tag 153.0.8010.52, V8 rev d1fed5cd7e3b114dea70f18b20d26f816322833d.
+Every patch preimage blob-hash verified against googlesource (75/75
+first-touch, 0 mismatch).
+
+## patches added in v12.5
+- 0026 wasm linear-memory CONTENT at Grow exits + GetArrayBuffer read-out
+  (kind 4, tag wasm-mem-content, 64KiB head, 512 dumps, AFEYE_TRACE_WASMMEMDUMP).
+- 0027 DTT core: taint.{h,cc} (u32 source-bitmap tags, 1M-slot store,
+  union propagation, GC-epoch clear), taint_abi.{h,cc} (extern "C" bridge for
+  blink), Factory NewConsString/NewProperSubString propagation, source-tag
+  birth at BUILTIN(JsonStringify) + 0024 IDL string returns.
+  KEY IDENTITY: reinterpret_cast<uintptr_t>(*v8::Local<String>) ==
+  Tagged<String>::address() (v8-handle-base.h:139, tagged.h:508). Blink tags
+  and v8 keys agree by construction.
+- 0028 wasm linear-memory SHADOW (1 byte per memory byte, keyed by
+  buffer_start, rekey+migrate on copy-grow, STAGE/COMMIT bulk-op semantics
+  so trapping copies record nothing). UNSEEDED STATE: nothing calls
+  WasmShadowPushStoreTaint yet (JS typed-array stores into wasm memory have
+  NO C++ funnel at this rev), so t_store_taint stays 0 and wasm-shadow-*
+  records DO NOT emit. Absence of those records is the known-unwired state,
+  NOT a capture failure or dead-end.
+- 0029 WebTransport (stream+datagram, both directions) and RTCDataChannel
+  (send+onmessage) wire capture - kind 19 spans, tags wt-stream-out/in,
+  wt-datagram-out/in, rtc-datachannel-out/in. These transports bypass
+  url_loader and websocket entirely.
+- 0030 WebGPU: WGSL shader source (kind 16 webgpu/wgsl), writeBuffer +
+  writeTexture egress (kind 19), mapAsync readback (kind 16
+  webgpu/map-readback).
+- 0031 async causality: trace_id through both microtask enqueue funnels
+  (C++ + CSA fast path - Torque promise reactions bypass C++), drain-loop
+  enter/exit, AllocateJSPromise. Records: kind 16 prose
+  "causality <what> tid=<hex> parent=<hex>" (8 shapes incl. witness with
+  dropped/imbalance/misses/minted counters - nonzero = async tree
+  INCOMPLETE). 4 RUNTIME_FUNCTIONs appended LAST in runtime.h (no
+  FunctionId shift in stock builds).
+- 0032 socket sink + GC proof: postMessage taint verdict (renderer-local,
+  real), req-body-stream spans at ChunkedDataPipeUploadDataStream::
+  ReadInternal, gc_witness at Heap::SetUp per-isolate epilogue callback -
+  the callback OWNS the TaintOnGCEpilogue wipe and reads
+  TaintLiveHeapTagUnion/TaintSunkUnion BEFORE it (ordering is the contract).
+  Records: "taint-swept tag=%x", "taint-deadend tag=%x" (live & ~sunk),
+  "taint-sink <sink> space=%u key=%llx tag=%x".
+
+## linkage law
+net/ and services/network/ cannot link v8::afeye (no //v8 dep, -Wl,-z,defs,
+multi-process). Cross-process proven = Rust content-match of wire bytes
+against renderer captures. cookie-attach lives in url_loader.cc
+(SetRawRequestHeadersAndNotify), not url_request_http_job.cc.
+
+## driver
+browser.rs passes NO js-flags. The old --afeye-trace under AFEYE_V8_TRACE
+referenced a v8 flag that no patch defines - v8 would abort on it. Removed.
+
+## dead enums (honest)
+kPerfEntry(13)/perf-entry, kClientHints(20)/client-hints, kAtomics(9),
+kSabBacking(10), kSwCache(21): defined, named by the collector, NOT
+emitted. perf timing VALUES still cross 0024 (IDL thunk, kind 29);
+client-hints values cross 0024 for the sync getters but
+getHighEntropyValues' resolved UADataValues fields are only partially
+covered; Atomics/SAB per-op have no C++ funnel (JIT-generated).
+
+## gn args
+The proven 18-arg block (run 35618590286 reached ninja with it). The v12.4
+graph-cut (26 extra args) was reverted: use_gio=false+use_gtk=true asserts,
+enable_print_preview=false hits an ungated chrome/test dep. Faster
+unproven << slower proven.

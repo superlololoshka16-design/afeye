@@ -25,40 +25,40 @@ import sys
 
 KIND_NAMES = {
     0: "sink-hello",
-    1: "script-source",      # v8 layer (compiler.cc funnels)
+    1: "script-source",
     2: "bytecode-entry",
     3: "wasm-module",
     4: "wasm-memory",
     5: "wasm-table",
     6: "microtask-enqueue",
     7: "microtask-run",
-    8: "call-completed",    # v8 Invoke funnel (0003)
+    8: "call-completed",
     9: "atomics",
     10: "sab-backing",
     11: "crypto-op",
-    12: "timer",             # blink dom_timer
+    12: "timer",
     13: "perf-entry",
     14: "message",
     15: "structured-clone",
     16: "fingerprint",
-    17: "net-request",        # net layer (network service)
+    17: "net-request",
     18: "net-resp-body",
     19: "websocket",
     20: "client-hints",
     21: "sw-cache",
-    22: "script-source",      # blink layer
+    22: "script-source",
     23: "input",
-    24: "event-dispatch",     # blink event_dispatcher + event_target
+    24: "event-dispatch",
     25: "dom-metric",
     26: "audio",
     27: "webrtc",
-    28: "fetch",              # blink resource_fetcher
-    29: "dom-api",           # blink IDLMemberInstaller
+    28: "fetch",
+    29: "dom-api",
     30: "microtask",
     31: "wasm-instance",
     32: "fn-tostring",
     33: "clock",
-    34: "isolate",           # isolate birth (0003)
+    34: "isolate",
     35: "worker",
     36: "nav-start",
     37: "taint-edge",
@@ -66,7 +66,7 @@ KIND_NAMES = {
     39: "sink-drop",
 }
 
-HDR = struct.Struct("<IBHI")  # len, kind, flags, rsv
+HDR = struct.Struct("<IBHI")
 
 
 def parse_layer(fname: str) -> str:
@@ -83,12 +83,6 @@ def census(path: str):
     while off + 16 <= len(buf):
         rec_len, kind, flags, _rsv = HDR.unpack_from(buf, off)
         if rec_len < 16 or off + rec_len > len(buf):
-            # v12.1: a truncated TAIL (a record that overhangs EOF by the
-            # last few bytes) is a torn write - chrome killed by `timeout`
-            # or SIGTERM-mid-drain leaves exactly this. collect.rs treats the
-            # identical condition as starved/wt and keeps counting; only a
-            # complete implausible record AHEAD of the bad offset is real
-            # corruption. Warn on the tail, keep the census green.
             tail = len(buf) - off
             if 16 <= rec_len <= 1 << 20 and 0 <= kind <= 39 and flags <= 1 and tail >= 16:
                 print(f"torn tail at {path}:{off} rec_len={rec_len} have={tail}")

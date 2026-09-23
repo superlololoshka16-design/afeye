@@ -1,5 +1,5 @@
 diff --git a/services/network/url_loader.cc b/services/network/url_loader.cc
-index 1720130..9f15fff 100644
+index 1720130..12f5c19 100644
 --- a/services/network/url_loader.cc
 +++ b/services/network/url_loader.cc
 @@ -4,6 +4,8 @@
@@ -11,21 +11,11 @@ index 1720130..9f15fff 100644
  #include <string>
  #include "services/network/afeye_sink.h"
  #endif
-@@ -2256,6 +2258,48 @@ void URLLoader::SetRawRequestHeadersAndNotify(
+@@ -2256,6 +2258,38 @@ void URLLoader::SetRawRequestHeadersAndNotify(
      raw_request_headers_size_ += key.size() + value.size();
    }
  
 +#ifdef NET_AFEYE
-+  // v12.2 (relocated from net/url_request/url_request_http_job.cc by v12.5):
-+  // the cookie->header RELAY record. 0013 catches the cookie VALUE in blink;
-+  // kind-18 catches Set-Cookie planting; THIS catches the attach - which
-+  // cookies actually left, on which request. This callback receives the
-+  // FINAL merged raw headers (the jar-built Cookie: line included), and
-+  // lives in services/network where network::afeye is linked - the net/
-+  // placement could not link (libnet.so has no //services/network dep,
-+  // -Wl,-z,defs would kill it). Same record: EmitSpan body carries the
-+  // exact line bytes so the content graph joins them to the blink
-+  // cookie-set VALUE bytes (tag prefix "cookie-attach", net kind 17).
 +  if (network::afeye::Enabled()) {
 +    static std::atomic<uint64_t> g_afeye_catt{0};
 +    static bool g_afeye_catt_off = []() {
@@ -61,20 +51,13 @@ index 1720130..9f15fff 100644
      std::vector<mojom::CookieOrLineWithAccessResultPtr> reported_cookies;
      for (const auto& cookie_with_access_result :
 diff --git a/v8/src/api/api.cc b/v8/src/api/api.cc
-index 31c6251..9f13535 100644
+index 31c6251..8c7ecf8 100644
 --- a/v8/src/api/api.cc
 +++ b/v8/src/api/api.cc
-@@ -10378,6 +10378,38 @@ Isolate* Isolate::New(const IsolateGroup& group,
+@@ -10378,6 +10378,21 @@ Isolate* Isolate::New(const IsolateGroup& group,
                    static_cast<void*>(v8_isolate));
      v8::afeye::EmitStr(v8::afeye::kIsolateBirth, v8::afeye::NowNs(),
                         afeye_buf);
-+    // v12.2: full execution coverage. Every function that is compiled -
-+    // bytecode, baseline, turbofan, wasm - crosses the JIT code-event
-+    // listener. The lazy-compile hook (0022) only saw a function's FIRST
-+    // run; tier-up and recompile were invisible. The handler is sink-only
-+    // (the event is a plain C struct; no v8 API calls, no handles - safe
-+    // on the logger thread). One install per process; 4M cap;
-+    // AFEYE_TRACE_EXEC=0 off.
 +    static std::atomic<bool> afeye_exec_installed{false};
 +    if (!afeye_exec_installed.exchange(true)) {
 +      static const bool afeye_exec_off = []() {
@@ -87,16 +70,6 @@ index 31c6251..9f13535 100644
 +            [](const v8::JitCodeEvent* event) {
 +              if (event == nullptr) return;
 +              if (event->type != v8::JitCodeEvent::CODE_ADDED) return;
-+              // v12.4 (N2): NO EMIT here. The v12.3 log.cc hook
-+              // (LogRecordedBuffer) is the record source - it runs where
-+              // the Tagged<> objects live and emits the full
-+              // 'exec <t> <fn> script=<name>:<line> len=N' record. This
-+              // handler firing too meant TWO kind-34 records per compile
-+              // in two formats with no dedup field. What stays: the
-+              // registration itself (belt - keeps the logger path warm
-+              // for isolates whose compile never crosses LogRecordedBuffer)
-+              // and the counter shared with the log.cc hook so the 4M
-+              // cap stays ONE budget across both.
 +            });
 +      }
 +    }
@@ -104,7 +77,7 @@ index 31c6251..9f13535 100644
  #endif
    return v8_isolate;
 diff --git a/v8/src/logging/log.cc b/v8/src/logging/log.cc
-index 773c24f..bbb2930 100644
+index 773c24f..a4353c2 100644
 --- a/v8/src/logging/log.cc
 +++ b/v8/src/logging/log.cc
 @@ -4,6 +4,14 @@
@@ -122,18 +95,11 @@ index 773c24f..bbb2930 100644
  #include <stdint.h>
  
  #include <atomic>
-@@ -878,6 +886,78 @@ void JitLogger::LogRecordedBuffer(
+@@ -878,6 +886,58 @@ void JitLogger::LogRecordedBuffer(
    event.name.str = name;
    event.name.len = length;
    event.isolate = reinterpret_cast<v8::Isolate*>(isolate_);
 +#ifdef V8_AFEYE
-+  // v12.3: the REAL execution-coverage funnel. The 0025 api.cc handler
-+  // only carried the function NAME - no script, no chain join. This is
-+  // where the Tagged<> objects live: the same no-alloc read as 0003
-+  // (GetFlatContent under the DisallowGC this function already holds,
-+  // stack scratch, EmitStr). Every compile - bytecode, baseline,
-+  // turbofan - crosses here with its SFI: 'exec <type> <fn>
-+  // script=<name>:<line> len=N'. 4M cap, AFEYE_TRACE_EXEC=0 off.
 +  if (v8::afeye::Enabled()) {
 +    static bool g_afeye_exec_off = []() {
 +      const char* v = ::getenv("AFEYE_TRACE_EXEC");
@@ -153,19 +119,6 @@ index 773c24f..bbb2930 100644
 +      char afeye_script[112];
 +      int afeye_line = 0;
 +      afeye_script[0] = 0;
-+      // v12.4 (N1): JitLogger can be invoked from BACKGROUND compile
-+      // threads (wasm tier-up). Raw Tagged<> heap reads without a
-+      // safepoint chase a moving GC into stale pointers - silently
-+      // corrupt names, worst case a crash inside the cage. The extern
-+      // name/length above are plain C data (safe anywhere); the
-+      // script/line enrichment below reads the HEAP and is only valid
-+      // when this thread is the isolate's main thread. Everyone else
-+      // gets the name-only record - honest, not garbage.
-+      // v12.5: IsMainThread(0) does not exist at this rev (v12.4 hand-edit
-+      // invented it; CI run 35713685114 died at log.cc:924). The stock idiom
-+      // is THIS FILE'S OWN line 1332: ThreadId::Current() ==
-+      // isolate->thread_id() - same namespace (v8::internal), isolate.h
-+      // already included here. Null check short-circuits the member call.
 +      bool afeye_main =
 +          isolate_ != nullptr && ThreadId::Current() == isolate_->thread_id();
 +      if (afeye_main && maybe_shared.ToHandle(&shared) &&
@@ -202,19 +155,14 @@ index 773c24f..bbb2930 100644
  }
  
 diff --git a/v8/src/objects/js-objects.cc b/v8/src/objects/js-objects.cc
-index 144dac6..90c50df 100644
+index 6a65510..2cedfe0 100644
 --- a/v8/src/objects/js-objects.cc
 +++ b/v8/src/objects/js-objects.cc
-@@ -1991,6 +1991,48 @@ Maybe<bool> JSReceiver::GetOwnPropertyDescriptor(LookupIterator* it,
+@@ -1991,6 +1991,43 @@ Maybe<bool> JSReceiver::GetOwnPropertyDescriptor(LookupIterator* it,
    Isolate* isolate = it->isolate();
    // "Virtual" dispatch.
    if (it->IsFound() && IsJSProxy(*it->GetHolder<JSReceiver>())) {
 +#ifdef V8_AFEYE
-+    // v12.2: the proxy branch returned into JSProxy::GOPD BEFORE the 0022
-+    // end-hook - descriptor tamper-checks over PROXIES (antifraud wraps
-+    // navigator in a proxy, then GOPDs it to detect the wrap) were
-+    // invisible. Emit the probe fact here; the 0022 end-hook still covers
-+    // non-proxy special receivers. Shares the AFEYE_TRACE_GOPD gate.
 +    if (v8::afeye::Enabled()) {
 +      static std::atomic<uint64_t> g_afeye_gopd_proxy{0};
 +      static bool g_afeye_gopd_off = []() {

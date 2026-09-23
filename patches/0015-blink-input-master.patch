@@ -1,3 +1,5 @@
+diff --git a/third_party/blink/renderer/core/input/widget_event_handler.cc b/third_party/blink/renderer/core/input/widget_event_handler.cc
+index 9fcfd9f..189d13e 100644
 --- a/third_party/blink/renderer/core/input/widget_event_handler.cc
 +++ b/third_party/blink/renderer/core/input/widget_event_handler.cc
 @@ -4,6 +4,19 @@
@@ -20,26 +22,13 @@
  #include "third_party/blink/public/common/input/web_coalesced_input_event.h"
  #include "third_party/blink/renderer/core/accessibility/ax_object_cache.h"
  #include "third_party/blink/renderer/core/dom/document.h"
-@@ -17,10 +30,106 @@
+@@ -17,10 +30,93 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
 +
-+// afeye (0015): THE physical-input master funnel. Every WebInputEvent that
-+// arrives at this frame passes HandleInputEvent exactly once - mouse, wheel,
-+// keyboard, gesture, pointer (incl. touch/pen). This closes three blind
-+// spots 0009 could not see:
-+//   1. kFromDebugger (1<<23) - the ONLY provenance marker for CDP-injected
-+//      input. isTrusted is TRUE for Playwright/Puppeteer Input.dispatch*
-+//      events (they ride the real browser input pipeline), so the kind-24
-+//      EventDispatcher flag cannot tell automation from human. The bit is
-+//      set in devtools_input_handler.cc and survives the mojo round-trip.
-+//   2. wheel raw deltas - scroll cadence, a first-class human-likeness
-+//      signal, previously invisible.
-+//   3. gesture types - tap/scroll/fling = the REAL mobile click/scroll.
-+// Zero allocation: snprintf into stack scratch, same discipline as 0009.
 +void AfeyeLogRawInput(const WebInputEvent& event) {
 +  static std::atomic<uint64_t> g_afeye_rawin{0};
 +  static bool g_afeye_rawin_off = []() {
@@ -112,7 +101,7 @@
 +                        afeye_buf);
 +}
 +
-+}  // namespace
++}
 +#endif
 +
  WebInputEventResult WidgetEventHandler::HandleInputEvent(

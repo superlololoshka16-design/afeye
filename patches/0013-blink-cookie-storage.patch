@@ -1,6 +1,8 @@
+diff --git a/third_party/blink/renderer/core/dom/document.cc b/third_party/blink/renderer/core/dom/document.cc
+index aeb4b0b..12e7366 100644
 --- a/third_party/blink/renderer/core/dom/document.cc
 +++ b/third_party/blink/renderer/core/dom/document.cc
-@@ -29,6 +29,35 @@
+@@ -29,6 +29,29 @@
  
  #include "third_party/blink/renderer/core/dom/document.h"
  
@@ -13,12 +15,6 @@
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +
 +namespace {
-+// v12.1: AFEYE_TRACE_STORAGE=0 + 2M cap - the series-standard per-stream
-+// gate the sibling funnels have (0012/0015/0016/0024); document.cookie is
-+// read in polling loops by antifraud, so the stream needs a bound.
-+// v12.5: this block MUST sit at file scope - it was inserted inside
-+// Document::cookie()'s body, which clang rejects ("namespaces can only be
-+// defined in global or namespace scope"). Both cookie funnels call it.
 +std::atomic<uint64_t> g_afeye_storage{0};
 +constexpr uint64_t kAfeyeStorageCap = 2ull << 20;
 +inline bool AfeyeStorageOn() {
@@ -30,30 +26,21 @@
 +         g_afeye_storage.fetch_add(1, std::memory_order_relaxed) <
 +             kAfeyeStorageCap;
 +}
-+}  // namespace
++}
 +#endif
 +
  #include <algorithm>
  #include <memory>
  #include <optional>
-@@ -6844,7 +6873,31 @@ String Document::cookie(ExceptionState& exception_state) const {
+@@ -6844,7 +6867,22 @@ String Document::cookie(ExceptionState& exception_state) const {
      CountUse(WebFeature::kFileAccessedCookies);
    }
  
 -  return cookie_jar_->Cookies();
 +  String afeye_cookies = cookie_jar_->Cookies();
 +#ifdef BLINK_AFEYE
-+  // afeye (0013): document.cookie READ. kind-29 logs the call by name; this
-+  // captures the VALUE - the cookie jar the challenge token (cf_clearance,
-+  // DataDome, Kasada) lives in. Capped to the head of the string (the token
-+  // names+values are what matter, not a multi-KB analytics tail).
 +  if (blink::afeye::Enabled() && AfeyeStorageOn() &&
 +      !afeye_cookies.empty()) {
-+    // v12.1: EmitSpan tag\0value (was EmitStr prose) - the NUL split is
-+    // what admits the VALUE bytes into the Rust content graph (VALUE_TAGS
-+    // matches the tag prefix; prose records were skipped entirely, so the
-+    // advertised store-then-send cookie relay never existed). Metadata
-+    // (len=) rides in the tag; the body IS the value head.
 +    char afeye_tag[64];
 +    std::snprintf(afeye_tag, sizeof(afeye_tag), "cookie-get len=%u",
 +                  afeye_cookies.length());
@@ -69,13 +56,11 @@
  }
  
  void Document::setCookie(const String& value, ExceptionState& exception_state) {
-@@ -6869,6 +6922,22 @@ void Document::setCookie(const String& value, ExceptionState& exception_state) {
+@@ -6869,6 +6907,20 @@ void Document::setCookie(const String& value, ExceptionState& exception_state) {
      UseCounter::Count(*this, WebFeature::kFileAccessedCookies);
    }
  
 +#ifdef BLINK_AFEYE
-+  // afeye (0013): document.cookie WRITE - the set-cookie the page itself
-+  // plants (challenge ack, first-party token). Head-capped like the getter.
 +  if (blink::afeye::Enabled() && AfeyeStorageOn() &&
 +      !value.empty()) {
 +    char afeye_tag[64];
@@ -92,9 +77,11 @@
    if (cookie_jar_->SetCookie(value)) {
      IncrementCookieModificationCount();
    }
+diff --git a/third_party/blink/renderer/modules/storage/storage_area.cc b/third_party/blink/renderer/modules/storage/storage_area.cc
+index 131a62a..ed849bc 100644
 --- a/third_party/blink/renderer/modules/storage/storage_area.cc
 +++ b/third_party/blink/renderer/modules/storage/storage_area.cc
-@@ -25,6 +25,33 @@
+@@ -25,6 +25,29 @@
  
  #include "third_party/blink/renderer/modules/storage/storage_area.h"
  
@@ -107,10 +94,6 @@
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +
 +namespace {
-+// v12.5: file-scope helper - it was inserted inside StorageArea::getItem's
-+// body, which clang rejects ("namespaces can only be defined in global or
-+// namespace scope"). Both storage funnels call it. Same gate + cap as the
-+// document.cc twin (AFEYE_TRACE_STORAGE=0 off, 2M records).
 +std::atomic<uint64_t> g_afeye_storage{0};
 +constexpr uint64_t kAfeyeStorageCap = 2ull << 20;
 +inline bool AfeyeStorageOn() {
@@ -122,23 +105,19 @@
 +         g_afeye_storage.fetch_add(1, std::memory_order_relaxed) <
 +             kAfeyeStorageCap;
 +}
-+}  // namespace
++}
 +#endif
 +
  #include "base/feature_list.h"
  #include "base/memory/scoped_refptr.h"
  #include "base/trace_event/trace_event.h"
-@@ -116,7 +143,26 @@ String StorageArea::getItem(const String& key,
+@@ -116,7 +139,22 @@ String StorageArea::getItem(const String& key,
      exception_state.ThrowSecurityError(StorageArea::kAccessDeniedMessage);
      return String();
    }
 -  return cached_area_->GetItem(key);
 +  String afeye_item = cached_area_->GetItem(key);
 +#ifdef BLINK_AFEYE
-+  // afeye (0013): localStorage/sessionStorage getItem VALUE - antifraud parks
-+  // the base fingerprint, the eval-chunk closure, or the challenge token here
-+  // at init and reads it back at send time (the store-then-send pattern the
-+  // fixed net-window drops). kind-29 names the call; this captures key+value.
 +  if (blink::afeye::Enabled() && AfeyeStorageOn() && !key.empty()) {
 +    char afeye_tag[192];
 +    std::snprintf(afeye_tag, sizeof(afeye_tag),
@@ -156,15 +135,11 @@
  }
  
  NamedPropertySetterResult StorageArea::setItem(
-@@ -127,6 +173,24 @@ NamedPropertySetterResult StorageArea::setItem(
+@@ -127,6 +165,20 @@ NamedPropertySetterResult StorageArea::setItem(
      exception_state.ThrowSecurityError(StorageArea::kAccessDeniedMessage);
      return NamedPropertySetterResult::kIntercepted;
    }
 +#ifdef BLINK_AFEYE
-+  // afeye (0013): localStorage/sessionStorage setItem VALUE - the store half
-+  // of store-then-send. Captures key + value head so the content-slice
-+  // backward pass can link this stored blob to the later crypto/send that
-+  // consumed it.
 +  if (blink::afeye::Enabled() && AfeyeStorageOn() && !key.empty()) {
 +    char afeye_tag[192];
 +    std::snprintf(afeye_tag, sizeof(afeye_tag),

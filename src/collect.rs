@@ -1,18 +1,3 @@
-//! afeye collector v2.
-//!
-//! The C++ sinks (V8 / Blink / network-service) append length-prefixed records
-//! to per-process files under /tmp/afeye-raw: `<layer>-<pid>.rec`.
-//! Record framing (little endian):
-//!   u32 total | u8 kind | u8 flags | u16 rsvd | u64 ts_ns | payload[total-16]
-//! `total` counts the whole record including the 16-byte header.
-//! ts_ns is CLOCK_MONOTONIC on the host: identical across every sink process,
-//! so the three streams can be merged into one exact diff-able timeline.
-//!
-//! This module tails those files and materializes, under `<stage>/collect/`:
-//!   raw/<layer>-<kind>-<seq>.bin   full payload bytes, nothing dropped
-//!   index.jsonl                    one line per record (ts/layer/kind/flags/
-//!                                  len/blake3/path/text preview)
-//!   stats.json                     running counters, rewritten every scan
 
 use crate::events::J;
 use std::collections::{BTreeMap, HashMap};
@@ -50,32 +35,13 @@ const KINDS: [&str; 40] = [
     "websocket",
     "client-hints",
     "sw-cache",
-    // kind 22: reserved. v4 emitted blink-hand-off script sources here (the
-    // 0007 duplicate); v5+ captures every script exactly once at the three
-    // v8 compile funnels (eval / streamed / buffered - patches/0002), so this
-    // slot stays wire-compatible but silent.
     "script-source",
-    // kinds 23-28 (v4): input / event dispatch / dom+canvas metrics /
-    // offline audio render / webrtc sdp-ice / renderer-side fetch origin.
-    // v5 note: kind 23 (pre-dispatch input) is silent too - the single
-    // EventDispatcher funnel already carries coords/keys/isTrusted.
     "input",
     "event-dispatch",
     "dom-metric",
     "audio",
     "webrtc",
     "fetch",
-    // v6 additions (the deep layers of the same wire format):
-    // 29 dom-api     - every WebIDL attribute get/set + method call from JS
-    //                  ("dom Navigator.get userAgent"), via the
-    //                  idl_member_installer callback wrap (0008)
-    // 30 microtask   - drain start/end brackets with ran-count (0004)
-    // 31 wasm-instance - imports as RESOLVED at instantiation (0003)
-    // 32 fn-tostring - Function.prototype.toString receiver identity (0004)
-    // 33 clock       - Date.now() reads (0004)
-    // 34 isolate     - v8 isolate birth record (0003)
-    // 35 worker      - worker/worklet global scope creation (0010)
-    // 36 nav-start   - navigation T0 in the sink clock domain (0010)
     "dom-api",
     "microtask",
     "wasm-instance",
@@ -84,27 +50,11 @@ const KINDS: [&str; 40] = [
     "isolate",
     "worker",
     "nav-start",
-    // 37 taint-edge  - plaintext string->bytes boundary carriers (0016):
-    // TextEncoder/TextDecoder, atob/btoa, FormData entries, URLSearchParams.
-    // The backward-slice graph edges: these bytes content-match the crypto
-    // raw_data / req-body sinks they eventually fed.
     "taint-edge",
-    // 38 error-stack - Error().stack / captureStackTrace materialization
-    // (0022): the automation-detection surface and the only cheap JS->JS
-    // call-edge source in the engine.
     "error-stack",
-    // 39 sink-drop - the sink ring's own overflow counter, emitted by each
-    // layer's drain thread directly to the fd (0023). The witness that lets
-    // the filter distinguish "this branch fed nothing" from "this branch's
-    // records were dropped" - without it `unresolved` would be a guess.
     "sink-drop",
 ];
 
-/// High-frequency small-record kinds are BATCHED: their payloads append to
-/// per-(layer,kind) part files (~8 MiB, rolled) instead of one file per
-/// record. The 10k-one-kilo-file problem dies here at the materialization
-/// layer; the index carries (part, offset, len) for every record and nothing
-/// is dropped or decided - batching is storage packing, not filtering.
 const BATCHED_KINDS: [&str; 7] = [
     "dom-api",
     "call-completed",
@@ -116,7 +66,6 @@ const BATCHED_KINDS: [&str; 7] = [
 ];
 const PART_ROLL_BYTES: u64 = 8 << 20;
 
-/// Highest valid kind byte the collector will accept in a record header.
 const MAX_KIND: u8 = (KINDS.len() - 1) as u8;
 
 fn kind_name(kind: u8) -> &'static str {
@@ -156,11 +105,8 @@ pub struct ScanState {
     parts: HashMap<String, PartWriter>,
 }
 
-/// Append-only part stream for a batched (layer, kind). Records of
-/// high-frequency kinds land here; the index lines carry (p, o, len).
 struct PartWriter {
     file: std::fs::File,
-    /// part path relative to the collect dir ("raw/<layer>-<kind>-pNN.bin")
     rel: String,
     seq: u32,
     written: u64,
@@ -177,8 +123,6 @@ impl ScanState {
 }
 
 impl PartWriter {
-    /// Append `payload`, rolling to a fresh part when the current one is
-    /// past the roll size. Returns (rel_path, offset).
     fn push(&mut self, raw_out: &Path, layer: &str, kname: &str, payload: &[u8]) -> Option<(String, u64)> {
         if self.written >= PART_ROLL_BYTES {
             self.seq += 1;
@@ -190,18 +134,11 @@ impl PartWriter {
                     self.rel = rel;
                     self.written = 0;
                 }
-                // v12.1: a failed roll-open previously returned a FABRICATED
-                // (rel, off) - the index pointed at bytes that never landed
-                // and read_payload() silently vanished the record. Keep
-                // appending to the current part instead: honest, and the
-                // record stays materialized.
                 Err(_) => {}
             }
         }
         let off = self.written;
         if self.file.write_all(payload).is_err() {
-            // write failure: do NOT index the record (an index line would
-            // reference bytes that were never appended)
             return None;
         }
         self.written += payload.len() as u64;
@@ -254,8 +191,6 @@ fn ensure_raw_dir(raw_dir: &Path) {
     }
 }
 
-/// One full scan of the raw dir. Newly appended bytes of every `<layer>-*.rec`
-/// file are parsed record-by-record and materialized under `out_dir`.
 pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &mut Stats) {
     ensure_raw_dir(raw_dir);
     let raw_dir = match raw_dir.canonicalize().unwrap_or_else(|_| raw_dir.to_path_buf()) {
@@ -297,8 +232,6 @@ pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &
             .and_then(|s| s.to_str())
             .and_then(layer_of)
             .unwrap_or("");
-        // pid from the `<layer>-<pid>.rec` stem - the sink filter groups
-        // script chains per process ("one isolate/session = one stream").
         let pid: u64 = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -337,9 +270,6 @@ pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &
         let total_at = |p: usize| -> u32 {
             u32::from_le_bytes([partial[p], partial[p + 1], partial[p + 2], partial[p + 3]])
         };
-        // A position is a plausible record start when the full header is
-        // present, the length is sane, the kind fits the table, the flags
-        // byte only uses bit0 and the reserved halfword is zero.
         let plausible_at = |p: usize| -> bool {
             if p + 16 > len {
                 return false;
@@ -371,9 +301,6 @@ pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &
                 continue;
             }
             if consumed + total > len {
-                // Starved: either a record mid-write (wait) or corruption
-                // with an in-range length (resync only when a complete
-                // plausible record exists further ahead).
                 let mut next = false;
                 let mut p = consumed + 1;
                 while p + 16 <= len {
@@ -433,13 +360,7 @@ pub fn scan_once(raw_dir: &Path, out_dir: &Path, state: &mut ScanState, stats: &
             j.key("h");
             j.s(&h16);
             if BATCHED_KINDS.contains(&kname) && !payload.is_empty() {
-                // batched kinds: append to the (layer,kind) part stream and
-                // reference (part, offset). Storage packing only - the
-                // filter unpacks by (p, o, len) and nothing is lost.
                 if let Some(pw) = part_writer(&raw_out, &mut state.parts, layer, kname) {
-                    // v12.1: a None here means the payload did not land -
-                    // no index line for it (the record is dropped loudly by
-                    // its absence, not silently by a lying pointer).
                     if let Some((rel, off)) = pw.push(&raw_out, layer, kname, payload) {
                         j.key("p");
                         j.s(&rel);
@@ -535,9 +456,6 @@ impl Collector {
         }
     }
 
-    /// sink-hello records seen so far, summed over the three layers.
-    /// Proof whether the running chrome actually contains afeye sinks:
-    /// a stock build writes nothing to the raw dir, ever.
     pub fn hellos(&self) -> u64 {
         self.stats
             .lock()
@@ -550,8 +468,6 @@ impl Collector {
             .unwrap_or(0)
     }
 
-    /// Shared read-only probe usable from another thread before `stop()`.
-    /// Returns a closure reading the live sink-hello count.
     pub fn hellos_handle(&self) -> impl Fn() -> u64 + Send + 'static {
         let stats = self.stats.clone();
         move || {
@@ -567,7 +483,6 @@ impl Collector {
         }
     }
 
-    /// Stop the scan thread, run one final drain scan, return final stats.
     pub fn stop(mut self) -> Stats {
         self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
@@ -585,8 +500,6 @@ impl Collector {
     }
 }
 
-/// Standalone entry: tail the raw dir until killed (used by the afeye-collect
-/// bin for local probing next to a patched browser).
 pub fn run_standalone(raw_dir: &Path, out_dir: &Path) {
     let mut state = ScanState::new();
     let mut stats = Stats::default();
@@ -627,7 +540,6 @@ mod tests {
         f.write_all(&rec(1, 0, 111, b"var a=1;")).unwrap();
         f.write_all(&rec(3, 1, 222, &[9u8; 32])).unwrap();
         f.write_all(&rec(0, 0, 55, b"afeye-sink/v8 v2 pid=1")).unwrap();
-        // torn tail: full record is 20 bytes, only the first 12 written
         let full = rec(9, 0, 333, b"abcd");
         f.write_all(&full[..12]).unwrap();
         drop(f);
@@ -652,7 +564,6 @@ mod tests {
         assert_eq!(bin, vec![9u8; 32]);
         assert_eq!(fs::read(out.join("raw/v8-script-source-000001.bin")).unwrap(), b"var a=1;");
 
-        // append the missing 8 bytes -> torn record completes on next scan
         let mut f = OpenOptions::new().append(true).open(raw.join("v8-4242.rec")).unwrap();
         f.write_all(&full[12..]).unwrap();
         drop(f);

@@ -1,9 +1,9 @@
 diff --git a/v8/src/afeye/causality.cc b/v8/src/afeye/causality.cc
 new file mode 100644
-index 0000000..fafc6f0
+index 0000000..8cb6931
 --- /dev/null
 +++ b/v8/src/afeye/causality.cc
-@@ -0,0 +1,458 @@
+@@ -0,0 +1,299 @@
 +#include "src/afeye/causality.h"
 +
 +#ifdef V8_AFEYE
@@ -18,60 +18,9 @@ index 0000000..fafc6f0
 +namespace v8 {
 +namespace afeye {
 +
-+// ---------------------------------------------------------------------------
-+// the trace_id registry.
-+//
-+// THREE bounded structures, all no-alloc on the hot path:
-+//
-+//  1. the ambient id + scope stack: thread_local. A MicrotaskQueue belongs to
-+//     one Isolate and is drained on one thread, so "the id active right now"
-+//     is a per-thread property. Fixed array (not std::vector) because the
-+//     enter/exit pair runs inside the drain loop for EVERY microtask - a
-+//     malloc per turn is not acceptable in a tracing build whose whole value
-+//     is that it stays close enough to real timing to be believed.
-+//
-+//  2. the enqueue->run side-table: one process-wide open-addressing table
-+//     mapping tagged Microtask address -> minted child id. Bounded linear
-+//     probe over atomic slots, drop-counted overflow, so no rehash stall, no
-+//     iterator invalidation and no malloc. EVERY probe runs under one short
-+//     spinlock (see TaskLock below): FindTaskSlot has exactly two callers,
-+//     StoreTaskTid and TakeTaskTid, both of which take it first, so there is
-+//     no unlocked reader path to reason about. Serialising insert/take is what
-+//     makes the tombstone protocol sound - a lock-free `take` tombstoning a
-+//     slot can otherwise clobber an insert that just reclaimed it, losing an
-+//     async edge (found by stress test, see TaskLock). Unlike taint.cc this
-+//     table is NOT cleared at GC: keys are consumed exactly once by the run
-+//     side, and an unconsumed key is overwritten when its address is recycled,
-+//     so the table self-limits.
-+//
-+//  3. the monotonic id counter: one process-wide atomic. Never 0.
-+//
-+// Why a side-table keyed by the Microtask address and not a field on the
-+// Microtask object: every Microtask variant (CallableTask, CallbackTask,
-+// PromiseFulfillReactionJobTask, PromiseRejectReactionJobTask,
-+// PromiseResolveThenableJobTask, AsyncResumeTask) is a Torque-generated struct
-+// whose layout is fixed by src/objects/microtask.tq and whose exact size is
-+// relied on by the in-place MORPH of a PromiseReaction into a
-+// PromiseReactionJobTask (see the comment at src/objects/promise.h:155-161 -
-+// "the size of PromiseReaction and the size of the PromiseReactionJobTask has
-+// to be same for this to work"). Adding a field would break that invariant and
-+// every offset constant derived from it. Keying by address keeps the object
-+// layout untouched.
-+//
-+// Address-recycling soundness: a tagged address can be reused by a LATER
-+// microtask after GC. That is handled by insert-or-OVERWRITE - two distinct
-+// live microtasks can never share an address, so a key collision always means
-+// the same object being re-captured, and the newer id is the correct one. A
-+// dangling entry (enqueued, then the queue was cleared via ClearMicrotasks or
-+// the Isolate died, so no run ever consumed it) can only be matched by an
-+// address that was subsequently re-captured - which overwrites it first. The
-+// run side REMOVES the entry, so consumed ids never linger.
-+// ---------------------------------------------------------------------------
 +
 +namespace {
 +
-+// env gate: AFEYE_CAUSALITY=0 disables the causality layer entirely (the
-+// boundary sieve and the DTT shadow store keep working). Read once, cached.
 +bool CausalityEnvOn() {
 +  static const bool off = []() {
 +    const char* v = ::getenv("AFEYE_CAUSALITY");
@@ -82,16 +31,10 @@ index 0000000..fafc6f0
 +
 +std::atomic<uint64_t> g_next_id{0};
 +
-+// --- the enqueue -> run side-table -----------------------------------------
 +
-+constexpr size_t kTaskSlots = 1u << 16;   // 64K x 16 B = 1 MB
++constexpr size_t kTaskSlots = 1u << 16;
 +constexpr uint64_t kTaskKeyMask = kTaskSlots - 1;
-+// 0 = empty. A tagged Microtask pointer is never 0 (it is a live heap object),
-+// so 0 is a safe empty marker and is never stored.
 +constexpr uint64_t kTaskKeyEmpty = 0;
-+// Tombstone: consumed entry. Never blocks a lookup (lookups stop only at an
-+// empty slot) and is reused by the next insert, so tombstones cannot
-+// accumulate into a full table.
 +constexpr uint64_t kTaskKeyDead = ~0ull;
 +
 +struct TaskSlot {
@@ -101,16 +44,6 @@ index 0000000..fafc6f0
 +
 +TaskSlot g_tasks[kTaskSlots];
 +
-+// One spinlock over the whole side-table, using the SAME bounded idiom
-+// sink.cc already applies to its ring (sink.cc EmitFlags: test_and_set, 64
-+// spins then std::this_thread::yield). Lock-free open addressing here is
-+// technically achievable but needs a tombstone protocol correct against
-+// concurrent reclaim; a stress test found interleavings where a `take`
-+// tombstoning a slot could lose a concurrent insert's id. Capture
-+// completeness is the entire value of this patch - a silently lost async edge
-+// is worse than a few nanoseconds of contention - so the table takes the lock.
-+// Scope is tiny (one probe + one store), never held across an emit, and the
-+// drain is single-threaded per isolate so real contention is rare.
 +std::atomic_flag g_task_lock = ATOMIC_FLAG_INIT;
 +
 +class TaskLock {
@@ -134,8 +67,6 @@ index 0000000..fafc6f0
 +std::atomic<uint64_t> g_misses{0};
 +std::atomic<uint64_t> g_minted{0};
 +
-+// FNV-1a over the 8-byte key. Same hash shape as taint.cc so the two tables
-+// spread the same kind of structured (cage-offset-derived) keys alike.
 +inline uint64_t HashTaskKey(uint64_t k) {
 +  uint64_t h = 1469598103934665603ull;
 +  for (int i = 0; i < 8; ++i) {
@@ -145,10 +76,6 @@ index 0000000..fafc6f0
 +  return h & kTaskKeyMask;
 +}
 +
-+// Bounded probe. Returns the slot holding {key}, or (for insert) the first
-+// reusable slot (empty or tombstone), or nullptr if the probe budget is spent.
-+// The budget is a fixed fraction of the table so a pathological cluster cannot
-+// spin the enqueue path.
 +inline TaskSlot* FindTaskSlot(uint64_t key, bool for_insert) {
 +  uint64_t idx = HashTaskKey(key);
 +  TaskSlot* reusable = nullptr;
@@ -158,10 +85,6 @@ index 0000000..fafc6f0
 +    uint64_t k = s->key.load(std::memory_order_acquire);
 +    if (k == key) return s;
 +    if (k == kTaskKeyEmpty) {
-+      // An empty slot terminates the probe for BOTH modes. On insert, prefer a
-+      // tombstone seen earlier (it reuses a consumed slot and keeps the chain
-+      // shorter) and fall back to this empty slot - returning nullptr here
-+      // would fail every first insert into a virgin table.
 +      if (!for_insert) return nullptr;
 +      return reusable != nullptr ? reusable : s;
 +    }
@@ -171,15 +94,6 @@ index 0000000..fafc6f0
 +  return nullptr;
 +}
 +
-+// Insert-or-overwrite. Returns false if the entry could not be stored (probe
-+// budget spent) - the caller counts the drop.
-+//
-+// Under TaskLock the whole probe+store is atomic against every other accessor,
-+// so a plain find-then-write is correct and no CAS retry dance is needed. An
-+// existing entry for {key} is OVERWRITTEN, which is the sound choice for a
-+// recycled tagged address: two distinct live Microtask objects can never share
-+// an address, so a key already present means the same object was re-captured
-+// and the newer id is the one the run side must see.
 +bool StoreTaskTid(uint64_t key, uint64_t tid) {
 +  TaskLock lock;
 +  TaskSlot* s = FindTaskSlot(key, true);
@@ -189,47 +103,25 @@ index 0000000..fafc6f0
 +  return true;
 +}
 +
-+// Take (read + REMOVE) the id stored for {key}. Returns 0 if absent.
 +uint64_t TakeTaskTid(uint64_t key) {
 +  TaskLock lock;
 +  TaskSlot* s = FindTaskSlot(key, false);
 +  if (s == nullptr) return 0;
 +  uint64_t tid = s->tid.load(std::memory_order_relaxed);
-+  // Tombstone the key so a recycled address is never matched to an already
-+  // consumed id, and so the slot becomes reusable by the next insert. This
-+  // store is exactly what a concurrent insert could be clobbered by if the
-+  // table were lock-free - hence the lock above.
 +  s->tid.store(0, std::memory_order_relaxed);
 +  s->key.store(kTaskKeyDead, std::memory_order_relaxed);
 +  return tid;
 +}
 +
-+// --- the ambient id + scope stack ------------------------------------------
 +
-+// Nesting bound. Reaching it means one async turn's body recursively started
-+// 256 more drains (each drain nests via
-+// Runtime_PerformMicrotaskCheckpoint); anything past that is counted as an
-+// imbalance and the turn runs with the OUTER id still ambient, which is the
-+// conservative, never-invents-an-edge behaviour.
 +constexpr size_t kScopeCap = 256;
 +
 +thread_local uint64_t g_ambient = 0;
 +thread_local uint64_t g_scope[kScopeCap];
 +thread_local size_t g_depth = 0;
-+// Outstanding enters that could NOT be installed because the scope stack was
-+// full. Under the LIFO discipline the skipped enters are always the innermost
-+// ones, so a single counter pairs them correctly with their exits.
 +thread_local size_t g_skipped = 0;
 +
-+// One line shape for every causality record:
-+//   "causality <what> tid=<hex> parent=<hex>"
-+// {what} carries the label plus any extra `k=v` fields verbatim, so a record
-+// is never split and the Rust side parses one prefix.
 +void EmitCausality(const char* what, uint64_t tid, uint64_t parent) {
-+  // 256 not 192: the `witness` record carries four u64 counters, which alone
-+  // can reach ~134 chars before the tid=/parent= suffix. snprintf would
-+  // truncate safely rather than overflow, but truncation would silently drop
-+  // the trailing counter - exactly the field a drop report most needs.
 +  char buf[256];
 +  std::snprintf(buf, sizeof(buf), "causality %s tid=%llx parent=%llx", what,
 +                static_cast<unsigned long long>(tid),
@@ -237,11 +129,6 @@ index 0000000..fafc6f0
 +  EmitStr(kFingerprint, NowNs(), buf);
 +}
 +
-+// Last-emitted snapshot of the witness counters, so emission is
-+// change-detected. Process-wide (the counters are), guarded by a flag swap so
-+// only one racing drain emits per change - the rest see the value already
-+// recorded and stay silent. Never on the per-task hot path: called only at
-+// drain scope exit.
 +std::atomic<uint64_t> g_wit_dropped{0};
 +std::atomic<uint64_t> g_wit_imbalance{0};
 +std::atomic<uint64_t> g_wit_misses{0};
@@ -257,7 +144,7 @@ index 0000000..fafc6f0
 +      imbalance == g_wit_imbalance.load(std::memory_order_relaxed) &&
 +      misses == g_wit_misses.load(std::memory_order_relaxed) &&
 +      minted == g_wit_minted.load(std::memory_order_relaxed)) {
-+    return;  // nothing new to say: a healthy drain emits no witness record
++    return;
 +  }
 +  g_wit_dropped.store(dropped, std::memory_order_relaxed);
 +  g_wit_imbalance.store(imbalance, std::memory_order_relaxed);
@@ -270,13 +157,10 @@ index 0000000..fafc6f0
 +                static_cast<unsigned long long>(imbalance),
 +                static_cast<unsigned long long>(misses),
 +                static_cast<unsigned long long>(minted));
-+  // tid is 0 by design: a witness record describes the whole process, not one
-+  // turn, and attributing it to whatever id happened to be ambient would
-+  // suggest a causal link that does not exist.
 +  EmitCausality(what, 0, 0);
 +}
 +
-+}  // namespace
++}
 +
 +bool CausalityEnabled() { return Enabled() && CausalityEnvOn(); }
 +
@@ -291,8 +175,6 @@ index 0000000..fafc6f0
 +}
 +
 +uint64_t CausalityNewRoot() {
-+  // Monotonic, never 0: a root is always distinguishable from an uncaptured
-+  // turn (which reads as 0).
 +  uint64_t id = g_next_id.fetch_add(1, std::memory_order_relaxed) + 1;
 +  g_minted.fetch_add(1, std::memory_order_relaxed);
 +  return id;
@@ -320,14 +202,9 @@ index 0000000..fafc6f0
 +
 +void CausalityCaptureEnqueue(uint64_t task_key) {
 +  if (!CausalityEnabled() || task_key == kTaskKeyEmpty) return;
-+  // The enqueuer's ambient id is the PARENT of this async turn. A turn
-+  // scheduled outside any trace (parent 0) becomes a fresh root, so an
-+  // uncaptured caller never silently adopts a neighbouring turn's id.
 +  uint64_t parent = g_ambient;
 +  uint64_t child = CausalityNewChild(parent);
 +  if (!StoreTaskTid(task_key, child)) {
-+    // Side-table full: the turn will run with no captured id. Counted, and the
-+    // run side reports the miss - a lost capture is witnessed, never guessed.
 +    g_dropped.fetch_add(1, std::memory_order_relaxed);
 +    return;
 +  }
@@ -345,8 +222,6 @@ index 0000000..fafc6f0
 +    return 0;
 +  }
 +  uint64_t tid = task_key == kTaskKeyEmpty ? 0 : TakeTaskTid(task_key);
-+  // Push the outgoing id even on a miss, so the exit always restores the true
-+  // previous ambient - a miss must not leak this turn's (absent) id outward.
 +  g_scope[g_depth++] = g_ambient;
 +  if (tid == 0) {
 +    g_misses.fetch_add(1, std::memory_order_relaxed);
@@ -370,37 +245,22 @@ index 0000000..fafc6f0
 +  std::snprintf(what, sizeof(what), "exit task=%llx",
 +                static_cast<unsigned long long>(task_key));
 +  if (g_skipped > 0) {
-+    // Pairs with an enter that could NOT be installed (scope stack at
-+    // kScopeCap): nothing was pushed, so nothing is restored. The counter alone
-+    // is enough to pair them because, under the LIFO discipline, the skipped
-+    // enters are always the innermost ones - their matching exits are the first
-+    // to arrive back out.
 +    --g_skipped;
 +    EmitCausality(what, g_ambient, g_ambient);
 +    return;
 +  }
 +  if (g_depth == 0) {
-+    // An exit with no matching enter: a termination exception unwound past the
-+    // enter hook, or a hook site fired out of order. Witnessed, and the ambient
-+    // id is left alone rather than "restored" from an invented frame.
 +    g_imbalance.fetch_add(1, std::memory_order_relaxed);
 +    EmitCausality("exit-unbalanced", g_ambient, 0);
 +    return;
 +  }
 +  uint64_t prev = g_scope[--g_depth];
-+  // The record names the finishing id and the id being restored, so the Rust
-+  // side can close the turn even if the matching `run` record was dropped.
 +  EmitCausality(what, g_ambient, prev);
 +  g_ambient = prev;
 +}
 +
 +void CausalityNotePromise(uint64_t promise_key) {
 +  if (!CausalityEnabled() || promise_key == kTaskKeyEmpty) return;
-+  // Promise creation INHERITS the ambient trace rather than starting one: the
-+  // async turns a promise schedules are its causal children, and those get
-+  // their own ids when they are enqueued. Recording the promise's own identity
-+  // against the ambient id is what lets the Rust side attach a `.then` edge to
-+  // the promise object the fingerprint value was resolved into.
 +  char what[112];
 +  std::snprintf(what, sizeof(what), "promise-new promise=%llx",
 +                static_cast<unsigned long long>(promise_key));
@@ -410,24 +270,9 @@ index 0000000..fafc6f0
 +size_t CausalityScopeDepth() { return g_depth; }
 +
 +void CausalityScopeReset(size_t depth) {
-+  // Fold the honest-witness counters onto the wire here, on every drain exit.
-+  // This is the one place that runs for EVERY drain on this thread regardless
-+  // of how the drain ended (both `return`s in RunMicrotasks plus exception
-+  // unwind, via CausalityDrainScope), so it is where the counters can be
-+  // guaranteed to surface rather than stay as dead in-process state. Change-
-+  // detected against the last snapshot, so a healthy build emits nothing and a
-+  // lossy one emits at most once per distinct counter change - bounded, and it
-+  // never adds a record to the hot path when there is nothing to report.
 +  EmitWitnessIfChanged();
 +
-+  // Re-base the stack to {depth} and report anything left above it. A
-+  // termination exception unwinds out of TF_BUILTIN(RunMicrotasks) without
-+  // returning through the exit hook, so this is the guard that keeps a leak
-+  // from poisoning every subsequent turn on the thread.
 +
-+  // Nothing leaked: depth already at/below base and no outstanding skipped
-+  // enters. (g_skipped can be non-zero with g_depth <= depth if the stack
-+  // filled to kScopeCap and then partially unwound - still a leak to report.)
 +  if (g_depth <= depth && g_skipped == 0) return;
 +  uint64_t lost = (g_depth > depth ? g_depth - depth : 0) + g_skipped;
 +  g_imbalance.fetch_add(lost, std::memory_order_relaxed);
@@ -436,13 +281,9 @@ index 0000000..fafc6f0
 +                static_cast<unsigned long long>(lost),
 +                static_cast<unsigned long long>(depth));
 +  EmitCausality(what, g_ambient, depth == 0 ? 0 : g_scope[depth - 1]);
-+  // Clear BOTH counters: skipped enters have no matching frames on the stack,
-+  // so leaving g_skipped non-zero would let a future legitimate exit be eaten.
 +  g_depth = depth;
 +  g_skipped = 0;
 +  g_ambient = depth == 0 ? 0 : g_scope[depth - 1];
-+  // The rebalance itself moved g_imbalance, so surface the new value now
-+  // rather than waiting for the next drain to notice.
 +  EmitWitnessIfChanged();
 +}
 +
@@ -458,16 +299,16 @@ index 0000000..fafc6f0
 +
 +uint64_t CausalityMinted() { return g_minted.load(std::memory_order_relaxed); }
 +
-+}  // namespace afeye
-+}  // namespace v8
++}
++}
 +
-+#endif  // V8_AFEYE
++#endif
 diff --git a/v8/src/afeye/causality.h b/v8/src/afeye/causality.h
 new file mode 100644
-index 0000000..256be1b
+index 0000000..25f1bec
 --- /dev/null
 +++ b/v8/src/afeye/causality.h
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,52 @@
 +#ifndef V8_AFEYE_CAUSALITY_H_
 +#define V8_AFEYE_CAUSALITY_H_
 +
@@ -479,230 +320,66 @@ index 0000000..256be1b
 +namespace v8 {
 +namespace afeye {
 +
-+// afeye async causality graph (0031). The boundary sieve (sink.cc) and the
-+// DTT shadow store (taint.h) both answer "which BYTES moved where"; neither
-+// can answer "which async turn produced them". Correlating a fingerprint read
-+// with the socket write that exfiltrates it by TIME WINDOW is a guess: on a
-+// busy page hundreds of unrelated microtasks interleave inside any window, so
-+// a time-window join both over-attributes (false edges) and under-attributes
-+// (a chain that spans a slow await leaves the window entirely).
-+//
-+// This module carries an explicit 64-bit trace_id ACROSS async boundaries
-+// instead. A trace_id is minted at a causal root and inherited by every async
-+// turn that root schedules, so a record emitted deep inside a
-+// `.then().then().catch()` chain - or inside an `await`ed resume - carries the
-+// SAME id as the code that started the chain. The Rust side rebuilds the async
-+// tree from the emitted `causality link` edges and can then state
-+// "this socket write happened in the same causal turn as that canvas read"
-+// as a PROVEN edge rather than a temporal coincidence.
-+//
-+// Propagation seam actually achieved (all sites verified at rev d1fed5cd7e3b):
-+//   ENQUEUE  every microtask/promise-job schedule passes through exactly one
-+//            of two funnels, both hooked:
-+//              - MicrotaskQueue::EnqueueMicrotask(Tagged<Microtask>)
-+//                (src/execution/microtask-queue.cc:157) - the single C++
-+//                funnel; CallEnqueueMicrotask (:114), all three
-+//                v8::Isolate::EnqueueMicrotask overloads (:123,:132,:145) and
-+//                Runtime_EnqueueMicrotask (src/runtime/runtime-promise.cc:43)
-+//                all route through it.
-+//              - TF_BUILTIN(EnqueueMicrotask) fast path
-+//                (src/builtins/builtins-microtask-queue-gen.cc:773-781), which
-+//                writes the ring buffer directly in CSA and only falls back to
-+//                the C++ funnel when the buffer must GROW (:785). This is the
-+//                path every Torque promise reaction job takes
-+//                (MorphAndEnqueuePromiseReaction, promise-abstract-operations
-+//                .tq:122/:142, and PerformPromiseThenImpl .tq:504).
-+//            At enqueue the ambient id becomes the PARENT; a fresh CHILD id is
-+//            minted for the job, the edge is linked, and the child is stored in
-+//            a side-table keyed by the tagged Microtask address.
-+//   RUN      TF_BUILTIN(RunMicrotasks) drains one task per loop iteration
-+//            (builtins-microtask-queue-gen.cc:881 RunSingleMicrotask). The
-+//            child id is extracted from the side-table and installed as the
-+//            ambient id for the whole job body, then the previous id is
-+//            restored - so everything the body does (promises it creates, jobs
-+//            it enqueues, sinks it writes) attributes to the correct turn.
-+//   PROMISE  PromiseBuiltinsAssembler::AllocateJSPromise
-+//            (src/builtins/builtins-promise-gen.cc:32) is the single JSPromise
-+//            allocation funnel (sole caller promise-misc.tq:64); it records the
-+//            promise object against the ambient id.
-+//
-+// Contract (same as sink.cc / taint.h): no-alloc, bounded, env-gated
-+// (AFEYE_CAUSALITY=0 disables), drop-counted. Emitted through the existing
-+// EmitStr sink as kind-16 fingerprint records, so the wire format is
-+// UNCHANGED and the Rust side needs no new record kind - only a new line
-+// shape under a prefix it already receives.
 +
-+// ---------------------------------------------------------------------------
-+// the trace_id registry (API fixed by the series contract; other patches call
-+// these, so signatures here are append-only)
-+// ---------------------------------------------------------------------------
 +
 +bool CausalityEnabled();
 +
-+// The trace_id active on THIS thread right now. 0 = no active trace.
-+// thread_local by construction: a MicrotaskQueue belongs to one Isolate and is
-+// drained on one thread, so the ambient id is a per-thread property, not a
-+// per-Isolate one (workers each get their own).
 +uint64_t CausalityCurrent();
 +
-+// Install {trace_id} as the ambient id for this thread.
 +void CausalityEnter(uint64_t trace_id);
 +
-+// Restore {prev} as the ambient id. Returns the id that was in effect
-+// immediately before the restore (for the exit record's diagnostics).
 +uint64_t CausalityExitRestore(uint64_t prev);
 +
-+// Mint a fresh ROOT id. Monotonic process-wide atomic counter, never 0
-+// (0 is reserved for "no trace"), so a root is always distinguishable from an
-+// uncaptured turn.
 +uint64_t CausalityNewRoot();
 +
-+// Record a parent->child edge and emit it, so the Rust side can rebuild the
-+// async tree. Both ids are emitted verbatim; no lookup, no alloc.
 +void CausalityLink(uint64_t parent, uint64_t child);
 +
-+// Emit one kind-16 fingerprint record:
-+//   "causality <what> tid=<hex> parent=<hex>"
-+// {what} may carry extra `k=v` fields - it is spliced verbatim between the
-+// label and the tid, which keeps every causality record on ONE line shape.
 +void CausalityEmit(const char* what, uint64_t trace_id, uint64_t parent_id);
 +
-+// ---------------------------------------------------------------------------
-+// derived helpers used by the engine hooks (append-only; the five functions
-+// above are the stable surface)
-+// ---------------------------------------------------------------------------
 +
-+// Mint the id for a newly scheduled async turn: if {parent} is 0 this is a
-+// root (no link edge), otherwise a fresh child is minted and
-+// CausalityLink(parent, child) is recorded. Returns the new id.
 +uint64_t CausalityNewChild(uint64_t parent);
 +
-+// ENQUEUE-side capture. {task_key} is the tagged Microtask address
-+// (Tagged<Microtask>::ptr()) - the identity the run side will see again. Mints
-+// the child id under the ambient parent, stores it against {task_key} and
-+// emits the enqueue record. Called from both enqueue funnels; each enqueue
-+// reaches exactly one of them, so no turn is captured twice.
 +void CausalityCaptureEnqueue(uint64_t task_key);
 +
-+// RUN-side enter. Extracts (and REMOVES) the id stored for {task_key}, pushes
-+// the current ambient id onto the per-thread scope stack and installs the
-+// extracted one. Returns the id now ambient, or 0 on a side-table miss - in
-+// which case the ambient id is left UNTOUCHED and a `run-miss` record says so
-+// (a lost capture is reported, never papered over with an invented parent).
 +uint64_t CausalityEnterTask(uint64_t task_key);
 +
-+// RUN-side exit: pops the scope stack and restores the saved ambient id.
-+// {task_key} is the same tagged address passed to CausalityEnterTask, carried
-+// into the record so a finished turn is identifiable even if its `run` record
-+// was dropped from the sink ring - enter and exit then still pair on the key.
 +void CausalityExitTask(uint64_t task_key);
 +
-+// Record a JSPromise object against the ambient id (promise creation inherits
-+// the ambient trace; it does not start a new one - the async turns it schedules
-+// do). {promise_key} is Tagged<JSPromise>::ptr().
 +void CausalityNotePromise(uint64_t promise_key);
 +
-+// Per-thread async-turn nesting depth, and a truncate-to-depth used by the
-+// drain-level balance guard in MicrotaskQueue::RunMicrotasks. A task body can
-+// nest a whole second drain (Runtime_PerformMicrotaskCheckpoint), and a
-+// TERMINATION exception unwinds out of the drain builtin without returning to
-+// the exit hook - so the depth is re-based at drain scope exit and any
-+// imbalance is counted as a witness instead of silently corrupting the stack.
 +size_t CausalityScopeDepth();
 +void CausalityScopeReset(size_t depth);
 +
-+// Honest-witness counters, folded into the drop stream like TaintDropped() so
-+// a causality gap is never mistaken for "no async activity here".
-+//   CausalityDropped()   - side-table full: a capture was lost.
-+//   CausalityImbalance() - enter/exit did not pair up (termination unwind or
-+//                          scope-stack overflow).
-+//   CausalityMisses()    - run-side found no captured id for a task.
-+//   CausalityMinted()    - total ids minted (graph size sanity).
 +uint64_t CausalityDropped();
 +uint64_t CausalityImbalance();
 +uint64_t CausalityMisses();
 +uint64_t CausalityMinted();
 +
-+}  // namespace afeye
-+}  // namespace v8
++}
++}
 +
-+#endif  // V8_AFEYE
++#endif
 +
-+#endif  // V8_AFEYE_CAUSALITY_H_
++#endif
 diff --git a/v8/src/builtins/builtins-microtask-queue-gen.cc b/v8/src/builtins/builtins-microtask-queue-gen.cc
-index 36f3791..0f63f0c 100644
+index 36f3791..9eca797 100644
 --- a/v8/src/builtins/builtins-microtask-queue-gen.cc
 +++ b/v8/src/builtins/builtins-microtask-queue-gen.cc
-@@ -777,6 +777,38 @@ TF_BUILTIN(EnqueueMicrotask, MicrotaskQueueBuiltinsAssembler) {
+@@ -777,6 +777,9 @@ TF_BUILTIN(EnqueueMicrotask, MicrotaskQueueBuiltinsAssembler) {
      StoreNoWriteBarrier(MachineType::PointerRepresentation(), microtask_queue,
                          IntPtrConstant(MicrotaskQueue::kSizeOffset),
                          IntPtrAdd(size, IntPtrConstant(1)));
 +#ifdef V8_AFEYE
-+    // afeye (0031): ENQUEUE-side causality capture on the CSA FAST PATH.
-+    //
-+    // This branch writes the ring buffer directly and returns without ever
-+    // entering C++, so the hook in MicrotaskQueue::EnqueueMicrotask
-+    // (src/execution/microtask-queue.cc:157) cannot see it. That matters:
-+    // every Torque-scheduled promise reaction job comes through here, not
-+    // through the C++ funnel - MorphAndEnqueuePromiseReaction
-+    // (src/builtins/promise-abstract-operations.tq:122/:142) and
-+    // PerformPromiseThenImpl (.tq:504) both call the EnqueueMicrotask builtin.
-+    // The `if_grow` fallback below DOES reach C++ (CallEnqueueMicrotask,
-+    // microtask-queue.cc:114, which calls the hooked :157 funnel), so hooking
-+    // both places covers every enqueue with no double capture: each schedule
-+    // takes exactly one of the two paths.
-+    //
-+    // Placed AFTER the stores, before Return, so the record is emitted only
-+    // for a schedule that actually happened: the `if_grow` bailout above means
-+    // a task that never lands in the ring buffer is never captured either. The
-+    // captured PARENT is the ambient id in effect at schedule time - the id of
-+    // the turn doing the scheduling - which is the edge the Rust side needs to
-+    // build the async tree.
-+    //
-+    // {context} is the builtin's context parameter (line 722 above); the
-+    // runtime impl ignores it and reads only args[0]. {microtask} is passed as
-+    // the tagged object read as an opaque key via Tagged<T>::ptr() - the very
-+    // same value the C++ funnel stores into ring_buffer_ at
-+    // microtask-queue.cc:166, so the enqueue key and the run key agree by
-+    // construction rather than by coincidence. TNode<Microtask> ->
-+    // TNode<Object> converts through the same implicit_cast the adjacent
-+    // CallRuntime(Runtime::kRunMicrotaskCallback, ...) at line 286 relies on.
 +    CallRuntime(Runtime::kAfeyeCausalityEnqueueMicrotask, context, microtask);
 +#endif  // V8_AFEYE
      Return(UndefinedConstant());
    }
  
-@@ -878,8 +910,42 @@ TF_BUILTIN(RunMicrotasks, MicrotaskQueueBuiltinsAssembler) {
+@@ -878,8 +881,16 @@ TF_BUILTIN(RunMicrotasks, MicrotaskQueueBuiltinsAssembler) {
    SetMicrotaskQueueSize(microtask_queue, new_size);
    SetMicrotaskQueueStart(microtask_queue, new_start);
  
 +#ifdef V8_AFEYE
-+  // afeye (0031): RUN-side causality restore. The id captured at enqueue time
-+  // for THIS task (looked up by the same tagged {microtask} address) is
-+  // installed as the thread's ambient trace_id for the whole job body, so
-+  // everything the body does - promises it creates, microtasks it enqueues,
-+  // sinks it writes - attributes to the turn that actually scheduled it rather
-+  // than to whatever happened to be ambient when the drain started. That is the
-+  // whole point of the patch: without it a chain of awaits looks like a flat
-+  // sequence of unrelated turns and time-window correlation has to guess.
-+  //
-+  // Wrapping at this single call site instead of inside RunSingleMicrotask
-+  // keeps the hooks on straight-line loop code. RunSingleMicrotask has six
-+  // distinct exit labels (a shared `done` plus a per-task-kind `if_exception`
-+  // for each of the six Switch cases, lines 228-525) and a task body that can
-+  // bail out early via PrepareForContext's `bailout` label; putting the enter
-+  // there would need a matching restore at every one of those exits, and
-+  // missing one would leak a turn's id into every later turn on the thread.
-+  // Here the pairing is one enter, one exit, no labels in between.
-+  //
-+  // Honest limitation, witnessed not hidden: if the task body raises a
-+  // TERMINATION exception it unwinds out of this builtin without returning to
-+  // the exit hook below, leaving one frame on the per-thread scope stack.
-+  // MicrotaskQueue::RunMicrotasks re-bases the stack at drain scope exit
-+  // (CausalityScopeReset) and emits a `scope-rebalance` record for anything
-+  // leaked, and CausalityImbalance() counts it - so the leak is reported and
-+  // bounded to the remainder of that one drain, never silently corrupting the
-+  // ids of subsequent turns.
 +  CallRuntime(Runtime::kAfeyeCausalityEnterMicrotask, current_context,
 +              microtask);
 +#endif  // V8_AFEYE
@@ -716,10 +393,10 @@ index 36f3791..0f63f0c 100644
    Goto(&loop);
  
 diff --git a/v8/src/builtins/builtins-promise-gen.cc b/v8/src/builtins/builtins-promise-gen.cc
-index e292d68..697ba06 100644
+index e292d68..0c7569f 100644
 --- a/v8/src/builtins/builtins-promise-gen.cc
 +++ b/v8/src/builtins/builtins-promise-gen.cc
-@@ -31,8 +31,41 @@ void PromiseBuiltinsAssembler::ZeroOutEmbedderOffsets(
+@@ -31,8 +31,13 @@ void PromiseBuiltinsAssembler::ZeroOutEmbedderOffsets(
  
  TNode<HeapObject> PromiseBuiltinsAssembler::AllocateJSPromise(
      TNode<Context> context) {
@@ -729,34 +406,6 @@ index e292d68..697ba06 100644
 +      Allocate(sizeof(JSPromise) +
 +               v8::Promise::kEmbedderFieldCount * kEmbedderDataSlotSize);
 +#ifdef V8_AFEYE
-+  // afeye (0031): PROMISE-creation causality node.
-+  //
-+  // This is the single JSPromise allocation funnel: its only caller is
-+  // InnerNewJSPromise (src/builtins/promise-misc.tq:64), which every
-+  // `new Promise(...)` / `Promise.resolve` / `Promise.withResolvers` /
-+  // `PromiseCapabilityDefaultReject`-style construction path goes through, so
-+  // one hook here sees every native promise ever created. There is no
-+  // js-promise.cc at this revision to hook instead - the promise implementation
-+  // is Torque plus this CSA allocator (verified: src/objects/ contains
-+  // js-promise.h / -inl.h / .tq only, and BUILD.gn lists no js-promise.cc).
-+  //
-+  // SAFETY at this exact point: the object is allocated but still MAP-LESS -
-+  // the caller sets `promiseHeapObject.map` on the line after this returns
-+  // (promise-misc.tq:65). That is why the hook reads ONLY the tagged address
-+  // (Tagged<T>::ptr(), src/objects/tagged-impl.h:111) as an opaque key and
-+  // never inspects the object, and why Runtime_AfeyeCausalityPromiseNew is
-+  // declared kCannotTriggerGC: a GC here would observe a map-less heap object.
-+  // The declared property makes the macro install
-+  // `DisallowGarbageCollection no_gc` around the body
-+  // (src/execution/arguments.h:176), so that is enforced rather than assumed.
-+  //
-+  // Semantics: promise creation INHERITS the ambient trace, it does not start
-+  // one. The async turns this promise later schedules are its causal children
-+  // and get their own ids when they are enqueued (see the enqueue hooks in
-+  // builtins-microtask-queue-gen.cc and microtask-queue.cc). Emitting the
-+  // promise's identity against the ambient id is what lets the Rust side attach
-+  // a `.then` edge to the specific promise object a fingerprint value was
-+  // resolved into, instead of only to "some promise in this turn".
 +  CallRuntime(Runtime::kAfeyeCausalityPromiseNew, context, promise);
 +#endif  // V8_AFEYE
 +  return promise;
@@ -764,7 +413,7 @@ index e292d68..697ba06 100644
  
  }  // namespace internal
 diff --git a/v8/src/execution/microtask-queue.cc b/v8/src/execution/microtask-queue.cc
-index 4480536..2d02a69 100644
+index 4480536..6b60420 100644
 --- a/v8/src/execution/microtask-queue.cc
 +++ b/v8/src/execution/microtask-queue.cc
 @@ -5,6 +5,7 @@
@@ -775,70 +424,23 @@ index 4480536..2d02a69 100644
  #include "src/afeye/sink.h"
  #endif
  
-@@ -165,6 +166,35 @@ void MicrotaskQueue::EnqueueMicrotask(Tagged<Microtask> microtask) {
+@@ -165,6 +166,11 @@ void MicrotaskQueue::EnqueueMicrotask(Tagged<Microtask> microtask) {
    DCHECK_LT(size_, capacity_);
    ring_buffer_[(start_ + size_) % capacity_] = microtask.ptr();
    ++size_;
 +
 +#ifdef V8_AFEYE
-+  // afeye (0031): ENQUEUE-side causality capture, C++ funnel.
-+  //
-+  // This single function is the choke point for every C++-initiated schedule:
-+  // CallEnqueueMicrotask (:114, the ExternalReference target the CSA
-+  // `if_grow` fallback calls), all three v8::Isolate::EnqueueMicrotask
-+  // overloads (:123, :132, :145 - Local<Function>, MicrotaskCallback+data,
-+  // MicrotaskCallbackWithData+Data) and Runtime_EnqueueMicrotask
-+  // (src/runtime/runtime-promise.cc:43, the %EnqueueMicrotask intrinsic that
-+  // queueMicrotask() lowers to) all end here.
-+  //
-+  // Keyed by microtask.ptr() - the very tagged address stored into
-+  // ring_buffer_ on the line above, and the same value the CSA run-side hook
-+  // passes back in (builtins-microtask-queue-gen.cc TF_BUILTIN(RunMicrotasks)
-+  // reads it out of the ring buffer), so enqueue and run agree by
-+  // construction. ResizeBuffer() above reallocates the ring buffer but copies
-+  // the SAME tagged values, so a captured key stays valid across a grow.
-+  //
-+  // No double capture with the CSA fast path: TF_BUILTIN(EnqueueMicrotask)
-+  // writes the ring buffer inline and returns, reaching this function only on
-+  // its `if_grow` fallback - one schedule, exactly one of the two hooks.
-+  //
-+  // Placed AFTER the stores so only a schedule that actually landed in the
-+  // queue is captured. No HandleScope / no V8 allocation: CausalityCapture
-+  // writes a fixed side-table and the sink ring.
 +  v8::afeye::CausalityCaptureEnqueue(
 +      static_cast<uint64_t>(microtask.ptr()));
 +#endif  // V8_AFEYE
  }
  
  bool MicrotaskQueue::ShouldPerformCheckpoint(v8::Isolate* v8_isolate) const {
-@@ -209,12 +239,54 @@ class SetIsRunningMicrotasks {
+@@ -209,12 +215,26 @@ class SetIsRunningMicrotasks {
    bool* flag_;
  };
  
 +#ifdef V8_AFEYE
-+// afeye (0031): drain-scope causality guard.
-+//
-+// RAII, so it covers EVERY exit from RunMicrotasks - both `return`s (the
-+// termination path and the normal path) and any exception unwinding out of
-+// Execution::TryRunMicrotasks. Two explicit calls before the returns would
-+// miss the termination path, which is precisely the path that leaks.
-+//
-+// It re-bases the per-thread causality scope stack to the depth this drain
-+// started at. Normally each enter hook in TF_BUILTIN(RunMicrotasks) is matched
-+// by its exit hook and the stack unwinds to base on its own. It does not when a
-+// task body raises a TERMINATION exception: that unwinds straight out of the
-+// drain builtin - see CSA_DCHECK(Word32BinaryNot(IsExecutionTerminating())) at
-+// builtins-microtask-queue-gen.cc:195 and the is_execution_terminating()
-+// branch below - without passing the exit hook, leaving one frame behind. Left
-+// alone, that stale frame would mis-scope every later turn on the thread,
-+// silently attributing unrelated work to a dead trace. With this guard the
-+// leak is bounded to the remainder of this drain, counted by
-+// CausalityImbalance() and emitted as a `scope-rebalance` record: witnessed
-+// rather than absorbed.
-+//
-+// The base depth is CAPTURED, not assumed 0: a task body can nest a whole
-+// second drain via Runtime_PerformMicrotaskCheckpoint, and only the frames
-+// above this drain's base belong to it.
 +class CausalityDrainScope {
 + public:
 +  CausalityDrainScope() : base_depth_(v8::afeye::CausalityScopeDepth()) {}
@@ -856,18 +458,13 @@ index 4480536..2d02a69 100644
    v8::Isolate::SuppressMicrotaskExecutionScope suppress(
        reinterpret_cast<v8::Isolate*>(isolate), this);
 +#ifdef V8_AFEYE
-+  // RAII, so the destructor runs on EVERY exit below - the empty-queue early
-+  // return, the termination `return -1` and the normal return - plus exception
-+  // unwind. It is the LAST object declared in this frame, so it destructs
-+  // FIRST; the reset touches only afeye's own thread_local state and does not
-+  // depend on {suppress} or {scope} still being alive.
 +  CausalityDrainScope afeye_causality_scope;
 +#endif  // V8_AFEYE
  
    if (!size()) {
      OnCompleted(isolate);
 diff --git a/v8/src/runtime/runtime-promise.cc b/v8/src/runtime/runtime-promise.cc
-index 169d48b..ed066bf 100644
+index 169d48b..d773338 100644
 --- a/v8/src/runtime/runtime-promise.cc
 +++ b/v8/src/runtime/runtime-promise.cc
 @@ -7,6 +7,9 @@
@@ -880,76 +477,31 @@ index 169d48b..ed066bf 100644
  
  namespace v8 {
  namespace internal {
-@@ -236,5 +239,78 @@ RUNTIME_FUNCTION(Runtime_ConstructSuppressedError) {
+@@ -236,5 +239,33 @@ RUNTIME_FUNCTION(Runtime_ConstructSuppressedError) {
    return *result;
  }
  
 +#ifdef V8_AFEYE
-+// afeye (0031): async causality graph capture hooks. Each is called from CSA
-+// at exactly one site and takes the object whose tagged address is the
-+// side-table key. None of them allocate V8 heap, none can throw: they mutate a
-+// fixed C++ scope stack / side-table in causality.cc and push records into the
-+// sink ring. Returning undefined_value() keeps them total.
-+//
-+// Placed in THIS file (not a new runtime-causality.cc) because it is already
-+// listed in v8/BUILD.gn sources, so no BUILD.gn edit is needed - the four
-+// Runtime::FunctionIds are registered purely by the FOR_EACH_INTRINSIC_AFEYE_
-+// CAUSALITY(F, I) group in runtime.h, which runtime.cc expands into both the
-+// declaration list (:19) and kIntrinsicFunctions[] (:42).
 +
-+// ENQUEUE-side capture. Called from both microtask enqueue funnels:
-+//   - MicrotaskQueue::EnqueueMicrotask(Tagged<Microtask>) in C++
-+//     (microtask-queue.cc:157) directly, which covers CallEnqueueMicrotask
-+//     (:114), all three v8::Isolate::EnqueueMicrotask overloads
-+//     (:123,:132,:145) and Runtime_EnqueueMicrotask (:43 above);
-+//   - TF_BUILTIN(EnqueueMicrotask)'s CSA fast path
-+//     (builtins-microtask-queue-gen.cc:773-781), which writes the ring buffer
-+//     directly and only falls back to the C++ funnel when the buffer must GROW
-+//     (:785). Every Torque-scheduled promise reaction job
-+//     (MorphAndEnqueuePromiseReaction, promise-abstract-operations.tq:122/:142;
-+//     PerformPromiseThenImpl, .tq:504) takes this fast path, so without it
-+//     promise scheduling would be captured not at all.
-+// Each enqueue reaches exactly ONE of the two, so no turn is captured twice.
 +RUNTIME_FUNCTION(Runtime_AfeyeCausalityEnqueueMicrotask) {
-+  // No HandleScope: the body creates no handles (ReadOnlyRoots is not
-+  // handle-allocated), so none of the four below need one. Precedent:
-+  // Runtime_PerformMicrotaskCheckpoint at the top of this file.
 +  DCHECK_EQ(1, args.length());
 +  v8::afeye::CausalityCaptureEnqueue(
 +      static_cast<uint64_t>(args[0].ptr()));
 +  return ReadOnlyRoots(isolate).undefined_value();
 +}
 +
-+// RUN-side enter. Called from TF_BUILTIN(RunMicrotasks) immediately before
-+// RunSingleMicrotask for each drained task (builtins-microtask-queue-gen.cc
-+// :881). Wrapping at that single call site rather than inside
-+// RunSingleMicrotask keeps the hook on straight-line loop code: the task body
-+// has six distinct exit labels (`done`, plus per-kind `if_exception` paths)
-+// that would each need its own restore, and an omission there would leak one
-+// turn's id into every later turn on the thread.
 +RUNTIME_FUNCTION(Runtime_AfeyeCausalityEnterMicrotask) {
 +  DCHECK_EQ(1, args.length());
 +  v8::afeye::CausalityEnterTask(static_cast<uint64_t>(args[0].ptr()));
 +  return ReadOnlyRoots(isolate).undefined_value();
 +}
 +
-+// RUN-side exit: restores the ambient id captured before the task ran.
-+// Paired 1:1 with Runtime_AfeyeCausalityEnterMicrotask, and given the same task
-+// key so the exit record names the turn it closes.
 +RUNTIME_FUNCTION(Runtime_AfeyeCausalityExitMicrotask) {
 +  DCHECK_EQ(1, args.length());
 +  v8::afeye::CausalityExitTask(static_cast<uint64_t>(args[0].ptr()));
 +  return ReadOnlyRoots(isolate).undefined_value();
 +}
 +
-+// PROMISE creation. Called from
-+// PromiseBuiltinsAssembler::AllocateJSPromise (builtins-promise-gen.cc:32),
-+// the single JSPromise allocation funnel - its sole caller is
-+// promise-misc.tq:64, so `new Promise(...)` / `Promise.resolve` /
-+// `Promise.withResolvers` / subclass construction all pass through it.
-+// Creation INHERITS the ambient trace rather than starting one; the async turns
-+// the promise later schedules are its causal children and get their own ids at
-+// enqueue.
 +RUNTIME_FUNCTION(Runtime_AfeyeCausalityPromiseNew) {
 +  DCHECK_EQ(1, args.length());
 +  v8::afeye::CausalityNotePromise(static_cast<uint64_t>(args[0].ptr()));
@@ -960,41 +512,14 @@ index 169d48b..ed066bf 100644
  }  // namespace internal
  }  // namespace v8
 diff --git a/v8/src/runtime/runtime.h b/v8/src/runtime/runtime.h
-index b99a90b..2f4b866 100644
+index b99a90b..bf56c8d 100644
 --- a/v8/src/runtime/runtime.h
 +++ b/v8/src/runtime/runtime.h
-@@ -880,6 +880,47 @@ constexpr bool CanTriggerGC(T... properties) {
+@@ -880,6 +880,20 @@ constexpr bool CanTriggerGC(T... properties) {
    F(HasElementWithInterceptor, 2, 1)         \
    F(ObjectAssignTryFastcase, 2, 1)
  
 +#ifdef V8_AFEYE
-+// afeye (0031): async causality graph trace_id capture hooks - see
-+// src/afeye/causality.h for the full propagation argument. A dedicated group,
-+// appended LAST in FOR_EACH_INTRINSIC_RETURN_OBJECT_IMPL below so that no
-+// existing Runtime::FunctionId shifts in a stock (non-V8_AFEYE) build: those
-+// ids are enum positions, and anything persisting or comparing them would
-+// break. Conditional-group precedent: FOR_EACH_INTRINSIC_TRACE_UNOPTIMIZED,
-+// gated on V8_TRACE_UNOPTIMIZED, above in this file.
-+//
-+// Each hook takes ONE tagged argument (the Microtask / JSPromise object) and
-+// reads it as an opaque 64-bit side-table key via Tagged<T>::ptr()
-+// (src/objects/tagged-impl.h:111). The task key must be passed explicitly
-+// rather than read from RootIndex::kCurrentMicrotask: the enter hook runs
-+// BEFORE RunSingleMicrotask stores the object into that root
-+// (src/builtins/builtins-microtask-queue-gen.cc:197), so at enter time the
-+// root still holds the PREVIOUS task.
-+//
-+// All four are kCannotTriggerGC. That is not decoration - the macro at
-+// src/execution/arguments.h:176 wraps such a body in
-+// `DisallowGarbageCollection no_gc`, converting the no-alloc contract into a
-+// checked one. It is load-bearing at the promise hook, whose caller
-+// InnerNewJSPromise (src/builtins/promise-misc.tq:64-65) sets the new object's
-+// .map only AFTER AllocateJSPromise returns: a GC inside the hook would
-+// observe a map-less heap object. The causality path allocates nothing on the
-+// V8 heap - it writes a fixed C++ scope stack and an open-addressed
-+// side-table, then pushes records into the sink ring (sink.cc EmitFlags:
-+// spinlock + memcpy into a preallocated ring) - so the guarantee holds by
-+// construction and now also by assertion.
 +#define FOR_EACH_INTRINSIC_AFEYE_CAUSALITY(F, I) \
 +  F(AfeyeCausalityEnqueueMicrotask, 1, 1,        \
 +    RuntimeCallProperty::kCannotTriggerGC)       \
@@ -1011,7 +536,7 @@ index b99a90b..2f4b866 100644
  #define FOR_EACH_INTRINSIC_RETURN_OBJECT_IMPL(F, I)               \
    FOR_EACH_INTRINSIC_ARRAY(F, I)                                  \
    FOR_EACH_INTRINSIC_ATOMICS(F, I)                                \
-@@ -913,7 +954,8 @@ constexpr bool CanTriggerGC(T... properties) {
+@@ -913,7 +927,8 @@ constexpr bool CanTriggerGC(T... properties) {
    IF_WASM(FOR_EACH_INTRINSIC_WASM, F, I)                          \
    IF_WASM(FOR_EACH_INTRINSIC_WASM_TEST, F, I)                     \
    IF_WASM_DRUMBRAKE(FOR_EACH_INTRINSIC_WASM_DRUMBRAKE_TEST, F, I) \

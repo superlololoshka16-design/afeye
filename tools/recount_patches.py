@@ -25,7 +25,6 @@ def fix(path: str) -> int:
     while i < len(lines):
         line = lines[i]
         if line.startswith("@@ "):
-            # parse header: @@ -a[,b] +c[,d] @@ optional-func
             head = line[3:]
             counts_part, _, func = head.partition("@@")
             try:
@@ -36,7 +35,6 @@ def fix(path: str) -> int:
                 out.append(line)
                 i += 1
                 continue
-            # collect body
             body = []
             j = i + 1
             while j < len(lines) and body_line(lines[j]):
@@ -46,7 +44,6 @@ def fix(path: str) -> int:
             add = sum(1 for l in body if l.startswith("+"))
             rem = sum(1 for l in body if l.startswith("-") and not l.startswith("---"))
             if add == 0 and rem == 0 and ctx == 0:
-                # empty hunk: drop the header entirely
                 changed += 1
                 i = j
                 continue

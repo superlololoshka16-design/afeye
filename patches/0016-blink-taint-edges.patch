@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/core/frame/universal_global_scope.cc b/third_party/blink/renderer/core/frame/universal_global_scope.cc
-index 884a285..44dff15 100644
+index 884a285..6a3a55c 100644
 --- a/third_party/blink/renderer/core/frame/universal_global_scope.cc
 +++ b/third_party/blink/renderer/core/frame/universal_global_scope.cc
 @@ -4,6 +4,13 @@
@@ -16,14 +16,12 @@ index 884a285..44dff15 100644
  #include "base/containers/span.h"
  #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
  #include "third_party/blink/renderer/bindings/core/v8/serialization/post_message_helper.h"
-@@ -20,6 +27,22 @@
+@@ -20,6 +27,20 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+// v12.1: g_afeye_taint is shared via the blink sink (0005) - five
-+// per-TU atomics were 500k/process, 5x the documented cap.
 +constexpr uint64_t kAfeyeTaintCap = 100000;
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
@@ -33,21 +31,17 @@ index 884a285..44dff15 100644
 +  return !g_afeye_taint_off &&
 +         afeye::g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
 +}
-+}  // namespace
++}
 +#endif
 +
  String UniversalGlobalScope::btoa(const String& string_to_encode,
                                    ExceptionState& exception_state) {
    if (string_to_encode.IsNull()) {
-@@ -34,6 +57,20 @@ String UniversalGlobalScope::btoa(const String& string_to_encode,
+@@ -34,6 +55,16 @@ String UniversalGlobalScope::btoa(const String& string_to_encode,
      return String();
    }
  
 +#ifdef BLINK_AFEYE
-+  // afeye (0016): the base64 encode boundary. Kasada x-kp/x-kpsp headers and
-+  // CF/DataDome token handoffs wrap ciphertext with btoa; the INPUT bytes here
-+  // content-match the JS-AES output that the req-body sink later sees - the
-+  // only data (not timer) edge linking pure-JS crypto to the upload.
 +  if (blink::afeye::Enabled() && AfeyeTaintOn() &&
 +      !string_to_encode.empty()) {
 +    base::span<const uint8_t> afeye_l1 =
@@ -60,13 +54,11 @@ index 884a285..44dff15 100644
    return Base64Encode(base::as_byte_span(string_to_encode.Latin1()));
  }
  
-@@ -58,6 +95,15 @@ String UniversalGlobalScope::atob(const String& encoded_string,
+@@ -58,6 +89,13 @@ String UniversalGlobalScope::atob(const String& encoded_string,
      return String();
    }
  
 +#ifdef BLINK_AFEYE
-+  // afeye (0016): the base64 decode boundary - the DECODED plaintext of a
-+  // challenge response / stored token before JS consumes or re-encrypts it.
 +  if (blink::afeye::Enabled() && AfeyeTaintOn() && !out.empty()) {
 +    blink::afeye::EmitSpan(blink::afeye::kTaintEdge, blink::afeye::NowNs(),
 +                           "atob", out.data(),
@@ -77,486 +69,13 @@ index 884a285..44dff15 100644
  }
  
 diff --git a/third_party/blink/renderer/core/html/forms/form_data.cc b/third_party/blink/renderer/core/html/forms/form_data.cc
-index 4b46b64..26ae617 100644
+index 4b46b64..6d7964b 100644
 --- a/third_party/blink/renderer/core/html/forms/form_data.cc
 +++ b/third_party/blink/renderer/core/html/forms/form_data.cc
-@@ -1,444 +1,513 @@
--/*
-- * Copyright (C) 2010 Google Inc. All rights reserved.
-- *
-- * Redistribution and use in source and binary forms, with or without
-- * modification, are permitted provided that the following conditions are
-- * met:
-- *
-- *     * Redistributions of source code must retain the above copyright
-- * notice, this list of conditions and the following disclaimer.
-- *     * Redistributions in binary form must reproduce the above
-- * copyright notice, this list of conditions and the following disclaimer
-- * in the documentation and/or other materials provided with the
-- * distribution.
-- *     * Neither the name of Google Inc. nor the names of its
-- * contributors may be used to endorse or promote products derived from
-- * this software without specific prior written permission.
-- *
-- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-- */
--
--#include "third_party/blink/renderer/core/html/forms/form_data.h"
--
--#include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
--#include "third_party/blink/renderer/bindings/core/v8/v8_union_file_usvstring.h"
--#include "third_party/blink/renderer/core/execution_context/execution_context.h"
--#include "third_party/blink/renderer/core/fileapi/blob.h"
--#include "third_party/blink/renderer/core/fileapi/file.h"
--#include "third_party/blink/renderer/core/frame/web_feature.h"
--#include "third_party/blink/renderer/core/html/forms/form_controller.h"
--#include "third_party/blink/renderer/core/html/forms/html_form_element.h"
--#include "third_party/blink/renderer/platform/bindings/script_state.h"
--#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
--#include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
--#include "third_party/blink/renderer/platform/network/form_data_encoder.h"
--#include "third_party/blink/renderer/platform/wtf/text/line_ending.h"
--#include "third_party/blink/renderer/platform/wtf/text/string_to_number.h"
--#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
--
--namespace blink {
--
--namespace {
--
--class FormDataIterationSource final
--    : public PairSyncIterable<FormData>::IterationSource {
-- public:
--  FormDataIterationSource(FormData* form_data)
--      : form_data_(form_data), current_(0) {}
--
--  bool FetchNextItem(ScriptState* script_state,
--                     String& name,
--                     V8FormDataEntryValue*& value) override {
--    if (current_ >= form_data_->size())
--      return false;
--
--    const FormData::Entry& entry = *form_data_->Entries()[current_++];
--    name = entry.name();
--    if (entry.IsString()) {
--      value = MakeGarbageCollected<V8FormDataEntryValue>(entry.Value());
--    } else {
--      DCHECK(entry.isFile());
--      value = MakeGarbageCollected<V8FormDataEntryValue>(entry.GetFile());
--    }
--    return true;
--  }
--
--  void Trace(Visitor* visitor) const override {
--    visitor->Trace(form_data_);
--    PairSyncIterable<FormData>::IterationSource::Trace(visitor);
--  }
--
-- private:
--  const Member<FormData> form_data_;
--  wtf_size_t current_;
--};
--
--}  // namespace
--
--FormData::FormData(const TextEncoding& encoding) : encoding_(encoding) {}
--
--FormData::FormData(const FormData& form_data)
--    : encoding_(form_data.encoding_),
--      entries_(form_data.entries_),
--      contains_password_data_(form_data.contains_password_data_) {}
--
--FormData::FormData() : encoding_(Utf8Encoding()) {}
--
--FormData* FormData::Create(HTMLFormElement* form,
--                           ExceptionState& exception_state) {
--  return FormData::Create(form, nullptr, exception_state);
--}
--
--// https://xhr.spec.whatwg.org/#dom-formdata
--FormData* FormData::Create(HTMLFormElement* form,
--                           HTMLElement* submitter,
--                           ExceptionState& exception_state) {
--  if (!form) {
--    return MakeGarbageCollected<FormData>();
--  }
--  // 1. If form is given, then:
--  HTMLFormControlElement* control = nullptr;
--  // 1.1. If submitter is non-null, then:
--  if (submitter) {
--    // 1.1.1. If submitter is not a submit button, then throw a TypeError.
--    control = DynamicTo<HTMLFormControlElement>(submitter);
--    if (!control || !control->CanBeSuccessfulSubmitButton()) {
--      exception_state.ThrowTypeError(
--          "The specified element is not a submit button.");
--      return nullptr;
--    }
--    // 1.1.2. If submitter's form owner is not this form element, then throw a
--    // "NotFoundError" DOMException.
--    if (control->formOwner() != form) {
--      exception_state.ThrowDOMException(
--          DOMExceptionCode::kNotFoundError,
--          "The specified element is not owned by this form element.");
--      return nullptr;
--    }
--  }
--  // 1.2. Let list be the result of constructing the entry list for form and
--  // submitter.
--  FormData* form_data = form->ConstructEntryList(control, Utf8Encoding());
--  // 1.3. If list is null, then throw an "InvalidStateError" DOMException.
--  if (!form_data) {
--    exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
--                                      "The form is constructing entry list.");
--    return nullptr;
--  }
--  // 1.4. Set this’s entry list to list.
--  // Return a shallow copy of |form_data| because |form_data| is visible in
--  // "formdata" event, and the specification says it should be different from
--  // the FormData object to be returned.
--  return MakeGarbageCollected<FormData>(*form_data);
--}
--
--void FormData::Trace(Visitor* visitor) const {
--  visitor->Trace(entries_);
--  ScriptWrappable::Trace(visitor);
--}
--
--void FormData::append(const String& name, const String& value) {
--  entries_.push_back(MakeGarbageCollected<Entry>(name, value));
--}
--
--void FormData::append(ScriptState* script_state,
--                      const String& name,
--                      Blob* blob,
--                      const String& filename) {
--  if (!blob) {
--    UseCounter::Count(ExecutionContext::From(script_state),
--                      WebFeature::kFormDataAppendNull);
--  }
--  append(name, blob, filename);
--}
--
--void FormData::deleteEntry(const String& name) {
--  wtf_size_t i = 0;
--  while (i < entries_.size()) {
--    if (entries_[i]->name() == name) {
--      entries_.EraseAt(i);
--    } else {
--      ++i;
--    }
--  }
--}
--
--V8FormDataEntryValue* FormData::get(const String& name) {
--  for (const auto& entry : Entries()) {
--    if (entry->name() == name) {
--      if (entry->IsString()) {
--        return MakeGarbageCollected<V8FormDataEntryValue>(entry->Value());
--      } else {
--        DCHECK(entry->isFile());
--        return MakeGarbageCollected<V8FormDataEntryValue>(entry->GetFile());
--      }
--    }
--  }
--  return nullptr;
--}
--
--HeapVector<Member<V8FormDataEntryValue>> FormData::getAll(const String& name) {
--  HeapVector<Member<V8FormDataEntryValue>> results;
--
--  for (const auto& entry : Entries()) {
--    if (entry->name() != name)
--      continue;
--    V8FormDataEntryValue* value;
--    if (entry->IsString()) {
--      value = MakeGarbageCollected<V8FormDataEntryValue>(entry->Value());
--    } else {
--      DCHECK(entry->isFile());
--      value = MakeGarbageCollected<V8FormDataEntryValue>(entry->GetFile());
--    }
--    results.push_back(value);
--  }
--  return results;
--}
--
--bool FormData::has(const String& name) {
--  for (const auto& entry : Entries()) {
--    if (entry->name() == name)
--      return true;
--  }
--  return false;
--}
--
--void FormData::set(const String& name, const String& value) {
--  SetEntry(MakeGarbageCollected<Entry>(name, value));
--}
--
--void FormData::set(const String& name, Blob* blob, const String& filename) {
--  SetEntry(MakeGarbageCollected<Entry>(name, blob, filename));
--}
--
--void FormData::SetEntry(const Entry* entry) {
--  DCHECK(entry);
--  bool found = false;
--  wtf_size_t i = 0;
--  while (i < entries_.size()) {
--    if (entries_[i]->name() != entry->name()) {
--      ++i;
--    } else if (found) {
--      entries_.EraseAt(i);
--    } else {
--      found = true;
--      entries_[i] = entry;
--      ++i;
--    }
--  }
--  if (!found)
--    entries_.push_back(entry);
--}
--
--void FormData::append(const String& name, Blob* blob, const String& filename) {
--  entries_.push_back(MakeGarbageCollected<Entry>(name, blob, filename));
--}
--
--void FormData::AppendFromElement(const String& name, int value) {
--  append(ReplaceUnmatchedSurrogates(name), String::Number(value));
--}
--
--void FormData::AppendFromElement(const String& name, File* file) {
--  entries_.push_back(MakeGarbageCollected<Entry>(
--      ReplaceUnmatchedSurrogates(name), file, String()));
--}
--
--void FormData::AppendFromElement(const String& name, const String& value) {
--  entries_.push_back(MakeGarbageCollected<Entry>(
--      ReplaceUnmatchedSurrogates(name), ReplaceUnmatchedSurrogates(value)));
--}
--
--std::string FormData::Encode(const String& string) const {
--  return encoding_.Encode(string, UnencodableHandling::kXmlCharRef);
--}
--
--scoped_refptr<EncodedFormData> FormData::EncodeFormData(
--    EncodedFormData::EncodingType encoding_type) {
--  scoped_refptr<EncodedFormData> form_data = EncodedFormData::Create();
--  Vector<char> encoded_data;
--  for (const auto& entry : Entries()) {
--    FormDataEncoder::AddKeyValuePairAsFormData(
--        encoded_data, Encode(entry->name()),
--        entry->isFile()
--            ? Encode(ReplaceUnmatchedSurrogates(entry->GetFile()->name()))
--            : Encode(entry->Value()),
--        encoding_type);
--  }
--  form_data->AppendData(encoded_data);
--  return form_data;
--}
--
--scoped_refptr<EncodedFormData> FormData::EncodeMultiPartFormData() {
--  scoped_refptr<EncodedFormData> form_data = EncodedFormData::Create();
--  form_data->SetBoundary(FormDataEncoder::GenerateUniqueBoundaryString());
--  for (const auto& entry : Entries()) {
--    Vector<char> header;
--    FormDataEncoder::BeginMultiPartHeader(header, form_data->Boundary(),
--                                          Encode(entry->name()));
--
--    // If the current type is blob, then we also need to include the
--    // filename.
--    if (entry->GetBlob()) {
--      String name;
--      if (auto* file = DynamicTo<File>(entry->GetBlob())) {
--        // For file blob, use the filename (or relative path if it is
--        // present) as the name.
--        name = file->webkitRelativePath().empty() ? file->name()
--                                                  : file->webkitRelativePath();
--
--        // If a filename is passed in FormData.append(), use it instead
--        // of the file blob's name.
--        if (!entry->Filename().IsNull())
--          name = entry->Filename();
--      } else {
--        // For non-file blob, use the filename if it is passed in
--        // FormData.append().
--        if (!entry->Filename().IsNull())
--          name = entry->Filename();
--        else
--          name = "blob";
--      }
--
--      // We have to include the filename=".." part in the header, even if
--      // the filename is empty.
--      FormDataEncoder::AddFilenameToMultiPartHeader(header, Encoding(), name);
--
--      // Add the content type if available, or "application/octet-stream"
--      // otherwise (RFC 1867).
--      String content_type;
--      if (entry->GetBlob()->type().empty())
--        content_type = "application/octet-stream";
--      else
--        content_type = entry->GetBlob()->type();
--      FormDataEncoder::AddContentTypeToMultiPartHeader(header, content_type);
--    }
--
--    FormDataEncoder::FinishMultiPartHeader(header);
--
--    // Append body
--    form_data->AppendData(header);
--    if (entry->GetBlob()) {
--      if (entry->GetBlob()->HasBackingFile()) {
--        auto* file = To<File>(entry->GetBlob());
--        // Do not add the file if the path is empty.
--        if (!file->GetPath().empty())
--          form_data->AppendFile(file->GetPath(), file->LastModifiedTime());
--      } else {
--        form_data->AppendBlob(entry->GetBlob()->GetBlobDataHandle());
--      }
--    } else {
--      std::string encoded_value =
--          Encode(NormalizeLineEndingsToCrLf(entry->Value()));
--      form_data->AppendData(encoded_value);
--    }
--    form_data->AppendData(base::span_from_cstring("\r\n"));
--  }
--
--  Vector<char> encoded_data;
--  FormDataEncoder::AddBoundaryToMultiPartHeader(
--      encoded_data, form_data->Boundary(), /*is_last_boundary=*/true);
--  form_data->AppendData(encoded_data);
--  return form_data;
--}
--
--PairSyncIterable<FormData>::IterationSource* FormData::CreateIterationSource(
--    ScriptState*) {
--  return MakeGarbageCollected<FormDataIterationSource>(this);
--}
--
--// ----------------------------------------------------------------
--
--FormData::Entry::Entry(const String& name, const String& value)
--    : name_(name), value_(value) {
--  DCHECK_EQ(name, ReplaceUnmatchedSurrogates(name))
--      << "'name' should be a USVString.";
--  DCHECK_EQ(value, ReplaceUnmatchedSurrogates(value))
--      << "'value' should be a USVString.";
--}
--
--FormData::Entry::Entry(const String& name, Blob* blob, const String& filename)
--    : name_(name), blob_(blob), filename_(filename) {
--  DCHECK_EQ(name, ReplaceUnmatchedSurrogates(name))
--      << "'name' should be a USVString.";
--}
--
--void FormData::Entry::Trace(Visitor* visitor) const {
--  visitor->Trace(blob_);
--}
--
--File* FormData::Entry::GetFile() const {
--  DCHECK(GetBlob());
--  // The spec uses the passed filename when inserting entries into the list.
--  // Here, we apply the filename (if present) as an override when extracting
--  // entries.
--  // FIXME: Consider applying the name during insertion.
--
--  if (auto* file = DynamicTo<File>(GetBlob())) {
--    if (Filename().IsNull())
--      return file;
--    return file->Clone(Filename());
--  }
--
--  String filename = filename_;
--  if (filename.IsNull())
--    filename = "blob";
--  return MakeGarbageCollected<File>(filename, base::Time::Now(),
--                                    GetBlob()->GetBlobDataHandle());
--}
--
--void FormData::AppendToControlState(FormControlState& state) const {
--  state.Append(String::Number(size()));
--  for (const auto& entry : Entries()) {
--    state.Append(entry->name());
--    if (entry->isFile()) {
--      state.Append("File");
--      entry->GetFile()->AppendToControlState(state);
--    } else {
--      state.Append("USVString");
--      state.Append(entry->Value());
--    }
--  }
--}
--
--FormData* FormData::CreateFromControlState(ExecutionContext& execution_context,
--                                           const FormControlState& state,
--                                           wtf_size_t& index) {
--  auto length = StringToUint64(state[index], NumberParsingOptions::Strict());
--  if (!length) {
--    return nullptr;
--  }
--  auto* form_data = MakeGarbageCollected<FormData>();
--  ++index;
--  for (uint64_t j = 0; j < *length; ++j) {
--    // Need at least three items.
--    if (index + 2 >= state.ValueSize())
--      return nullptr;
--    const String& name = state[index++];
--    const String& entry_type = state[index++];
--    if (entry_type == "File") {
--      if (auto* file =
--              File::CreateFromControlState(&execution_context, state, index)) {
--        form_data->append(name, file);
--      } else {
--        return nullptr;
--      }
--    } else if (entry_type == "USVString") {
--      form_data->append(name, state[index++]);
--    } else {
--      return nullptr;
--    }
--  }
--  return form_data;
--}
--
--}  // namespace blink
-+/*
-+ * Copyright (C) 2010 Google Inc. All rights reserved.
-+ *
-+ * Redistribution and use in source and binary forms, with or without
-+ * modification, are permitted provided that the following conditions are
-+ * met:
-+ *
-+ *     * Redistributions of source code must retain the above copyright
-+ * notice, this list of conditions and the following disclaimer.
-+ *     * Redistributions in binary form must reproduce the above
-+ * copyright notice, this list of conditions and the following disclaimer
-+ * in the documentation and/or other materials provided with the
-+ * distribution.
-+ *     * Neither the name of Google Inc. nor the names of its
-+ * contributors may be used to endorse or promote products derived from
-+ * this software without specific prior written permission.
-+ *
-+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-+ */
-+
-+#include "third_party/blink/renderer/core/html/forms/form_data.h"
-+
+@@ -30,6 +30,16 @@
+ 
+ #include "third_party/blink/renderer/core/html/forms/form_data.h"
+ 
 +#ifdef BLINK_AFEYE
 +#include <atomic>
 +#include <cstdio>
@@ -567,28 +86,15 @@ index 4b46b64..26ae617 100644
 +#include "third_party/blink/renderer/platform/wtf/vector.h"
 +#endif
 +
-+#include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
-+#include "third_party/blink/renderer/bindings/core/v8/v8_union_file_usvstring.h"
-+#include "third_party/blink/renderer/core/execution_context/execution_context.h"
-+#include "third_party/blink/renderer/core/fileapi/blob.h"
-+#include "third_party/blink/renderer/core/fileapi/file.h"
-+#include "third_party/blink/renderer/core/frame/web_feature.h"
-+#include "third_party/blink/renderer/core/html/forms/form_controller.h"
-+#include "third_party/blink/renderer/core/html/forms/html_form_element.h"
-+#include "third_party/blink/renderer/platform/bindings/script_state.h"
-+#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
-+#include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
-+#include "third_party/blink/renderer/platform/network/form_data_encoder.h"
-+#include "third_party/blink/renderer/platform/wtf/text/line_ending.h"
-+#include "third_party/blink/renderer/platform/wtf/text/string_to_number.h"
-+#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
-+
-+namespace blink {
-+
+ #include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_union_file_usvstring.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+@@ -48,6 +58,20 @@
+ 
+ namespace blink {
+ 
 +#ifdef BLINK_AFEYE
 +namespace {
-+// v12.1: g_afeye_taint is shared via the blink sink (0005) - five
-+// per-TU atomics were 500k/process, 5x the documented cap.
 +constexpr uint64_t kAfeyeTaintCap = 100000;
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
@@ -598,331 +104,17 @@ index 4b46b64..26ae617 100644
 +  return !g_afeye_taint_off &&
 +         afeye::g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
 +}
-+}  // namespace
++}
 +#endif
 +
-+namespace {
-+
-+class FormDataIterationSource final
-+    : public PairSyncIterable<FormData>::IterationSource {
-+ public:
-+  FormDataIterationSource(FormData* form_data)
-+      : form_data_(form_data), current_(0) {}
-+
-+  bool FetchNextItem(ScriptState* script_state,
-+                     String& name,
-+                     V8FormDataEntryValue*& value) override {
-+    if (current_ >= form_data_->size())
-+      return false;
-+
-+    const FormData::Entry& entry = *form_data_->Entries()[current_++];
-+    name = entry.name();
-+    if (entry.IsString()) {
-+      value = MakeGarbageCollected<V8FormDataEntryValue>(entry.Value());
-+    } else {
-+      DCHECK(entry.isFile());
-+      value = MakeGarbageCollected<V8FormDataEntryValue>(entry.GetFile());
-+    }
-+    return true;
-+  }
-+
-+  void Trace(Visitor* visitor) const override {
-+    visitor->Trace(form_data_);
-+    PairSyncIterable<FormData>::IterationSource::Trace(visitor);
-+  }
-+
-+ private:
-+  const Member<FormData> form_data_;
-+  wtf_size_t current_;
-+};
-+
-+}  // namespace
-+
-+FormData::FormData(const TextEncoding& encoding) : encoding_(encoding) {}
-+
-+FormData::FormData(const FormData& form_data)
-+    : encoding_(form_data.encoding_),
-+      entries_(form_data.entries_),
-+      contains_password_data_(form_data.contains_password_data_) {}
-+
-+FormData::FormData() : encoding_(Utf8Encoding()) {}
-+
-+FormData* FormData::Create(HTMLFormElement* form,
-+                           ExceptionState& exception_state) {
-+  return FormData::Create(form, nullptr, exception_state);
-+}
-+
-+// https://xhr.spec.whatwg.org/#dom-formdata
-+FormData* FormData::Create(HTMLFormElement* form,
-+                           HTMLElement* submitter,
-+                           ExceptionState& exception_state) {
-+  if (!form) {
-+    return MakeGarbageCollected<FormData>();
-+  }
-+  // 1. If form is given, then:
-+  HTMLFormControlElement* control = nullptr;
-+  // 1.1. If submitter is non-null, then:
-+  if (submitter) {
-+    // 1.1.1. If submitter is not a submit button, then throw a TypeError.
-+    control = DynamicTo<HTMLFormControlElement>(submitter);
-+    if (!control || !control->CanBeSuccessfulSubmitButton()) {
-+      exception_state.ThrowTypeError(
-+          "The specified element is not a submit button.");
-+      return nullptr;
-+    }
-+    // 1.1.2. If submitter's form owner is not this form element, then throw a
-+    // "NotFoundError" DOMException.
-+    if (control->formOwner() != form) {
-+      exception_state.ThrowDOMException(
-+          DOMExceptionCode::kNotFoundError,
-+          "The specified element is not owned by this form element.");
-+      return nullptr;
-+    }
-+  }
-+  // 1.2. Let list be the result of constructing the entry list for form and
-+  // submitter.
-+  FormData* form_data = form->ConstructEntryList(control, Utf8Encoding());
-+  // 1.3. If list is null, then throw an "InvalidStateError" DOMException.
-+  if (!form_data) {
-+    exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
-+                                      "The form is constructing entry list.");
-+    return nullptr;
-+  }
-+  // 1.4. Set this’s entry list to list.
-+  // Return a shallow copy of |form_data| because |form_data| is visible in
-+  // "formdata" event, and the specification says it should be different from
-+  // the FormData object to be returned.
-+  return MakeGarbageCollected<FormData>(*form_data);
-+}
-+
-+void FormData::Trace(Visitor* visitor) const {
-+  visitor->Trace(entries_);
-+  ScriptWrappable::Trace(visitor);
-+}
-+
-+void FormData::append(const String& name, const String& value) {
-+  entries_.push_back(MakeGarbageCollected<Entry>(name, value));
-+}
-+
-+void FormData::append(ScriptState* script_state,
-+                      const String& name,
-+                      Blob* blob,
-+                      const String& filename) {
-+  if (!blob) {
-+    UseCounter::Count(ExecutionContext::From(script_state),
-+                      WebFeature::kFormDataAppendNull);
-+  }
-+  append(name, blob, filename);
-+}
-+
-+void FormData::deleteEntry(const String& name) {
-+  wtf_size_t i = 0;
-+  while (i < entries_.size()) {
-+    if (entries_[i]->name() == name) {
-+      entries_.EraseAt(i);
-+    } else {
-+      ++i;
-+    }
-+  }
-+}
-+
-+V8FormDataEntryValue* FormData::get(const String& name) {
-+  for (const auto& entry : Entries()) {
-+    if (entry->name() == name) {
-+      if (entry->IsString()) {
-+        return MakeGarbageCollected<V8FormDataEntryValue>(entry->Value());
-+      } else {
-+        DCHECK(entry->isFile());
-+        return MakeGarbageCollected<V8FormDataEntryValue>(entry->GetFile());
-+      }
-+    }
-+  }
-+  return nullptr;
-+}
-+
-+HeapVector<Member<V8FormDataEntryValue>> FormData::getAll(const String& name) {
-+  HeapVector<Member<V8FormDataEntryValue>> results;
-+
-+  for (const auto& entry : Entries()) {
-+    if (entry->name() != name)
-+      continue;
-+    V8FormDataEntryValue* value;
-+    if (entry->IsString()) {
-+      value = MakeGarbageCollected<V8FormDataEntryValue>(entry->Value());
-+    } else {
-+      DCHECK(entry->isFile());
-+      value = MakeGarbageCollected<V8FormDataEntryValue>(entry->GetFile());
-+    }
-+    results.push_back(value);
-+  }
-+  return results;
-+}
-+
-+bool FormData::has(const String& name) {
-+  for (const auto& entry : Entries()) {
-+    if (entry->name() == name)
-+      return true;
-+  }
-+  return false;
-+}
-+
-+void FormData::set(const String& name, const String& value) {
-+  SetEntry(MakeGarbageCollected<Entry>(name, value));
-+}
-+
-+void FormData::set(const String& name, Blob* blob, const String& filename) {
-+  SetEntry(MakeGarbageCollected<Entry>(name, blob, filename));
-+}
-+
-+void FormData::SetEntry(const Entry* entry) {
-+  DCHECK(entry);
-+  bool found = false;
-+  wtf_size_t i = 0;
-+  while (i < entries_.size()) {
-+    if (entries_[i]->name() != entry->name()) {
-+      ++i;
-+    } else if (found) {
-+      entries_.EraseAt(i);
-+    } else {
-+      found = true;
-+      entries_[i] = entry;
-+      ++i;
-+    }
-+  }
-+  if (!found)
-+    entries_.push_back(entry);
-+}
-+
-+void FormData::append(const String& name, Blob* blob, const String& filename) {
-+  entries_.push_back(MakeGarbageCollected<Entry>(name, blob, filename));
-+}
-+
-+void FormData::AppendFromElement(const String& name, int value) {
-+  append(ReplaceUnmatchedSurrogates(name), String::Number(value));
-+}
-+
-+void FormData::AppendFromElement(const String& name, File* file) {
-+  entries_.push_back(MakeGarbageCollected<Entry>(
-+      ReplaceUnmatchedSurrogates(name), file, String()));
-+}
-+
-+void FormData::AppendFromElement(const String& name, const String& value) {
-+  entries_.push_back(MakeGarbageCollected<Entry>(
-+      ReplaceUnmatchedSurrogates(name), ReplaceUnmatchedSurrogates(value)));
-+}
-+
-+std::string FormData::Encode(const String& string) const {
-+  return encoding_.Encode(string, UnencodableHandling::kXmlCharRef);
-+}
-+
-+scoped_refptr<EncodedFormData> FormData::EncodeFormData(
-+    EncodedFormData::EncodingType encoding_type) {
-+  scoped_refptr<EncodedFormData> form_data = EncodedFormData::Create();
-+  Vector<char> encoded_data;
-+  for (const auto& entry : Entries()) {
-+    FormDataEncoder::AddKeyValuePairAsFormData(
-+        encoded_data, Encode(entry->name()),
-+        entry->isFile()
-+            ? Encode(ReplaceUnmatchedSurrogates(entry->GetFile()->name()))
-+            : Encode(entry->Value()),
-+        encoding_type);
-+  }
-+  form_data->AppendData(encoded_data);
-+  return form_data;
-+}
-+
-+scoped_refptr<EncodedFormData> FormData::EncodeMultiPartFormData() {
-+  scoped_refptr<EncodedFormData> form_data = EncodedFormData::Create();
-+  form_data->SetBoundary(FormDataEncoder::GenerateUniqueBoundaryString());
-+  for (const auto& entry : Entries()) {
-+    Vector<char> header;
-+    FormDataEncoder::BeginMultiPartHeader(header, form_data->Boundary(),
-+                                          Encode(entry->name()));
-+
-+    // If the current type is blob, then we also need to include the
-+    // filename.
-+    if (entry->GetBlob()) {
-+      String name;
-+      if (auto* file = DynamicTo<File>(entry->GetBlob())) {
-+        // For file blob, use the filename (or relative path if it is
-+        // present) as the name.
-+        name = file->webkitRelativePath().empty() ? file->name()
-+                                                  : file->webkitRelativePath();
-+
-+        // If a filename is passed in FormData.append(), use it instead
-+        // of the file blob's name.
-+        if (!entry->Filename().IsNull())
-+          name = entry->Filename();
-+      } else {
-+        // For non-file blob, use the filename if it is passed in
-+        // FormData.append().
-+        if (!entry->Filename().IsNull())
-+          name = entry->Filename();
-+        else
-+          name = "blob";
-+      }
-+
-+      // We have to include the filename=".." part in the header, even if
-+      // the filename is empty.
-+      FormDataEncoder::AddFilenameToMultiPartHeader(header, Encoding(), name);
-+
-+      // Add the content type if available, or "application/octet-stream"
-+      // otherwise (RFC 1867).
-+      String content_type;
-+      if (entry->GetBlob()->type().empty())
-+        content_type = "application/octet-stream";
-+      else
-+        content_type = entry->GetBlob()->type();
-+      FormDataEncoder::AddContentTypeToMultiPartHeader(header, content_type);
-+    }
-+
-+    FormDataEncoder::FinishMultiPartHeader(header);
-+
-+    // Append body
-+    form_data->AppendData(header);
-+    if (entry->GetBlob()) {
-+      if (entry->GetBlob()->HasBackingFile()) {
-+        auto* file = To<File>(entry->GetBlob());
-+        // Do not add the file if the path is empty.
-+        if (!file->GetPath().empty())
-+          form_data->AppendFile(file->GetPath(), file->LastModifiedTime());
-+      } else {
-+        form_data->AppendBlob(entry->GetBlob()->GetBlobDataHandle());
-+      }
-+    } else {
-+      std::string encoded_value =
-+          Encode(NormalizeLineEndingsToCrLf(entry->Value()));
-+      form_data->AppendData(encoded_value);
-+    }
-+    form_data->AppendData(base::span_from_cstring("\r\n"));
-+  }
-+
-+  Vector<char> encoded_data;
-+  FormDataEncoder::AddBoundaryToMultiPartHeader(
-+      encoded_data, form_data->Boundary(), /*is_last_boundary=*/true);
-+  form_data->AppendData(encoded_data);
-+  return form_data;
-+}
-+
-+PairSyncIterable<FormData>::IterationSource* FormData::CreateIterationSource(
-+    ScriptState*) {
-+  return MakeGarbageCollected<FormDataIterationSource>(this);
-+}
-+
-+// ----------------------------------------------------------------
-+
-+FormData::Entry::Entry(const String& name, const String& value)
-+    : name_(name), value_(value) {
-+  DCHECK_EQ(name, ReplaceUnmatchedSurrogates(name))
-+      << "'name' should be a USVString.";
-+  DCHECK_EQ(value, ReplaceUnmatchedSurrogates(value))
-+      << "'value' should be a USVString.";
+ namespace {
+ 
+ class FormDataIterationSource final
+@@ -364,12 +388,48 @@ FormData::Entry::Entry(const String& name, const String& value)
+       << "'name' should be a USVString.";
+   DCHECK_EQ(value, ReplaceUnmatchedSurrogates(value))
+       << "'value' should be a USVString.";
 +#ifdef BLINK_AFEYE
-+  // afeye (0016): EVERY string field of every FormData (append/set and the
-+  // HTML form-submit path all funnel through this ctor). Captures name+value
-+  // as one span with a NUL separator - the per-field plaintext of
-+  // form-encoded uploads (DataDome captcha POST, CF challenge ack). EmitSpan
-+  // convention: <tag>\0<name>\0<value>.
 +  if (blink::afeye::Enabled() && AfeyeTaintOn() && !name.IsNull()) {
 +    std::string afeye_name = name.Utf8();
 +    std::string afeye_value = value.IsNull() ? std::string() : value.Utf8();
@@ -946,15 +138,13 @@ index 4b46b64..26ae617 100644
 +                           static_cast<uint32_t>(afeye_i));
 +  }
 +#endif
-+}
-+
-+FormData::Entry::Entry(const String& name, Blob* blob, const String& filename)
-+    : name_(name), blob_(blob), filename_(filename) {
-+  DCHECK_EQ(name, ReplaceUnmatchedSurrogates(name))
-+      << "'name' should be a USVString.";
+ }
+ 
+ FormData::Entry::Entry(const String& name, Blob* blob, const String& filename)
+     : name_(name), blob_(blob), filename_(filename) {
+   DCHECK_EQ(name, ReplaceUnmatchedSurrogates(name))
+       << "'name' should be a USVString.";
 +#ifdef BLINK_AFEYE
-+  // afeye (0016): blob entries - metadata only (the bytes flow async and are
-+  // captured by the net layer as the multipart req-body).
 +  if (blink::afeye::Enabled() && AfeyeTaintOn() && !name.IsNull()) {
 +    char afeye_buf[320];
 +    std::snprintf(afeye_buf, sizeof(afeye_buf),
@@ -966,80 +156,11 @@ index 4b46b64..26ae617 100644
 +                          afeye_buf);
 +  }
 +#endif
-+}
-+
-+void FormData::Entry::Trace(Visitor* visitor) const {
-+  visitor->Trace(blob_);
-+}
-+
-+File* FormData::Entry::GetFile() const {
-+  DCHECK(GetBlob());
-+  // The spec uses the passed filename when inserting entries into the list.
-+  // Here, we apply the filename (if present) as an override when extracting
-+  // entries.
-+  // FIXME: Consider applying the name during insertion.
-+
-+  if (auto* file = DynamicTo<File>(GetBlob())) {
-+    if (Filename().IsNull())
-+      return file;
-+    return file->Clone(Filename());
-+  }
-+
-+  String filename = filename_;
-+  if (filename.IsNull())
-+    filename = "blob";
-+  return MakeGarbageCollected<File>(filename, base::Time::Now(),
-+                                    GetBlob()->GetBlobDataHandle());
-+}
-+
-+void FormData::AppendToControlState(FormControlState& state) const {
-+  state.Append(String::Number(size()));
-+  for (const auto& entry : Entries()) {
-+    state.Append(entry->name());
-+    if (entry->isFile()) {
-+      state.Append("File");
-+      entry->GetFile()->AppendToControlState(state);
-+    } else {
-+      state.Append("USVString");
-+      state.Append(entry->Value());
-+    }
-+  }
-+}
-+
-+FormData* FormData::CreateFromControlState(ExecutionContext& execution_context,
-+                                           const FormControlState& state,
-+                                           wtf_size_t& index) {
-+  auto length = StringToUint64(state[index], NumberParsingOptions::Strict());
-+  if (!length) {
-+    return nullptr;
-+  }
-+  auto* form_data = MakeGarbageCollected<FormData>();
-+  ++index;
-+  for (uint64_t j = 0; j < *length; ++j) {
-+    // Need at least three items.
-+    if (index + 2 >= state.ValueSize())
-+      return nullptr;
-+    const String& name = state[index++];
-+    const String& entry_type = state[index++];
-+    if (entry_type == "File") {
-+      if (auto* file =
-+              File::CreateFromControlState(&execution_context, state, index)) {
-+        form_data->append(name, file);
-+      } else {
-+        return nullptr;
-+      }
-+    } else if (entry_type == "USVString") {
-+      form_data->append(name, state[index++]);
-+    } else {
-+      return nullptr;
-+    }
-+  }
-+  return form_data;
-+}
-+
-+}  // namespace blink
+ }
+ 
+ void FormData::Entry::Trace(Visitor* visitor) const {
 diff --git a/third_party/blink/renderer/core/url/url_search_params.cc b/third_party/blink/renderer/core/url/url_search_params.cc
-index 2f4cf50..68d3804 100644
+index 2f4cf50..26e31cb 100644
 --- a/third_party/blink/renderer/core/url/url_search_params.cc
 +++ b/third_party/blink/renderer/core/url/url_search_params.cc
 @@ -4,6 +4,13 @@
@@ -1056,14 +177,12 @@ index 2f4cf50..68d3804 100644
  #include <algorithm>
  #include <utility>
  
-@@ -19,6 +26,22 @@
+@@ -19,6 +26,20 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+// v12.1: g_afeye_taint is shared via the blink sink (0005) - five
-+// per-TU atomics were 500k/process, 5x the documented cap.
 +constexpr uint64_t kAfeyeTaintCap = 100000;
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
@@ -1073,20 +192,17 @@ index 2f4cf50..68d3804 100644
 +  return !g_afeye_taint_off &&
 +         afeye::g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
 +}
-+}  // namespace
++}
 +#endif
 +
  namespace {
  
  class URLSearchParamsIterationSource final
-@@ -171,6 +194,17 @@ void URLSearchParams::SetInputWithoutUpdate(const String& query_string) {
+@@ -171,6 +192,14 @@ void URLSearchParams::SetInputWithoutUpdate(const String& query_string) {
  String URLSearchParams::toString() const {
    Vector<char> encoded_data;
    EncodeAsFormData(encoded_data);
 +#ifdef BLINK_AFEYE
-+  // afeye (0016): the full form-encoded query string - the exact bytes a
-+  // fetch(X, {body: usp}) uploads. One span, content-matches the req-body
-+  // sink byte-for-byte (this IS its source in the common path).
 +  if (blink::afeye::Enabled() && AfeyeTaintOn() && !encoded_data.empty()) {
 +    blink::afeye::EmitSpan(
 +        blink::afeye::kTaintEdge, blink::afeye::NowNs(), "url-search-params",
@@ -1098,7 +214,7 @@ index 2f4cf50..68d3804 100644
  }
  
 diff --git a/third_party/blink/renderer/modules/encoding/text_decoder.cc b/third_party/blink/renderer/modules/encoding/text_decoder.cc
-index 833f434..d2d2b7e 100644
+index 833f434..577877e 100644
 --- a/third_party/blink/renderer/modules/encoding/text_decoder.cc
 +++ b/third_party/blink/renderer/modules/encoding/text_decoder.cc
 @@ -30,6 +30,13 @@
@@ -1115,14 +231,12 @@ index 833f434..d2d2b7e 100644
  #include "third_party/blink/renderer/bindings/core/v8/v8_union_arraybuffer_arraybufferview.h"
  #include "third_party/blink/renderer/core/typed_arrays/dom_array_buffer.h"
  #include "third_party/blink/renderer/core/typed_arrays/dom_array_buffer_view.h"
-@@ -41,6 +48,22 @@
+@@ -41,6 +48,20 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+// v12.1: g_afeye_taint is shared via the blink sink (0005) - five
-+// per-TU atomics were 500k/process, 5x the documented cap.
 +constexpr uint64_t kAfeyeTaintCap = 100000;
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
@@ -1132,21 +246,17 @@ index 833f434..d2d2b7e 100644
 +  return !g_afeye_taint_off &&
 +         afeye::g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
 +}
-+}  // namespace
++}
 +#endif
 +
  TextDecoder* TextDecoder::Create(const String& label,
                                   const TextDecoderOptions* options,
                                   ExceptionState& exception_state) {
-@@ -118,6 +141,17 @@ String TextDecoder::Decode(base::span<const uint8_t> input,
+@@ -118,6 +139,13 @@ String TextDecoder::Decode(base::span<const uint8_t> input,
  
    bool saw_error = false;
    String s = codec_->Decode(input, flush, fatal_, saw_error);
 +#ifdef BLINK_AFEYE
-+  // afeye (0016): the bytes->string boundary. The challenge RESPONSE often
-+  // arrives as UTF-8 bytes the antifraud decodes then feeds to JS crypto;
-+  // capture the input bytes here (the decoded String is cheap metadata - the
-+  // next TE/btoa/upload edge carries it forward if it re-enters the wire).
 +  if (blink::afeye::Enabled() && AfeyeTaintOn() && !input.empty()) {
 +    blink::afeye::EmitSpan(blink::afeye::kTaintEdge, blink::afeye::NowNs(),
 +                           "text-decoder", input.data(),
@@ -1157,7 +267,7 @@ index 833f434..d2d2b7e 100644
    if (fatal_ && saw_error) {
      if (!do_not_flush_) {
 diff --git a/third_party/blink/renderer/modules/encoding/text_encoder.cc b/third_party/blink/renderer/modules/encoding/text_encoder.cc
-index 8582a29..08c0b52 100644
+index 8582a29..c849f77 100644
 --- a/third_party/blink/renderer/modules/encoding/text_encoder.cc
 +++ b/third_party/blink/renderer/modules/encoding/text_encoder.cc
 @@ -30,6 +30,13 @@
@@ -1174,14 +284,12 @@ index 8582a29..08c0b52 100644
  #include "base/feature_list.h"
  #include "third_party/blink/renderer/bindings/modules/v8/v8_text_encoder_encode_into_result.h"
  #include "third_party/blink/renderer/core/execution_context/execution_context.h"
-@@ -40,6 +47,22 @@
+@@ -40,6 +47,20 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+// v12.1: g_afeye_taint is shared via the blink sink (0005) - five
-+// per-TU atomics were 500k/process, 5x the documented cap.
 +constexpr uint64_t kAfeyeTaintCap = 100000;
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
@@ -1191,23 +299,17 @@ index 8582a29..08c0b52 100644
 +  return !g_afeye_taint_off &&
 +         afeye::g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
 +}
-+}  // namespace
++}
 +#endif
 +
  // Controls if TextEncode will throw an exception when failed to allocate
  // buffer.
  BASE_FEATURE(kThrowExceptionWhenTextEncodeOOM,
-@@ -74,6 +97,20 @@ NotShared<DOMUint8Array> TextEncoder::encode(const String& input,
+@@ -74,6 +95,14 @@ NotShared<DOMUint8Array> TextEncoder::encode(const String& input,
    std::string result = VisitCharacters(input, [this](auto chars) {
      return codec_->Encode(chars, UnencodableHandling::kNone);
    });
 +#ifdef BLINK_AFEYE
-+  // afeye (0016): THE string->bytes boundary. Every antifraud payload that
-+  // leaves as UTF-8 bytes crosses TextEncoder.encode - Cloudflare/DataDome
-+  // form bodies, Kasada JS-AES plaintext, token JSON. The bytes exist here in
-+  // `result` before any encryption wraps them; emitting them lets the Rust
-+  // filter run content-runs against the crypto raw_data / req-body sinks
-+  // (backward slice by DATA, not by timer). Head-capped by the sink span.
 +  if (blink::afeye::Enabled() && AfeyeTaintOn() && !result.empty()) {
 +    blink::afeye::EmitSpan(
 +        blink::afeye::kTaintEdge, blink::afeye::NowNs(), "text-encoder",
@@ -1218,7 +320,7 @@ index 8582a29..08c0b52 100644
    if (base::FeatureList::IsEnabled(kThrowExceptionWhenTextEncodeOOM)) {
      NotShared<DOMUint8Array> result_array(
          DOMUint8Array::CreateOrNull(base::as_byte_span(result)));
-@@ -99,6 +136,18 @@ TextEncoderEncodeIntoResult* TextEncoder::encodeInto(
+@@ -99,6 +128,18 @@ TextEncoderEncodeIntoResult* TextEncoder::encodeInto(
        });
    encode_into_result->setRead(encode_into_result_data.code_units_read);
    encode_into_result->setWritten(encode_into_result_data.bytes_written);

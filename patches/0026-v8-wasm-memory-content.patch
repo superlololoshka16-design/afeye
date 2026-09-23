@@ -1,24 +1,11 @@
 diff --git a/v8/src/afeye/sink.cc b/v8/src/afeye/sink.cc
-index 108089b..30ca433 100644
+index 7073af3..2e62d70 100644
 --- a/v8/src/afeye/sink.cc
 +++ b/v8/src/afeye/sink.cc
-@@ -387,6 +387,39 @@ void EmitWasmMemGrow(size_t old_pages, size_t new_pages) {
+@@ -328,6 +328,24 @@ void EmitWasmMemGrow(size_t old_pages, size_t new_pages) {
    EmitStr(kWasmInstance, NowNs(), afeye_buf);
  }
  
-+// afeye (0026): wasm linear-memory CONTENT capture. Called at every
-+// WasmMemoryObject::Grow success exit with the live backing store. PoW-style
-+// antifraud (Kasada) accumulates its challenge state in linear memory and
-+// grows in deterministic bursts - the CONTENT at each grow is the payload
-+// the boundary sieve can never see (per-byte JS reads cross no C++ funnel).
-+// Same contract as every sink emitter:
-+//  - no-alloc on the emit path (EmitSpan copies into the ring under the lock)
-+//  - bounded: kSpanCap (64 KiB) head per dump + 512 dumps per process
-+//  - env-gated: AFEYE_TRACE_WASMMEMDUMP=0 disables content (grow events stay)
-+//  - the dump races a worker thread mutating memory: bytes may tear between
-+//    read and ring-copy. Accepted and documented - a torn head still carries
-+//    the deterministic burst pattern; exactness needs stop-the-world, which
-+//    antifraud would detect.
 +void EmitWasmMemContent(const void* mem_id, const uint8_t* base,
 +                        size_t byte_length) {
 +  static std::atomic<uint64_t> g_afeye_wmdump{0};
@@ -33,35 +20,28 @@ index 108089b..30ca433 100644
 +  std::snprintf(afeye_tag, sizeof(afeye_tag),
 +                "wasm-mem-content id=%p len=%llu", mem_id,
 +                static_cast<unsigned long long>(byte_length));
-+  // kind 4 (kWasmMemory) - the collector already names it "wasm-memory";
-+  // the tag prefix carries the discriminator, zero wire-format change.
 +  EmitSpan(kWasmMemory, NowNs(), afeye_tag, base,
 +           static_cast<uint32_t>(byte_length));
 +}
 +
  
- // v12.4: ring drops AND write errors - the 0023 witness must see both or
- // ENOSPC is an invisible gap the graph then misreads as dead-end evidence.
+ uint64_t SinkDropped() {
+   return g_dropped.load(std::memory_order_relaxed) +
 diff --git a/v8/src/afeye/sink.h b/v8/src/afeye/sink.h
-index 28fc833..366c16f 100644
+index 958beaf..9ab7d6e 100644
 --- a/v8/src/afeye/sink.h
 +++ b/v8/src/afeye/sink.h
-@@ -51,6 +51,13 @@ void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
+@@ -39,6 +39,8 @@ void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
  void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s);
  void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b);
  void EmitWasmMemGrow(size_t old_pages, size_t new_pages);
-+// afeye (0026): wasm linear-memory CONTENT head dump at every Grow exit
-+// and every Memory.buffer read-out - closes the SERIES.md-admitted
-+// "memory CONTENTS are a black box" hole. Off-heap backing store: sound
-+// across compaction. Head-capped by EmitSpan kSpanCap; 512-dump throttle;
-+// AFEYE_TRACE_WASMMEMDUMP=0 off.
 +void EmitWasmMemContent(const void* mem_id, const uint8_t* base,
 +                        size_t byte_length);
  void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
                const uint8_t* bytes, uint32_t n);
  uint64_t SinkDropped();
 diff --git a/v8/src/wasm/wasm-objects.cc b/v8/src/wasm/wasm-objects.cc
-index 85814c9..82e40ee 100644
+index 85814c9..5c1be85 100644
 --- a/v8/src/wasm/wasm-objects.cc
 +++ b/v8/src/wasm/wasm-objects.cc
 @@ -1126,8 +1126,17 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
@@ -117,16 +97,11 @@ index 85814c9..82e40ee 100644
    return static_cast<int32_t>(old_pages);  // success
  }
  
-@@ -1212,6 +1236,20 @@ DirectHandle<JSArrayBuffer> WasmMemoryObject::GetArrayBuffer(
+@@ -1212,6 +1236,15 @@ DirectHandle<JSArrayBuffer> WasmMemoryObject::GetArrayBuffer(
    DCHECK_EQ(memory_object->backing_store()->is_shared(), buffer->is_shared());
    DCHECK_EQ(memory_object->backing_store()->is_resizable_by_js().value(),
              !buffer->is_shared() && buffer->is_resizable_by_js());
 +#ifdef V8_AFEYE
-+  // v12.5 (0026): the JS read-out moment. Every `Memory.buffer` access
-+  // funnels here - this is where antifraud extracts the PoW RESULT from
-+  // linear memory. Grow-exit dumps catch mid-flight bursts; this catches
-+  // the final state at extraction. Bounded by the same 512-dump cap +
-+  // AFEYE_TRACE_WASMMEMDUMP gate as the grow hooks.
 +  if (v8::afeye::Enabled()) {
 +    v8::afeye::EmitWasmMemContent(
 +        memory_object->backing_store().raw(),

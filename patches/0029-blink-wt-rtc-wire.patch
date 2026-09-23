@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/modules/peerconnection/rtc_data_channel.cc b/third_party/blink/renderer/modules/peerconnection/rtc_data_channel.cc
-index 62e191a..676a717 100644
+index 62e191a..6455c48 100644
 --- a/third_party/blink/renderer/modules/peerconnection/rtc_data_channel.cc
 +++ b/third_party/blink/renderer/modules/peerconnection/rtc_data_channel.cc
 @@ -24,6 +24,13 @@
@@ -16,24 +16,12 @@ index 62e191a..676a717 100644
  #include <limits>
  #include <memory>
  #include <string>
-@@ -67,6 +74,37 @@
+@@ -67,6 +74,25 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+// afeye (0029): the WebTransport/RTC wire funnels. These transports BYPASS
-+// both the url_loader hooks (0011 - they are not HTTP requests) and the
-+// websocket hooks (0017 - they are not WS frames): WebTransport rides
-+// HTTP/3 QUIC streams/datagrams straight through mojo data pipes, and
-+// RTCDataChannel rides SCTP through the webrtc stack. A token leaving over
-+// either crossed NO sink before this patch. Kind 19 is the "non-HTTP wire
-+// frame" bucket (the collector names it "websocket"); the TAG carries the
-+// true transport identity. Records are spans (tag\\0bytes) so the Rust
-+// content graph links them by byte identity like every other payload.
-+// Per-TU throttle + env gate (house pattern 0013/0021/0026): a long-lived
-+// session cannot drown the ring; AFEYE_TRACE_WT_RTC=0 disables entirely.
-+// EmitSpan caps each record at kSpanCap (64 KiB) internally.
 +std::atomic<uint64_t> g_afeye_rtc{0};
 +inline bool AfeyeWireOn() {
 +  static const bool off = []() {
@@ -48,20 +36,17 @@ index 62e191a..676a717 100644
 +  afeye::EmitSpan(afeye::kWebSocket, afeye::NowNs(), tag, data,
 +                  static_cast<uint32_t>(len));
 +}
-+}  // namespace
++}
 +#endif  // BLINK_AFEYE
 +
  namespace {
  
  // These values are persisted to logs. Entries should not be renumbered and
-@@ -757,6 +795,15 @@ void RTCDataChannel::OnMaxMessageSizeChange(int max_message_size) {
+@@ -757,6 +783,12 @@ void RTCDataChannel::OnMaxMessageSizeChange(int max_message_size) {
  
  void RTCDataChannel::OnMessage(webrtc::DataBuffer buffer) {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +#ifdef BLINK_AFEYE
-+  // afeye (0029): RTCDataChannel IN - every received SCTP message before
-+  // the Blob/ArrayBuffer/String MessageEvent is dispatched to JS. The
-+  // challenge-response half of an RTC-exfil conversation.
 +  {
 +    base::span<const uint8_t> afeye_span(buffer.data);
 +    AfeyeEmitWire("rtc-datachannel-in", afeye_span.data(), afeye_span.size());
@@ -70,17 +55,11 @@ index 62e191a..676a717 100644
  
    if (buffer.binary) {
      switch (binary_type_) {
-@@ -824,6 +871,18 @@ void RTCDataChannel::SendRawData(const char* data, size_t length) {
+@@ -824,6 +856,12 @@ void RTCDataChannel::SendRawData(const char* data, size_t length) {
  void RTCDataChannel::SendDataBuffer(webrtc::DataBuffer data_buffer) {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
    CHECK(!was_transferred_);
 +#ifdef BLINK_AFEYE
-+  // afeye (0029): RTCDataChannel OUT - ALL FOUR send() overloads (String,
-+  // ArrayBuffer, ArrayBufferView, Blob-via-queue) and SendRawData funnel
-+  // into this single method before channel()->SendAsync hands the buffer to
-+  // the webrtc SCTP stack. The bytes leave the browser here and cross NO
-+  // other afeye sink: not url_loader (not HTTP), not websocket (not WS).
-+  // base::span(data_buffer.data) is stock's own conversion at :765.
 +  {
 +    base::span<const uint8_t> afeye_span(data_buffer.data);
 +    AfeyeEmitWire("rtc-datachannel-out", afeye_span.data(), afeye_span.size());
@@ -90,7 +69,7 @@ index 62e191a..676a717 100644
    // SCTP data channels queue the packet on failure and always return true, so
    // Send can be called asynchronously for them.
 diff --git a/third_party/blink/renderer/modules/webtransport/incoming_stream.cc b/third_party/blink/renderer/modules/webtransport/incoming_stream.cc
-index 0e8a03c..5dfb833 100644
+index 0e8a03c..f8c772c 100644
 --- a/third_party/blink/renderer/modules/webtransport/incoming_stream.cc
 +++ b/third_party/blink/renderer/modules/webtransport/incoming_stream.cc
 @@ -4,6 +4,13 @@
@@ -107,24 +86,12 @@ index 0e8a03c..5dfb833 100644
  #include <string.h>
  
  #include <utility>
-@@ -35,6 +42,37 @@
+@@ -35,6 +42,25 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+// afeye (0029): the WebTransport/RTC wire funnels. These transports BYPASS
-+// both the url_loader hooks (0011 - they are not HTTP requests) and the
-+// websocket hooks (0017 - they are not WS frames): WebTransport rides
-+// HTTP/3 QUIC streams/datagrams straight through mojo data pipes, and
-+// RTCDataChannel rides SCTP through the webrtc stack. A token leaving over
-+// either crossed NO sink before this patch. Kind 19 is the "non-HTTP wire
-+// frame" bucket (the collector names it "websocket"); the TAG carries the
-+// true transport identity. Records are spans (tag\\0bytes) so the Rust
-+// content graph links them by byte identity like every other payload.
-+// Per-TU throttle + env gate (house pattern 0013/0021/0026): a long-lived
-+// session cannot drown the ring; AFEYE_TRACE_WT_RTC=0 disables entirely.
-+// EmitSpan caps each record at kSpanCap (64 KiB) internally.
 +std::atomic<uint64_t> g_afeye_wtin{0};
 +inline bool AfeyeWireOn() {
 +  static const bool off = []() {
@@ -139,19 +106,17 @@ index 0e8a03c..5dfb833 100644
 +  afeye::EmitSpan(afeye::kWebSocket, afeye::NowNs(), tag, data,
 +                  static_cast<uint32_t>(len));
 +}
-+}  // namespace
++}
 +#endif  // BLINK_AFEYE
 +
  // An implementation of UnderlyingByteSourceBase that forwards all operations to
  // the IncomingStream object that created it.
  class IncomingStream::UnderlyingByteSource final
-@@ -234,6 +272,12 @@ void IncomingStream::ReadFromPipeAndEnqueue(ExceptionState& exception_state) {
+@@ -234,6 +260,10 @@ void IncomingStream::ReadFromPipeAndEnqueue(ExceptionState& exception_state) {
      case MOJO_RESULT_OK: {
        in_two_phase_read_ = true;
  
 +#ifdef BLINK_AFEYE
-+      // afeye (0029): WebTransport stream IN - the challenge/ack bytes the
-+      // server sends back over the QUIC stream, before JS ever sees them.
 +      AfeyeEmitWire("wt-stream-in", buffer.data(), buffer.size());
 +#endif
 +
@@ -159,7 +124,7 @@ index 0e8a03c..5dfb833 100644
        size_t read_bytes =
            RespondBYOBRequestOrEnqueueBytes(buffer, exception_state);
 diff --git a/third_party/blink/renderer/modules/webtransport/outgoing_stream.cc b/third_party/blink/renderer/modules/webtransport/outgoing_stream.cc
-index f95d6a4..4f5f8e0 100644
+index f95d6a4..c27e645 100644
 --- a/third_party/blink/renderer/modules/webtransport/outgoing_stream.cc
 +++ b/third_party/blink/renderer/modules/webtransport/outgoing_stream.cc
 @@ -4,6 +4,13 @@
@@ -176,24 +141,12 @@ index f95d6a4..4f5f8e0 100644
  #include <cstring>
  #include <utility>
  
-@@ -36,6 +43,37 @@
+@@ -36,6 +43,25 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+// afeye (0029): the WebTransport/RTC wire funnels. These transports BYPASS
-+// both the url_loader hooks (0011 - they are not HTTP requests) and the
-+// websocket hooks (0017 - they are not WS frames): WebTransport rides
-+// HTTP/3 QUIC streams/datagrams straight through mojo data pipes, and
-+// RTCDataChannel rides SCTP through the webrtc stack. A token leaving over
-+// either crossed NO sink before this patch. Kind 19 is the "non-HTTP wire
-+// frame" bucket (the collector names it "websocket"); the TAG carries the
-+// true transport identity. Records are spans (tag\\0bytes) so the Rust
-+// content graph links them by byte identity like every other payload.
-+// Per-TU throttle + env gate (house pattern 0013/0021/0026): a long-lived
-+// session cannot drown the ring; AFEYE_TRACE_WT_RTC=0 disables entirely.
-+// EmitSpan caps each record at kSpanCap (64 KiB) internally.
 +std::atomic<uint64_t> g_afeye_wtout{0};
 +inline bool AfeyeWireOn() {
 +  static const bool off = []() {
@@ -208,20 +161,17 @@ index f95d6a4..4f5f8e0 100644
 +  afeye::EmitSpan(afeye::kWebSocket, afeye::NowNs(), tag, data,
 +                  static_cast<uint32_t>(len));
 +}
-+}  // namespace
++}
 +#endif  // BLINK_AFEYE
 +
  namespace {
  
  class SendStreamAbortAlgorithm final : public AbortSignal::Algorithm {
-@@ -437,6 +475,13 @@ size_t OutgoingStream::WriteDataSynchronously(base::span<const uint8_t> data) {
+@@ -437,6 +463,10 @@ size_t OutgoingStream::WriteDataSynchronously(base::span<const uint8_t> data) {
             << data.size() << ")";
    DCHECK(data_pipe_);
  
 +#ifdef BLINK_AFEYE
-+  // afeye (0029): WebTransport stream OUT. Every stream byte funnels here -
-+  // WriteOrCacheData (direct writes) and WriteCachedData (backpressure
-+  // flushes) both call this single method before the mojo pipe write.
 +  AfeyeEmitWire("wt-stream-out", data.data(), data.size());
 +#endif
 +
@@ -229,7 +179,7 @@ index f95d6a4..4f5f8e0 100644
    MojoResult result = data_pipe_->WriteData(data, MOJO_WRITE_DATA_FLAG_NONE,
                                              actually_written_bytes);
 diff --git a/third_party/blink/renderer/modules/webtransport/web_transport.cc b/third_party/blink/renderer/modules/webtransport/web_transport.cc
-index 066fa6d..c169a33 100644
+index 066fa6d..2ad6dd1 100644
 --- a/third_party/blink/renderer/modules/webtransport/web_transport.cc
 +++ b/third_party/blink/renderer/modules/webtransport/web_transport.cc
 @@ -4,6 +4,13 @@
@@ -246,24 +196,12 @@ index 066fa6d..c169a33 100644
  #include <stdint.h>
  
  #include <limits>
-@@ -84,6 +91,37 @@
+@@ -84,6 +91,25 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+// afeye (0029): the WebTransport/RTC wire funnels. These transports BYPASS
-+// both the url_loader hooks (0011 - they are not HTTP requests) and the
-+// websocket hooks (0017 - they are not WS frames): WebTransport rides
-+// HTTP/3 QUIC streams/datagrams straight through mojo data pipes, and
-+// RTCDataChannel rides SCTP through the webrtc stack. A token leaving over
-+// either crossed NO sink before this patch. Kind 19 is the "non-HTTP wire
-+// frame" bucket (the collector names it "websocket"); the TAG carries the
-+// true transport identity. Records are spans (tag\\0bytes) so the Rust
-+// content graph links them by byte identity like every other payload.
-+// Per-TU throttle + env gate (house pattern 0013/0021/0026): a long-lived
-+// session cannot drown the ring; AFEYE_TRACE_WT_RTC=0 disables entirely.
-+// EmitSpan caps each record at kSpanCap (64 KiB) internally.
 +std::atomic<uint64_t> g_afeye_wtdg{0};
 +inline bool AfeyeWireOn() {
 +  static const bool off = []() {
@@ -278,33 +216,27 @@ index 066fa6d..c169a33 100644
 +  afeye::EmitSpan(afeye::kWebSocket, afeye::NowNs(), tag, data,
 +                  static_cast<uint32_t>(len));
 +}
-+}  // namespace
++}
 +#endif  // BLINK_AFEYE
 +
  namespace {
  
  // The incoming max age to to be used when datagrams.incomingMaxAge is set to
-@@ -256,6 +294,13 @@ class WebTransport::DatagramUnderlyingSink final : public UnderlyingSinkBase {
+@@ -256,6 +282,9 @@ class WebTransport::DatagramUnderlyingSink final : public UnderlyingSinkBase {
  
   private:
    ScriptPromise<IDLUndefined> SendDatagram(base::span<const uint8_t> data) {
 +#ifdef BLINK_AFEYE
-+    // afeye (0029): WebTransport DATAGRAM out - the unreliable transport
-+    // antifraud prefers for telemetry (no stream ordering, no flow control,
-+    // nothing HTTP-shaped for proxies to inspect). Both the bound and the
-+    // pending_datagrams_ queue paths pass through here first.
 +    AfeyeEmitWire("wt-datagram-out", data.data(), data.size());
 +#endif
      auto* resolver = MakeGarbageCollected<ScriptPromiseResolver<IDLUndefined>>(
          web_transport_->script_state_);
      pending_datagrams_resolvers_.push_back(resolver);
-@@ -1194,6 +1239,11 @@ void WebTransport::OnHandshakeFailed(
+@@ -1194,6 +1223,9 @@ void WebTransport::OnHandshakeFailed(
  }
  
  void WebTransport::OnDatagramReceived(base::span<const uint8_t> data) {
 +#ifdef BLINK_AFEYE
-+  // afeye (0029): WebTransport datagram IN - server challenge/response
-+  // bytes before they reach the readable stream (and JS).
 +  AfeyeEmitWire("wt-datagram-in", data.data(), data.size());
 +#endif
    datagram_underlying_source_->OnDatagramReceived(

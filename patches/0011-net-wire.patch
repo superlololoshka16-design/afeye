@@ -1,53 +1,39 @@
-diff --git a/services/network/afeye_sink.h b/services/network/afeye_sink.h
-new file mode 100644
-index 0000000000..1111111111
---- /dev/null
-+++ b/services/network/afeye_sink.h
-@@ -0,0 +0,38 @@
-+#ifndef SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
-+#define SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
-+
-+#include <stddef.h>
-+#include <stdint.h>
-+
-+#ifdef NET_AFEYE
-+
-+namespace network {
-+namespace afeye {
-+
-+enum EventKind : uint8_t {
-+  kSinkHello = 0,
-+  kNetReq = 17,
-+  kNetRespBody = 18,
-+  kWebSocket = 19,
-+};
-+
-+bool Enabled();
-+uint64_t NowNs();
-+void EmitFlags(uint8_t kind, uint64_t ts_ns, uint8_t flags, const void* data,
-+               uint32_t len);
-+void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
-+void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s);
-+void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b);
-+void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
-+              const uint8_t* bytes, uint32_t n);
-+uint64_t SinkDropped();
-+bool Flush(uint32_t timeout_ms);
-+
+diff --git a/services/network/BUILD.gn b/services/network/BUILD.gn
+index 518ada2..9a0877f 100644
+--- a/services/network/BUILD.gn
++++ b/services/network/BUILD.gn
+@@ -9,6 +9,11 @@ import("//net/features.gni")
+ import("//services/network/public/cpp/features.gni")
+ import("//testing/libfuzzer/fuzzer_test.gni")
+ 
++declare_args() {
++  # afeye: env-activated record sink compiled into the network service.
++  network_enable_afeye = false
 +}
-+}  // namespace network
 +
-+#endif
-+
-+#endif
-+
-+
+ component("network_service") {
+   sources = [
+     "accept_ch_frame_interceptor.cc",
+@@ -447,6 +452,13 @@ component("network_service") {
+   }
+ 
+   defines = [ "IS_NETWORK_SERVICE_IMPL" ]
++  if (network_enable_afeye) {
++    sources += [
++      "afeye_sink.cc",
++      "afeye_sink.h",
++    ]
++    defines += [ "NET_AFEYE" ]
++  }
+ }
+ 
+ if (is_linux || is_chromeos) {
 diff --git a/services/network/afeye_sink.cc b/services/network/afeye_sink.cc
 new file mode 100644
-index 0000000000..1111111111
+index 0000000..84e4952
 --- /dev/null
 +++ b/services/network/afeye_sink.cc
-@@ -0,0 +37,315 @@
+@@ -0,0 +1,300 @@
 +#include "services/network/afeye_sink.h"
 +
 +#ifdef NET_AFEYE
@@ -82,7 +68,7 @@ index 0000000000..1111111111
 +std::atomic<bool> g_on{false};
 +std::atomic<uint64_t> g_dropped{0};
 +std::once_flag g_init_once;
-+std::atomic<pid_t> g_pid{0};  // v12.4: atomic + CAS - see Enabled()
++std::atomic<pid_t> g_pid{0};
 +
 +struct Ring {
 +  std::atomic_flag lock = ATOMIC_FLAG_INIT;
@@ -112,8 +98,6 @@ index 0000000000..1111111111
 +  return kDir;
 +}
 +
-+// v12.4 (0001 pattern): write errors are COUNTED and folded into the
-+// drop witness - a silent return made ENOSPC/EIO invisible loss.
 +std::atomic<uint64_t> g_write_err{0};
 +
 +void WriteAll(int fd, const uint8_t* p, size_t n) {
@@ -154,8 +138,6 @@ index 0000000000..1111111111
 +  std::string path = std::string(RawDir()) + "/" + kLayer + "-" + pid + ".rec";
 +  int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
 +  if (fd >= 0) EmitHello(fd);
-+  // v12.4 (N6, 0001 pattern): pre-sized buffer, memcpy under lock, write
-+  // outside it - buf.assign() malloc'd up to 1 MiB INSIDE the ring lock.
 +  static thread_local std::vector<uint8_t> buf;
 +  buf.resize(kMaxRecord);
 +  for (;;) {
@@ -187,7 +169,6 @@ index 0000000000..1111111111
 +    if (have) {
 +      if (fd >= 0) {
 +        WriteAll(fd, buf.data(), len);
-+        // v12.4 (0001 pattern): failed write -> force reopen next cycle.
 +        if (g_write_err.load(std::memory_order_relaxed) != werr_before) {
 +          ::close(fd);
 +          fd = -1;
@@ -203,13 +184,7 @@ index 0000000000..1111111111
 +  }
 +}
 +
-+// v12.1: fork safety (see 0001 for the rationale). The network service
-+// utility process also forks (e.g. crashpad helpers); same re-init rule.
 +void ReinitAfterFork() {
-+  // v12.4 (0001 pattern hardened): clear the lock unconditionally - the
-+  // dead parent thread may have held it at fork time and test_and_set
-+  // would spin forever. Race-free: in the fresh child only the calling
-+  // thread exists.
 +  g_ring.lock.clear(std::memory_order_release);
 +  g_ring.tail = 0;
 +  g_ring.head = 0;
@@ -228,13 +203,10 @@ index 0000000000..1111111111
 +  std::atexit([] { Flush(500); });
 +}
 +
-+}  // namespace
++}
 +
 +bool Enabled() {
 +  std::call_once(g_init_once, InitOnce);
-+  // v12.4: CAS so concurrent child threads admit exactly ONE reinit (two
-+  // drain threads would interleave WriteAll chunks into one file); a
-+  // disabled sink never spawns a drain thread or a .rec file (N4).
 +  pid_t me = ::getpid();
 +  if (g_pid.load(std::memory_order_acquire) != me) {
 +    pid_t old = g_pid.load(std::memory_order_acquire);
@@ -335,7 +307,6 @@ index 0000000000..1111111111
 +            static_cast<uint32_t>(buf.size()));
 +}
 +
-+// v12.4 (0001 pattern): ring drops AND write errors - see SinkDropped.
 +uint64_t SinkDropped() {
 +  return g_dropped.load(std::memory_order_relaxed) +
 +         g_write_err.load(std::memory_order_relaxed);
@@ -358,43 +329,60 @@ index 0000000000..1111111111
 +}
 +
 +}
-+}  // namespace network
++}
 +
 +#endif
 +
 +
---- a/services/network/BUILD.gn
-+++ b/services/network/BUILD.gn
-@@ -8,6 +325,11 @@
- import("//net/features.gni")
- import("//services/network/public/cpp/features.gni")
- import("//testing/libfuzzer/fuzzer_test.gni")
+diff --git a/services/network/afeye_sink.h b/services/network/afeye_sink.h
+new file mode 100644
+index 0000000..b421479
+--- /dev/null
++++ b/services/network/afeye_sink.h
+@@ -0,0 +1,38 @@
++#ifndef SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
++#define SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
 +
-+declare_args() {
-+  # afeye: env-activated record sink compiled into the network service.
-+  network_enable_afeye = false
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef NET_AFEYE
++
++namespace network {
++namespace afeye {
++
++enum EventKind : uint8_t {
++  kSinkHello = 0,
++  kNetReq = 17,
++  kNetRespBody = 18,
++  kWebSocket = 19,
++};
++
++bool Enabled();
++uint64_t NowNs();
++void EmitFlags(uint8_t kind, uint64_t ts_ns, uint8_t flags, const void* data,
++               uint32_t len);
++void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
++void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s);
++void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b);
++void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
++              const uint8_t* bytes, uint32_t n);
++uint64_t SinkDropped();
++bool Flush(uint32_t timeout_ms);
++
 +}
- 
- component("network_service") {
-   sources = [
-@@ -447,6 +769,13 @@
-   }
- 
-   defines = [ "IS_NETWORK_SERVICE_IMPL" ]
-+  if (network_enable_afeye) {
-+    sources += [
-+      "afeye_sink.cc",
-+      "afeye_sink.h",
-+    ]
-+    defines += [ "NET_AFEYE" ]
-+  }
- }
- 
- if (is_linux || is_chromeos) {
-
++}
++
++#endif
++
++#endif
++
++
+diff --git a/services/network/url_loader.cc b/services/network/url_loader.cc
+index 1e700c0..1720130 100644
 --- a/services/network/url_loader.cc
 +++ b/services/network/url_loader.cc
-@@ -3,6 +332,10 @@
+@@ -3,6 +3,10 @@
  // found in the LICENSE file.
  
  #include "services/network/url_loader.h"
@@ -405,7 +393,7 @@ index 0000000000..1111111111
  
  #include <algorithm>
  #include <limits>
-@@ -633,6 +966,31 @@
+@@ -633,6 +637,31 @@ void URLLoader::OpenFilesForUpload(const ResourceRequest& request) {
  void URLLoader::SetUpUpload(
      const ResourceRequest& request,
      base::expected<std::vector<base::File>, net::Error> file_open_result) {
@@ -437,7 +425,7 @@ index 0000000000..1111111111
    if (file_opener_for_upload_) {
      file_opener_for_upload_.reset();
      // This corresponds to the LogBlockedBy call made just before creating
-@@ -739,6 +1097,20 @@
+@@ -739,6 +768,20 @@ void URLLoader::OnDoneBeginningTrustTokenOperation(
  }
  
  void URLLoader::ScheduleStart() {
@@ -458,7 +446,7 @@ index 0000000000..1111111111
    TRACE_EVENT("loading", "URLLoader::ScheduleStart",
                net::NetLogWithSourceToFlow(url_request_->net_log()));
    bool defer = false;
-@@ -1195,6 +1567,28 @@
+@@ -1195,6 +1238,28 @@ void URLLoader::OnDoneFinalizingTrustTokenOperation(net::Error error) {
  }
  
  void URLLoader::ContinueOnResponseStarted() {
@@ -487,7 +475,7 @@ index 0000000000..1111111111
    // Do not account header bytes when reporting received body bytes to client.
    reported_total_encoded_bytes_ =
        url_request_->GetTotalReceivedBytes().InBytes();
-@@ -1647,6 +2041,18 @@
+@@ -1647,6 +1712,18 @@ void URLLoader::DidRead(int num_bytes,
    url_read_state_ = URLReadState::kWaitMojoPipeWritable;
  
    size_t new_data_offset = pending_write_buffer_offset_;
@@ -506,7 +494,7 @@ index 0000000000..1111111111
    MaybeCollectDurableMessage(new_data_offset, num_bytes);
  
    if (num_bytes > 0) {
-@@ -1941,6 +2347,21 @@
+@@ -1941,6 +2018,21 @@ void URLLoader::CancelRequest() {
  }
  
  void URLLoader::NotifyCompleted(int error_code) {
@@ -528,10 +516,11 @@ index 0000000000..1111111111
    // Ensure sending the final upload progress message here, since
    // OnResponseCompleted can be called without OnResponseStarted on cancellation
    // or error cases.
-
+diff --git a/services/network/websocket.cc b/services/network/websocket.cc
+index c1a9892..89673ec 100644
 --- a/services/network/websocket.cc
 +++ b/services/network/websocket.cc
-@@ -3,6 +424,9 @@
+@@ -3,6 +3,9 @@
  // found in the LICENSE file.
  
  #include "services/network/websocket.h"
@@ -541,7 +530,7 @@ index 0000000000..1111111111
  
  #include <inttypes.h>
  #include <string.h>
-@@ -411,6 +835,16 @@
+@@ -411,6 +414,16 @@ void WebSocket::WebSocketEventHandler::OnDataFrame(
      bool fin,
      net::WebSocketFrameHeader::OpCode type,
      base::span<const char> payload) {

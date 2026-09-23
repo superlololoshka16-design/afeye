@@ -1,3 +1,5 @@
+diff --git a/v8/src/codegen/compiler.cc b/v8/src/codegen/compiler.cc
+index 203c9d3..eb5d461 100644
 --- a/v8/src/codegen/compiler.cc
 +++ b/v8/src/codegen/compiler.cc
 @@ -3,6 +3,14 @@
@@ -15,7 +17,9 @@
  
  #include <memory>
  #include <optional>
-@@ -75,4 +83,59 @@ namespace internal {
+@@ -75,6 +83,61 @@ namespace internal {
+ 
+ namespace {
  
 +// afeye (v6): raw script-source dumper. ONE definition, placed before every
 +// call site - the three compilation funnels below (eval, streamed, buffered)
@@ -75,7 +79,7 @@
  constexpr bool IsOSR(BytecodeOffset osr_offset) { return !osr_offset.IsNone(); }
  
  class CompilerTracer : public AllStatic {
-@@ -3304,6 +3359,9 @@ MaybeDirectHandle<JSFunction> Compiler::GetFunctionFromEval(
+@@ -3304,6 +3367,9 @@ MaybeDirectHandle<JSFunction> Compiler::GetFunctionFromEval(
      LanguageMode language_mode, ParseRestriction restriction,
      int parameters_end_pos, int eval_position,
      ParsingWhileDebugging parsing_while_debugging) {
@@ -85,7 +89,7 @@
    // The cache lookup key needs to be aware of the separation between the
    // parameters and the body to prevent this valid invocation:
    //   Function("", "function anonymous(\n/**/) {\n}");
-@@ -3953,6 +4011,10 @@ MaybeDirectHandle<SharedFunctionInfo> GetSharedFunctionInfoForScriptImpl(
+@@ -3953,6 +4019,10 @@ MaybeDirectHandle<SharedFunctionInfo> GetSharedFunctionInfoForScriptImpl(
      ScriptCompiler::CompileOptions compile_options,
      ScriptCompiler::NoCacheReason no_cache_reason, NativesFlag natives,
      ScriptCompiler::CompilationDetails* compilation_details) {
@@ -96,7 +100,7 @@
    ScriptCompileTimerScope compile_timer(isolate, no_cache_reason,
                                          compilation_details);
  
-@@ -4297,6 +4359,10 @@ Compiler::GetSharedFunctionInfoForStreamedScript(
+@@ -4297,6 +4367,10 @@ Compiler::GetSharedFunctionInfoForStreamedScript(
      const ScriptDetails& script_details, ScriptStreamingData* streaming_data,
      IsCompiledScope* is_compiled_scope,
      ScriptCompiler::CompilationDetails* compilation_details) {

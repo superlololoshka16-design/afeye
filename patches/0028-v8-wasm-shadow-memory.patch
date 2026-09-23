@@ -18,10 +18,10 @@ index 6f63a62..ad1e764 100644
    }
 diff --git a/v8/src/afeye/wasm_shadow.cc b/v8/src/afeye/wasm_shadow.cc
 new file mode 100644
-index 0000000..fff6929
+index 0000000..b54978b
 --- /dev/null
 +++ b/v8/src/afeye/wasm_shadow.cc
-@@ -0,0 +1,809 @@
+@@ -0,0 +1,605 @@
 +#include "src/afeye/wasm_shadow.h"
 +
 +#ifdef V8_AFEYE
@@ -42,59 +42,26 @@ index 0000000..fff6929
 +namespace afeye {
 +namespace {
 +
-+// ---------------------------------------------------------------------------
-+// bounds. Each exists so a memory-hungry PoW module cannot turn the tracer into
-+// a stall, and every refusal that LOSES taint is counted so the Rust witness
-+// never reads a shadow gap as a dead end.
-+// ---------------------------------------------------------------------------
 +
-+// Tracked instances. 64 is far past any real page's module count (antifraud
-+// ships 1-3); the table is a fixed array, so the hot path never allocates and
-+// never rehashes.
 +constexpr size_t kMaxTracked = 64;
 +constexpr size_t kTrackedMask = kMaxTracked - 1;
 +
-+// Per-instance shadow capacity, 1:1 with linear memory. 256 MiB covers the
-+// largest memory any realistic PoW uses; the memory32 spec max is 4 GiB, so a
-+// bigger module is tracked only up to this cap and the untracked tail counted.
 +constexpr size_t kMaxShadowBytes = 256u << 20;
 +
-+// One bulk op (memory.copy/fill/init) cannot move more shadow bytes than this.
-+// A 256 MiB memory.copy would otherwise become a 256 MiB memmove on the wasm
-+// thread mid-crawl; the truncated tail is counted.
 +constexpr size_t kMaxBulkBytes = 8u << 20;
 +
-+// One grow-by-copy migration cannot copy more than this. The rekey runs on the
-+// JS thread inside memory.grow, so a 256 MiB memcpy there is a visible stall.
-+// Truncation is counted.
 +constexpr size_t kMigrateCapBytes = 32u << 20;
 +
-+// Records emitted per process. Bounded like every other afeye stream (0026's
-+// content dumps use 512, the taint-edge stream 100k).
 +constexpr uint64_t kEmitCap = 100000;
 +
-+// Bytes of linear memory read into one record body. Matches sink.cc's kSpanCap
-+// (EmitSpan head-caps there anyway) so no work is done that gets thrown away.
 +constexpr uint32_t kEmitBodyCap = 64u * 1024u;
 +
-+// Open addressing cannot punch a hole in a probe chain, so a retired slot keeps
-+// a tombstone that lookups skip and inserts may reuse. A real mem_id is a
-+// page-aligned base pointer and is never 1.
 +void* const kTombstone = reinterpret_cast<void*>(1);
 +
 +struct ShadowEntry {
-+  // Published LAST with release ordering: a reader that acquire-loads a
-+  // matching mem_id and then sees shadow == nullptr is observing a claim still
-+  // in progress, and must bail (a few missed accesses during setup, never a
-+  // torn read).
 +  std::atomic<uint8_t*> shadow{nullptr};
 +  std::atomic<size_t> len{0};
-+  // Installed before {shadow} on claim, tombstoned on retire. The claim CAS is
-+  // what makes two threads racing on one free slot produce exactly one winner.
 +  std::atomic<void*> mem_id{nullptr};
-+  // True once this region has held non-zero tags. A fresh mmap is zero-filled by
-+  // the kernel, so a slot's first occupant needs no memset and later ones do -
-+  // this avoids a 256 MiB memset on first allocation.
 +  std::atomic<bool> dirty{false};
 +};
 +
@@ -103,29 +70,13 @@ index 0000000..fff6929
 +std::atomic<uint64_t> g_shadow_emitted{0};
 +std::atomic<uint64_t> g_shadow_live{0};
 +
-+// The value-taint handoff (see the HONEST PRECISION LIMIT in the header).
-+// liftoff has no per-register taint side table, so a tainted value pushed into
-+// wasm parks its tag here and the next store on this thread applies it.
 +thread_local uint32_t t_store_taint = 0;
 +thread_local uint32_t t_load_taint = 0;
 +
-+// Per-thread emit dedup. A tight PoW loop over one tainted buffer would
-+// otherwise emit once per iteration and saturate kEmitCap in milliseconds,
-+// drowning every other record in the process. Consecutive IDENTICAL events (same
-+// op, offset, length, tag) emit once; the next CHANGE emits again. So record
-+// volume tracks taint FLOW, not access count - the honest volume story for a
-+// tracing build. 0 is "nothing yet"; no real signature hashes to 0.
 +thread_local uint64_t t_last_sig = 0;
 +
-+// The STAGE half of a bulk op (see the header for why stage/commit and not one
-+// callout). Thread-local, not passed back through the generated code: the real
-+// memory.copy/fill/init runtime call clobbers caller-saved registers, and the
-+// popped VarStates holding the operands are no longer in cache_state, so
-+// SpillAllRegisters will not save them. Keeping the operands here means the
-+// COMMIT callout takes ZERO arguments and needs no frame-slot or rsp
-+// assumption - which is what makes it arch-generic.
 +struct StagedBulk {
-+  uint32_t op = 0;  // kOpCopy/kOpFill/kOpInit below; 0 = nothing staged
++  uint32_t op = 0;
 +  void* dst_base = nullptr;
 +  size_t dst_off = 0;
 +  void* src_base = nullptr;
@@ -134,9 +85,6 @@ index 0000000..fff6929
 +};
 +thread_local StagedBulk t_staged;
 +
-+// Bulk/access op ids, internal to this translation unit (the emitted-code seam
-+// in wasm_shadow.h uses one dedicated function per operation, not an opcode
-+// enum, so these are only for record-tag bookkeeping and the dedup signature).
 +enum : uint32_t {
 +  kOpNone = 0,
 +  kOpLoad = 1,
@@ -147,9 +95,6 @@ index 0000000..fff6929
 +  kOpReKey = 6,
 +};
 +
-+// env gate: AFEYE_WASM_SHADOW=0 disables the whole layer (0026's grow/buffer
-+// content dumps keep working; only the per-byte shadow stops). Read once,
-+// cached - the same idiom taint.cc uses for AFEYE_TAINT (taint.cc:49-55).
 +bool ShadowEnvOn() {
 +  static const bool off = []() {
 +    const char* v = ::getenv("AFEYE_WASM_SHADOW");
@@ -158,9 +103,6 @@ index 0000000..fff6929
 +  return !off;
 +}
 +
-+// Emission gate, separate from the tracking gate: AFEYE_TRACE_WASMSHADOW=0 keeps
-+// the shadow plus the load/store thread-local seam live but stops records.
-+// Matches the series convention of a per-stream AFEYE_TRACE_* knob.
 +bool EmitOn() {
 +  static const bool off = []() {
 +    const char* v = ::getenv("AFEYE_TRACE_WASMSHADOW");
@@ -173,18 +115,12 @@ index 0000000..fff6929
 +  g_shadow_dropped.fetch_add(1, std::memory_order_relaxed);
 +}
 +
-+// Linear bases are page-aligned, so the low 12 bits carry no entropy: shift them
-+// out, then keep the HIGH bits of a multiply (the better half of the mixer) for
-+// the 6-bit table index.
 +inline size_t HashId(const void* mem_id) {
 +  uint64_t v = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mem_id)) >> 12;
 +  v *= 0x9E3779B97F4A7C15ull;
 +  return static_cast<size_t>(v >> 51) & kTrackedMask;
 +}
 +
-+// Probe for {mem_id}. Stops at the first genuinely empty slot (end of chain),
-+// skips tombstones and foreign keys. The returned entry may still have
-+// shadow == nullptr (claim in progress) - callers must check.
 +inline ShadowEntry* FindEntry(void* mem_id) {
 +  size_t idx = HashId(mem_id);
 +  for (size_t p = 0; p < kMaxTracked; ++p) {
@@ -194,19 +130,16 @@ index 0000000..fff6929
 +    if (k == nullptr) return nullptr;
 +    ++idx;
 +  }
-+  return nullptr;  // probe budget exhausted (table saturated)
++  return nullptr;
 +}
 +
-+// Claim a slot: an existing entry if {mem_id} is already tracked, else a freshly
-+// claimed one (mem_id CAS-installed, shadow/len NOT yet published). nullptr =
-+// table full; the caller counts that as a drop.
 +inline ShadowEntry* ClaimSlot(void* mem_id) {
 +  size_t idx = HashId(mem_id);
 +  ShadowEntry* reuse = nullptr;
 +  for (size_t p = 0; p < kMaxTracked; ++p) {
 +    ShadowEntry* e = &g_shadow[idx & kTrackedMask];
 +    void* k = e->mem_id.load(std::memory_order_acquire);
-+    if (k == mem_id) return e;  // another thread won the race to track it
++    if (k == mem_id) return e;
 +    if (k == nullptr) {
 +      void* expected = nullptr;
 +      if (e->mem_id.compare_exchange_strong(expected, mem_id,
@@ -214,7 +147,7 @@ index 0000000..fff6929
 +                                            std::memory_order_relaxed)) {
 +        return e;
 +      }
-+      return FindEntry(mem_id);  // lost the race; re-probe for the winner's key
++      return FindEntry(mem_id);
 +    }
 +    if (k == kTombstone && reuse == nullptr) reuse = e;
 +    ++idx;
@@ -228,20 +161,9 @@ index 0000000..fff6929
 +    }
 +    return FindEntry(mem_id);
 +  }
-+  return nullptr;  // every slot holds a live foreign key
++  return nullptr;
 +}
 +
-+// The mapping for a slot, created at most once per slot for the process lifetime.
-+// mmap rather than malloc: the region must be zero-filled on first touch (the
-+// kernel gives that free), must not perturb the V8 heap or its accounting, and
-+// must be cheap to leave reserved-but-untouched. MAP_NORESERVE keeps
-+// kMaxShadowBytes of ADDRESS SPACE per slot from becoming committed memory -
-+// physical pages materialize only where a tag is actually written. This is the
-+// reserve-address-space-then-touch-lazily shape V8 itself uses for wasm memory
-+// (src/base/platform/platform-posix.cc:136 sets MAP_ANONYMOUS; :680 and :1186
-+// use MAP_ANONYMOUS|MAP_PRIVATE), and afeye already talks to the kernel directly
-+// instead of through base/ (sink.cc:17-21 includes fcntl.h/unistd.h and calls
-+// ::open/::write).
 +uint8_t* SlotMapping(ShadowEntry* e) {
 +  uint8_t* cur = e->shadow.load(std::memory_order_relaxed);
 +  if (cur != nullptr) return cur;
@@ -255,18 +177,14 @@ index 0000000..fff6929
 +  uint8_t* region = static_cast<uint8_t*>(p);
 +  e->len.store(0, std::memory_order_relaxed);
 +  e->dirty.store(false, std::memory_order_relaxed);
-+  // Release-publish so a reader that sees the pointer also sees len/dirty.
 +  e->shadow.store(region, std::memory_order_release);
 +  return region;
 +}
 +
-+// Publish a tracked length over an already-mapped, already-zeroed region.
-+// {must_zero} forces a memset because the region is being handed to a NEW
-+// occupant and may still carry the previous one's tags.
 +void Publish(ShadowEntry* e, size_t byte_length, bool must_zero) {
 +  uint8_t* region = e->shadow.load(std::memory_order_relaxed);
 +  size_t len = byte_length < kMaxShadowBytes ? byte_length : kMaxShadowBytes;
-+  if (byte_length > kMaxShadowBytes) CountDrop();  // untracked tail
++  if (byte_length > kMaxShadowBytes) CountDrop();
 +  if (must_zero && len > 0) {
 +    std::memset(region, 0, len);
 +    e->dirty.store(false, std::memory_order_relaxed);
@@ -274,22 +192,8 @@ index 0000000..fff6929
 +  e->len.store(len, std::memory_order_release);
 +}
 +
-+// ---------------------------------------------------------------------------
-+// TAG NARROWING. A shadow byte is ONE byte (1:1 with linear memory, which is
-+// what keeps a 256 MiB memory's shadow at 256 MiB instead of 1 GiB) but a
-+// TaintTag is 32 bits. The eight NAMED sources (taint.h:28-39) are
-+// kSrcFingerprint..kSrcWasm = bits 0..7, which fit a byte exactly. Only kSrcOther
-+// (bit 31, the "folded source" escape hatch whose real identity rides in a
-+// record's tag string, not in a bit) has nowhere to go, so it shares bit 7 with
-+// kSrcWasm and reads back AS kSrcWasm.
-+//
-+// That loss is deliberate and bounded: inside linear memory both mean
-+// "engine-internal, not one of the seven named capture sources", and the identity
-+// kSrcOther was folding is already carried by the boundary record that created
-+// it. Widening never invents a bit that was not narrowed in.
-+// ---------------------------------------------------------------------------
-+constexpr uint32_t kNarrowNamedMask = 0x7Fu;  // bits 0..6
-+constexpr uint8_t kNarrowWasmBit = 0x80u;     // bit 7 = kSrcWasm | kSrcOther
++constexpr uint32_t kNarrowNamedMask = 0x7Fu;
++constexpr uint8_t kNarrowWasmBit = 0x80u;
 +
 +inline uint8_t NarrowTag(uint32_t tag) {
 +  uint8_t b = static_cast<uint8_t>(tag & kNarrowNamedMask);
@@ -306,17 +210,12 @@ index 0000000..fff6929
 +  return tag;
 +}
 +
-+// Resolve (mem_id -> shadow region), clamping {offset}/{size} into the tracked
-+// range. Returns nullptr for an untracked memory, which is the NORMAL case for
-+// instances the layer never claimed: it is not a drop and is deliberately NOT
-+// counted (counting it would turn every access of every untracked module into
-+// witness noise and hide real losses).
 +inline uint8_t* Resolve(void* mem_id, size_t* offset, size_t* size,
 +                        size_t* len_out) {
 +  ShadowEntry* e = FindEntry(mem_id);
 +  if (e == nullptr) return nullptr;
 +  uint8_t* region = e->shadow.load(std::memory_order_acquire);
-+  if (region == nullptr) return nullptr;  // claim still in progress
++  if (region == nullptr) return nullptr;
 +  size_t len = e->len.load(std::memory_order_relaxed);
 +  if (len == 0 || *size == 0 || *offset >= len) return nullptr;
 +  if (*size > len - *offset) *size = len - *offset;
@@ -329,35 +228,15 @@ index 0000000..fff6929
 +  if (e != nullptr) e->dirty.store(true, std::memory_order_relaxed);
 +}
 +
-+// OR-reduce {n} shadow bytes at {p}. {n} is already clamped by Resolve.
 +inline uint32_t ReduceRange(const uint8_t* p, size_t n) {
 +  uint8_t acc = 0;
 +  for (size_t i = 0; i < n; ++i) acc = static_cast<uint8_t>(acc | p[i]);
 +  return WidenTag(acc);
 +}
 +
-+// ---------------------------------------------------------------------------
-+// RECORD EMISSION. Every record rides kind 4 (kWasmMemory) through the existing
-+// EmitSpan - the same path 0026's EmitWasmMemContent uses - so the Rust side
-+// already knows how to split tag/body and blake3-join the body against every
-+// other payload span (req-body, stringify-head). Tag = NUL-terminated prefix,
-+// body = the ACTUAL linear-memory bytes at the affected range.
-+//
-+// Two kinds of event are emitted, and both matter to the fact graph:
-+//   TAINT MOVED  (after != 0) - the normal capture edge;
-+//   TAINT ERASED (before != 0, after == 0) - an untainted store/fill/init over
-+//     bytes that WERE tainted. This is what lets the graph explain a chain that
-+//     genuinely ended inside wasm instead of guessing, so `dead-end-proven`
-+//     stays an honest verdict rather than a coverage hole.
-+//
-+// The body is read from the live linear memory, so it can tear against a
-+// concurrent wasm thread mutating the same bytes. Accepted and documented -
-+// exactly the trade 0026's content dumps make; stop-the-world would be
-+// detectable by the antifraud this traces.
-+// ---------------------------------------------------------------------------
 +
 +inline uint64_t Sig(uint64_t op, uint64_t a, uint64_t b, uint64_t c) {
-+  uint64_t h = 1469598103934665603ull;  // FNV-1a over the 4 fields
++  uint64_t h = 1469598103934665603ull;
 +  const uint64_t f[4] = {op, a, b, c};
 +  for (int i = 0; i < 4; ++i) {
 +    for (int j = 0; j < 8; ++j) {
@@ -365,17 +244,14 @@ index 0000000..fff6929
 +      h *= 1099511628211ull;
 +    }
 +  }
-+  return h == 0 ? 1 : h;  // 0 is the "nothing yet" sentinel
++  return h == 0 ? 1 : h;
 +}
 +
-+// {base} is the linear memory base (the mem_id the callout was handed), so the
-+// body is the real wasm bytes at {off}. {n} is already clamped. {base} may be
-+// nullptr for a bodyless record.
 +void EmitShadow(const char* tag, const void* base, size_t off, size_t n,
 +                uint64_t sig) {
 +  if (!EmitOn()) return;
 +  if (g_shadow_emitted.load(std::memory_order_relaxed) >= kEmitCap) return;
-+  if (sig == t_last_sig) return;  // same event as last time on this thread
++  if (sig == t_last_sig) return;
 +  t_last_sig = sig;
 +  g_shadow_emitted.fetch_add(1, std::memory_order_relaxed);
 +
@@ -384,7 +260,6 @@ index 0000000..fff6929
 +    body = n > kEmitBodyCap ? kEmitBodyCap : static_cast<uint32_t>(n);
 +  }
 +  if (body == 0) {
-+    // EmitSpan drops len==0 spans, so a bodyless record still needs one byte.
 +    static const uint8_t kNil = 0;
 +    EmitSpan(kWasmMemory, NowNs(), tag, &kNil, 1);
 +    return;
@@ -393,26 +268,17 @@ index 0000000..fff6929
 +  EmitSpan(kWasmMemory, NowNs(), tag, p, body);
 +}
 +
-+// The single store path shared by WasmShadowOnStore and the fill commit, so the
-+// overwrite-vs-augment law is written exactly once.
 +void ApplyStoreTag(void* base, uint8_t* p, size_t n, bool augment,
 +                   uint32_t tag, uint32_t before, uint64_t op_id, size_t off) {
 +  const uint8_t b = NarrowTag(tag);
 +  if (augment) {
-+    // Atomic RMW: the result combines the OLD memory value with the operand, so
-+    // the old tag survives (OR). Erasing it here would drop a real source.
 +    for (size_t i = 0; i < n; ++i) p[i] = static_cast<uint8_t>(p[i] | b);
 +  } else {
-+    // Plain store/fill REPLACES the destination bytes, so the old tag is gone
-+    // and each byte takes the value's tag exactly. Without the clearing, a buffer
-+    // rewritten in a loop would accumulate taint forever and every later read
-+    // would report a source that is no longer in the data - a false "proven",
-+    // which is worse than a missed one.
 +    std::memset(p, static_cast<int>(b), n);
 +  }
 +  if (b != 0) MarkDirty(base);
 +
-+  if (tag == 0 && before == 0) return;  // nothing moved and nothing erased
++  if (tag == 0 && before == 0) return;
 +  char text[192];
 +  if (op_id == kOpFill) {
 +    std::snprintf(text, sizeof(text),
@@ -434,7 +300,7 @@ index 0000000..fff6929
 +                                                         before));
 +}
 +
-+}  // namespace
++}
 +
 +bool WasmShadowEnabled() { return Enabled() && ShadowEnvOn(); }
 +
@@ -442,8 +308,6 @@ index 0000000..fff6929
 +  if (!WasmShadowEnabled() || mem_id == nullptr) return false;
 +  ShadowEntry* e = FindEntry(mem_id);
 +  if (e != nullptr && e->shadow.load(std::memory_order_acquire) != nullptr) {
-+    // Already tracked (a re-entrant New, or a base that survived): just make sure
-+    // the length covers the request.
 +    if (byte_length > e->len.load(std::memory_order_relaxed)) {
 +      Publish(e, byte_length, false);
 +    }
@@ -451,14 +315,12 @@ index 0000000..fff6929
 +  }
 +  e = ClaimSlot(mem_id);
 +  if (e == nullptr) {
-+    CountDrop();  // table full: this memory's taint is invisible - say so
++    CountDrop();
 +    return false;
 +  }
-+  // A slot handed over from a previous occupant must be scrubbed; a never-used
-+  // slot's fresh mmap is already zero.
 +  const bool must_zero = e->dirty.load(std::memory_order_relaxed);
 +  if (SlotMapping(e) == nullptr) {
-+    CountDrop();  // mmap failed (ENOMEM / address-space exhaustion)
++    CountDrop();
 +    e->len.store(0, std::memory_order_relaxed);
 +    e->mem_id.store(nullptr, std::memory_order_release);
 +    return false;
@@ -473,10 +335,6 @@ index 0000000..fff6929
 +  ShadowEntry* e = FindEntry(mem_id);
 +  if (e == nullptr) return;
 +  if (e->shadow.load(std::memory_order_acquire) == nullptr) return;
-+  // INPLACE grow (wasm-objects.cc:1121 shared, :1140 non-shared): the base did not
-+  // move, so the key is unchanged and the region only extends. No remap, no tag
-+  // copy - the mapping was reserved at kMaxShadowBytes up front. A shrink is
-+  // ignored (tags past the new end simply go unread).
 +  if (new_byte_length <= e->len.load(std::memory_order_relaxed)) return;
 +  Publish(e, new_byte_length, false);
 +}
@@ -492,9 +350,6 @@ index 0000000..fff6929
 +    old_len = old_e->len.load(std::memory_order_relaxed);
 +  }
 +
-+  // Claim the NEW slot first. If that fails, the old tags stay readable under the
-+  // now-dead old key - counted, because from the graph's point of view the taint
-+  // stopped following the memory.
 +  ShadowEntry* new_e = FindEntry(new_mem_id);
 +  if (new_e == nullptr ||
 +      new_e->shadow.load(std::memory_order_acquire) == nullptr) {
@@ -520,11 +375,6 @@ index 0000000..fff6929
 +  if (new_region == nullptr) return;
 +  const size_t new_len = new_e->len.load(std::memory_order_relaxed);
 +
-+  // Migrate the tags. COPY grow (wasm-objects.cc:1158-1182) installs a NEW
-+  // BackingStore, so buffer_start() - and the key - CHANGES. Without this copy
-+  // every grow-by-copy would silently orphan the taint accumulated so far: a
-+  // false dead-end on exactly the memory-hungry PoW modules this layer exists to
-+  // follow.
 +  size_t migrated = 0;
 +  bool truncated = false;
 +  if (old_region != nullptr && old_len > 0) {
@@ -532,21 +382,16 @@ index 0000000..fff6929
 +    if (n > kMigrateCapBytes) {
 +      n = kMigrateCapBytes;
 +      truncated = true;
-+      CountDrop();  // the tail's tags are lost - counted, never silent
++      CountDrop();
 +    }
-+    // memmove, not memcpy: the regions are distinct slots here, but never assume
-+    // it.
 +    std::memmove(new_region, old_region, n);
 +    migrated = n;
 +    new_e->dirty.store(true, std::memory_order_relaxed);
 +    old_e->dirty.store(false, std::memory_order_relaxed);
 +  }
 +
-+  // Retire the OLD key. Tombstone, never nullptr: an open-addressed chain cannot
-+  // have a hole punched in it without orphaning every entry probed past the hole.
 +  if (old_e != nullptr && old_e != new_e) {
 +    if (old_region != nullptr && old_len > 0) {
-+      // Scrub for the slot's next occupant.
 +      std::memset(old_region, 0, old_len);
 +    }
 +    old_e->len.store(0, std::memory_order_relaxed);
@@ -554,8 +399,6 @@ index 0000000..fff6929
 +    g_shadow_live.fetch_sub(1, std::memory_order_relaxed);
 +  }
 +
-+  // The rekey record is the proof that taint SURVIVED a grow-by-copy - without it
-+  // a chain that crosses a grow looks broken even when it is not.
 +  char tag[192];
 +  std::snprintf(tag, sizeof(tag),
 +                "wasm-shadow-rekey old=0x%llx new=0x%llx len=%llu migrated=%llu"
@@ -571,16 +414,6 @@ index 0000000..fff6929
 +                 new_byte_length, migrated));
 +}
 +
-+// NOTE ON LIFETIME - why this never munmaps. ShadowFree retires a KEY, not a
-+// mapping. A concurrent wasm thread may sit between "FindEntry matched" and "read
-+// region[i]" when the JS thread frees or grow-by-copies the memory; V8 keeps the
-+// OLD backing store alive for exactly that reason (wasm-objects.cc detaches the
-+// old buffer only after the new one is installed), and the shadow has to be at
-+// least as conservative. Unmapping here would be a use-after-free on the tracer's
-+// own bookkeeping. Instead the slot keeps its mapping (kMaxTracked mappings for
-+// the whole process, kMaxShadowBytes of NORESERVE address space each, physical
-+// pages only where a tag was written) and is scrubbed + recycled by the next
-+// ShadowAlloc. Bounded by construction.
 +void ShadowFree(void* mem_id) {
 +  if (mem_id == nullptr) return;
 +  ShadowEntry* e = FindEntry(mem_id);
@@ -607,10 +440,6 @@ index 0000000..fff6929
 +  size_t tracked = 0;
 +  uint8_t* region = Resolve(mem_id, &offset, &size, &tracked);
 +  if (region == nullptr) return;
-+  // AUGMENT semantics (the DTT union law, taint.h:64-67): existing bits survive,
-+  // for a C++ caller adding provenance to bytes it did not overwrite. The emitted
-+  // store path uses overwrite semantics instead, because there the bytes ARE
-+  // replaced.
 +  const uint8_t b = NarrowTag(tag);
 +  if (b == 0) return;
 +  uint8_t* p = region + offset;
@@ -628,11 +457,6 @@ index 0000000..fff6929
 +}
 +
 +void WasmShadowOnLoad(uintptr_t mem_id, uintptr_t offset, uintptr_t size) {
-+  // The runtime half of the two-level gate. The callout was already emitted (the
-+  // compile-time WasmShadowEnabled() check decided that once per function), so all
-+  // that is left is this table probe - and for an untracked instance it returns
-+  // after one failed probe. That is the whole point of keying by the base pointer
-+  // the register already holds.
 +  void* base = reinterpret_cast<void*>(mem_id);
 +  size_t off = static_cast<size_t>(offset);
 +  size_t n = static_cast<size_t>(size);
@@ -640,11 +464,7 @@ index 0000000..fff6929
 +  const uint8_t* region = Resolve(base, &off, &n, &tracked);
 +  if (region == nullptr) return;
 +
-+  // LOAD: OR-reduce the range - that is the taint of the value just read.
 +  const uint32_t t = ReduceRange(region + off, n);
-+  // Publish for the JS boundary seam: when this load's value flows out of a wasm
-+  // export, the boundary layer reads it back so an in-memory value crossing into
-+  // JS still carries its sources.
 +  t_load_taint = t;
 +  if (t == 0) return;
 +
@@ -665,12 +485,6 @@ index 0000000..fff6929
 +  if (region == nullptr) return;
 +
 +  const uint32_t before = ReduceRange(region + off, n);
-+  // Take the tag the boundary layer parked when the value was pushed, and
-+  // CONSUME it so a stale tag cannot leak onto the next store. This is the
-+  // documented precision limit - see the header's REQUIRED CALLER note, which
-+  // also states that as of 0001-0032 nothing parks a tag yet, so this currently
-+  // reads 0. It over-attributes (a store may pick up a tag from an earlier push
-+  // on this thread) and never under-attributes.
 +  const uint32_t t = t_store_taint;
 +  t_store_taint = 0;
 +  ApplyStoreTag(base, region + off, n, augment != 0, t, before, kOpStore, off);
@@ -681,12 +495,12 @@ index 0000000..fff6929
 +                         uintptr_t len) {
 +  size_t n = static_cast<size_t>(len);
 +  if (n == 0) {
-+    t_staged.op = kOpNone;  // nothing to apply; a stale stage must not survive
++    t_staged.op = kOpNone;
 +    return;
 +  }
 +  if (n > kMaxBulkBytes) {
 +    n = kMaxBulkBytes;
-+    CountDrop();  // truncated bulk op: the tail did not follow - counted
++    CountDrop();
 +  }
 +  t_staged.op = kOpCopy;
 +  t_staged.dst_base = reinterpret_cast<void*>(dst_mem_id);
@@ -733,12 +547,9 @@ index 0000000..fff6929
 +}
 +
 +void WasmShadowCommit() {
-+  // Copy out and clear the stage first: the record body read below can be slow
-+  // (up to 64 KiB), and leaving the stage set would let an unrelated trapped op
-+  // on this thread re-commit it.
 +  const StagedBulk s = t_staged;
 +  t_staged.op = kOpNone;
-+  if (s.op == kOpNone) return;  // trapped op, or nothing was ever staged
++  if (s.op == kOpNone) return;
 +
 +  if (s.op == kOpInit) {
 +    size_t off = s.dst_off;
@@ -746,12 +557,6 @@ index 0000000..fff6929
 +    size_t tracked = 0;
 +    uint8_t* region = Resolve(s.dst_base, &off, &n, &tracked);
 +    if (region == nullptr) return;
-+    // memory.init copies from a DATA SEGMENT. Segment bytes are static module
-+    // content - present in the .wasm blob at compile time, never tainted at
-+    // runtime - so the destination is overwritten UNTAINTED and clearing here is
-+    // EXACT, not an approximation. Recorded only when that clearing actually
-+    // destroyed taint, which is the causally interesting case (and keeps a
-+    // segment-heavy module from flooding the stream).
 +    const uint32_t before = ReduceRange(region + off, n);
 +    std::memset(region + off, 0, n);
 +    if (before == 0) return;
@@ -770,8 +575,6 @@ index 0000000..fff6929
 +    size_t tracked = 0;
 +    uint8_t* region = Resolve(s.dst_base, &off, &n, &tracked);
 +    if (region == nullptr) return;
-+    // memory.fill writes one byte value across the range, so every byte takes
-+    // that value's taint (0 clears). Same overwrite law as a plain store.
 +    const uint32_t before = ReduceRange(region + off, n);
 +    const uint32_t t = t_store_taint;
 +    t_store_taint = 0;
@@ -779,8 +582,6 @@ index 0000000..fff6929
 +    return;
 +  }
 +
-+  // kOpCopy: memory.copy moves bytes, and the tags must move with them - dst
-+  // takes src's tag per byte (overwrite, since dst's bytes are replaced).
 +  size_t d_off = s.dst_off;
 +  size_t d_n = s.len;
 +  size_t s_off = s.src_off;
@@ -791,13 +592,8 @@ index 0000000..fff6929
 +  if (dst_region == nullptr) return;
 +  const uint8_t* src_region = Resolve(s.src_base, &s_off, &s_n, &s_tracked);
 +  if (src_region == nullptr) {
-+    // Source untracked, so its taint is unknown. Leaving the destination alone is
-+    // the conservative choice - erasing could destroy a real tag. Not counted:
-+    // nothing was observed and then lost.
 +    return;
 +  }
-+  // src and dst may be the SAME memory with overlapping ranges, so the copy must
-+  // be overlap-safe.
 +  const uint32_t src_tag = ReduceRange(src_region + s_off, s_n);
 +  size_t m = d_n < s_n ? d_n : s_n;
 +  if (m == 0) return;
@@ -827,16 +623,16 @@ index 0000000..fff6929
 +  return g_shadow_dropped.load(std::memory_order_relaxed);
 +}
 +
-+}  // namespace afeye
-+}  // namespace v8
++}
++}
 +
-+#endif  // V8_AFEYE
++#endif
 diff --git a/v8/src/afeye/wasm_shadow.h b/v8/src/afeye/wasm_shadow.h
 new file mode 100644
-index 0000000..88769f0
+index 0000000..c4ce06c
 --- /dev/null
 +++ b/v8/src/afeye/wasm_shadow.h
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,57 @@
 +#ifndef V8_AFEYE_WASM_SHADOW_H_
 +#define V8_AFEYE_WASM_SHADOW_H_
 +
@@ -848,244 +644,54 @@ index 0000000..88769f0
 +namespace v8 {
 +namespace afeye {
 +
-+// afeye (0028): 1:1 SHADOW MEMORY for every tracked wasm linear memory.
-+//
-+// The boundary sieve (sink.cc) sees only values that CROSS a C++ API edge, and
-+// 0026's dumps see only the CONTENT at grow / buffer-readout moments. An
-+// antifraud that shuffles bytes purely INSIDE linear memory - store at 0x1000,
-+// memory.copy to 0x4000, load back, feed an i32 out - crosses neither. The
-+// shadow closes that hole: one tag byte per byte of linear memory, propagated
-+// by the emitted code, so a fingerprint byte that entered linear memory is
-+// still identified when it leaves, however many pure-wasm transforms it
-+// survived.
-+//
-+// KEYING (corrected against the original brief; verified at rev d1fed5cd).
-+// The shadow is keyed by the linear memory's BASE POINTER (buffer_start()),
-+// NOT by BackingStore*. That base is the only identity already live in a
-+// register at every emitted Load/Store site:
-+//   wasm-objects.cc:783-790   SetInstanceMemory computes base_address =
-+//                             backing_store->buffer_start() and passes it to
-+//                             SetRawMemory(memory_index, base_address, len)
-+//   wasm-objects.cc:1419-1435 SetRawMemory stores it at kMemory0StartOffset
-+//                             (and in the bases-and-sizes array for index > 0)
-+//   liftoff-assembler-inl.h:313-327 LoadMemoryStart loads exactly that field
-+// So the emitted callout passes the `mem` register verbatim - no instance_data
-+// indirection per access. The backing store is off-heap and does not move, so
-+// the key is GC-stable: the same soundness argument taint.h:44-46 makes for
-+// kKeyWasm.
-+//
-+// RESIZE SOUNDNESS - the failure mode that would silently kill capture:
-+//   INPLACE grow (wasm-objects.cc:1121 shared, :1140 non-shared) keeps
-+//                buffer_start() stable, so the key is unchanged and the region
-+//                merely EXTENDS (ShadowGrow). No copy.
-+//   COPY grow    (wasm-objects.cc:1158-1182) installs a NEW BackingStore, so
-+//                buffer_start() - and the key - CHANGES. ShadowReKey migrates
-+//                the old tags to the new key and retires the old one. Without
-+//                it every grow-by-copy would orphan the taint accumulated so
-+//                far: a false dead-end on exactly the memory-hungry PoW modules
-+//                this layer exists to follow. The migrate copy is CAPPED
-+//                (kMigrateCapBytes) and truncation is COUNTED, so a 256 MB grow
-+//                cannot stall the crawl on a 256 MB memcpy and the lost tail is
-+//                never silent.
-+//
-+// HONEST PRECISION LIMIT (documented, not papered over).
-+// liftoff keeps wasm values in REGISTERS with no per-register taint side table,
-+// so a value's taint cannot follow it through locals or arithmetic inside wasm.
-+// What this layer IS exact about:
-+//   - byte-range to byte-range flows (memory.copy / memory.fill / memory.init,
-+//     and each load/store's own tag bytes) - exact, no approximation;
-+//   - the tag a LOAD reads out, published for the JS boundary seam;
-+//   - the tag a STORE writes, taken from the thread-local declared below.
-+// The thread-local handoff means a store may CONSERVATIVELY over-attribute a tag
-+// left by an earlier push on the same thread; it never under-attributes.
-+// Over-attribution is the accepted trade - for capture, a plausible false link
-+// beats a silent hole. Threading a real per-register taint table through every
-+// liftoff handler is the follow-up this layer is staged for.
-+//
-+// REQUIRED CALLER - INTEGRATION PREREQUISITE, NOT A GAP IN THIS FILE.
-+// WasmShadowPushStoreTaint() must be called by the layer that KNOWS a JS value
-+// is tainted at the moment it is pushed into wasm. That is the 0027
-+// interpreter/Factory propagation seam (src/afeye/taint.cc + the interpreter
-+// handlers), which this patch does not and may not edit. As of patches
-+// 0001-0032 NOTHING calls it, so the consequence is exactly this: t_store_taint
-+// stays 0, every store/fill therefore applies tag 0 (which by the overwrite law
-+// below CLEARS), no range ever becomes non-zero, and because every emission is
-+// gated on a non-zero tag the shadow ALLOCATES and TRACKS lifetimes correctly
-+// but emits no records. The byte-range machinery (copy/fill/init/rekey) and the
-+// load read-back are wired and exercised; only the initial injection of taint
-+// INTO linear memory is pending that one call. Wiring it is a single call site
-+// and is deliberately left to the owner of the taint core rather than faked
-+// here by inventing a source bit - tagging every wasm store as tainted would be
-+// precisely the false precision this comment refuses.
-+//
-+// Discipline matches sink.cc / taint.cc: no-alloc on the hot path (regions are
-+// pre-mapped, the table is a fixed array), bounded (kMaxTracked instances,
-+// kMaxShadowBytes per instance, kMaxBulkBytes per bulk op, kMigrateCapBytes per
-+// rekey, kEmitCap records), env-gated (AFEYE_WASM_SHADOW=0 disables the layer,
-+// AFEYE_TRACE_WASMSHADOW=0 disables only the records), and every refusal that
-+// LOSES taint is COUNTED so a shadow gap is never read as a dead end.
 +
-+// ---------------------------------------------------------------------------
-+// The emitted-callout ABI.
-+//
-+// EVERY parameter is uintptr_t and every value the emitted code passes is
-+// either a Register or a VarState of kind kIntPtrKind. On a 64-bit target
-+// kIntPtrKind == kI64 == 8 bytes (liftoff-assembler.h:105-106), so the VarState
-+// width and the C parameter width agree by construction - including on Win64,
-+// where CallC's stack-argument path stores value_kind_size(arg.kind()) bytes at
-+// kSystemPointerSize stride (liftoff-assembler-x64-inl.h:5198-5227) and a
-+// narrower kind would leave the parameter's high half undefined.
-+//
-+// Emission is therefore compiled in only when kSystemPointerSize == 8. On a
-+// 32-bit target kNeedI64RegPair is true (liftoff-register.h:23), so a memory64
-+// offset lives in a REGISTER PAIR and cannot be passed as one uintptr_t without
-+// arch-specific pair handling. afeye is a Linux/x64 tracing build (sink.cc is
-+// POSIX: fcntl.h/unistd.h), so this costs nothing real and keeps the codegen
-+// free of an untestable 32-bit path.
-+//
-+// These are plain free functions so their addresses can be taken and passed
-+// through ExternalReference::Create(Address) - the same shape the
-+// FUNCTION_REFERENCE(wasm_memory_copy, wasm::memory_copy_wrapper) table entry
-+// uses (external-reference.cc:427-431, 688), which liftoff already calls via
-+// GenerateCCall for the bulk ops (liftoff-compiler.cc:7641-7649).
-+// ---------------------------------------------------------------------------
 +
-+// Load hook. OR-reduces [offset, offset+size) - that is the taint of the value
-+// just read - publishes it to this thread's load slot for the JS boundary seam,
-+// and emits a record when it is non-zero. {mem_id} is the linear-memory base
-+// (the register liftoff already holds), NOT an index.
 +void WasmShadowOnLoad(uintptr_t mem_id, uintptr_t offset, uintptr_t size);
 +
-+// Store hook. OVERWRITES [offset, offset+size) with the tag the boundary layer
-+// parked for this thread (currently always 0 - see REQUIRED CALLER above), and
-+// emits on a moved OR an erased tag.
-+// {augment} != 0 ORs the tag in instead of overwriting - required for the
-+// atomic read-modify-write ops (atomic.rmw / atomic.cmpxchg), whose result
-+// combines the old memory value with the operand, so erasing the old tag there
-+// would drop a real source. Plain stores pass 0.
 +void WasmShadowOnStore(uintptr_t mem_id, uintptr_t offset, uintptr_t size,
 +                       uintptr_t augment);
 +
-+// Bulk memory, STAGE half: records the operation into a thread-local and
-+// returns WITHOUT touching the shadow. Emitted immediately BEFORE the real
-+// memory.copy/fill/init runtime call.
-+//
-+// WHY STAGE/COMMIT AND NOT ONE CALLOUT (do not "simplify" this by moving the
-+// apply before the runtime call): memory.copy/fill/init can trap out-of-bounds,
-+// and Kasada-style sensors DELIBERATELY induce traps to detect a modified
-+// environment. Applying the shadow first would record a taint flow that never
-+// happened - a fabricated edge in the fact graph, which is worse than a missing
-+// one. So the values are staged, the real operation runs, the emitted
-+// out-of-bounds trap jump (liftoff-compiler.cc:7650-7653) diverts on failure,
-+// and only the fall-through path reaches the COMMIT, which applies and emits.
-+// An induced-trap probe therefore leaves NO wasm-shadow-copy record: that is
-+// correct behaviour, not a coverage gap.
-+//
-+// The stage callout cannot run after the runtime call instead, because that
-+// call clobbers the caller-saved registers holding the operands (popped
-+// VarStates are no longer in cache_state, so SpillAllRegisters will not save
-+// them) - see WasmShadowCommit for the matching half.
 +void WasmShadowStageCopy(uintptr_t dst_mem_id, uintptr_t dst_off,
 +                         uintptr_t src_mem_id, uintptr_t src_off,
 +                         uintptr_t len);
 +void WasmShadowStageFill(uintptr_t mem_id, uintptr_t dst_off, uintptr_t len);
 +void WasmShadowStageInit(uintptr_t mem_id, uintptr_t dst_off, uintptr_t len);
 +
-+// Bulk memory, COMMIT half. Takes NO arguments - everything it needs is in the
-+// staged thread-local - so it survives the runtime call's register clobbering
-+// with no frame-slot or rsp assumptions (arch-generic by construction).
-+// Emitted after the OOB trap jump. A staged entry left behind by a trapped op
-+// is harmless: every commit is preceded by its own stage, which overwrites it.
 +void WasmShadowCommit();
 +
-+// ---------------------------------------------------------------------------
-+// Lifetime (called from WasmMemoryObject::New / ::Grow, wasm-objects.cc).
-+// {mem_id} is the linear memory base pointer (buffer_start()).
-+// ---------------------------------------------------------------------------
 +
-+// Map a shadow region for {mem_id} covering {byte_length} bytes (clamped to
-+// kMaxShadowBytes). No-op if already tracked, the table is full, or the layer
-+// is off. Returns true when {mem_id} is tracked afterwards.
 +bool ShadowAlloc(void* mem_id, size_t byte_length);
 +
-+// INPLACE grow: extend the existing region to {new_byte_length}. The key is
-+// unchanged, so this is a length bump - no remap, no tag copy. A shrink is
-+// ignored (tags past the new end simply go unread).
 +void ShadowGrow(void* mem_id, size_t new_byte_length);
 +
-+// COPY grow: migrate {old_mem_id}'s tags onto {new_mem_id} covering
-+// {new_byte_length}, then retire the old key. Copy capped at kMigrateCapBytes;
-+// a truncated tail is counted as a drop, never silent.
 +void ShadowReKey(void* old_mem_id, void* new_mem_id, size_t new_byte_length);
 +
-+// Retire {mem_id}'s key. Safe on an unknown id. NOTE: this never munmaps - see
-+// the lifetime comment above ShadowFree in the .cc for why (a concurrent wasm
-+// thread may still be between "matched the key" and "read the tag byte").
 +void ShadowFree(void* mem_id);
 +
-+// ---------------------------------------------------------------------------
-+// Query / mutation for C++-side consumers.
-+// ---------------------------------------------------------------------------
 +
-+// Shadow base pointer, or nullptr when {mem_id} is untracked / layer off.
 +uint8_t* ShadowGet(void* mem_id);
 +
-+// OR {tag} into the shadow bytes [offset, offset+len). AUGMENT semantics - for
-+// a C++ caller adding provenance to bytes it did not overwrite. Clamped to the
-+// tracked length.
 +void ShadowSetRange(void* mem_id, size_t offset, size_t len, uint32_t tag);
 +
-+// OR-reduce the shadow bytes over [offset, offset+len) -> the value's taint.
-+// 0 for an untracked id or an out-of-range call.
 +uint32_t ShadowGetRange(void* mem_id, size_t offset, size_t len);
 +
-+// ---------------------------------------------------------------------------
-+// Two-level gate, level 1 (compile time).
-+//
-+// Read ONCE per wasm function compile and cached in a LiftoffCompiler member, so
-+// a shadow-disabled build emits ZERO instructions at every hook site and its
-+// codegen is byte-identical to stock V8. That is the honest perf claim: a
-+// shadow-DISABLED build has zero overhead. A shadow-ENABLED build pays the
-+// callout on every tracked memory access - accepted, because this is a tracing
-+// build and capture completeness is the goal.
-+//
-+// Why not a per-INSTANCE compile-time flag: liftoff code is compiled per MODULE
-+// and shared across instances through the native module's code space, and
-+// CompilationEnv exposes only `module` + `enabled_features`
-+// (compilation-environment.h:46-51) - no instance, which may not even exist yet
-+// at compile time. So the per-instance gate is level 2, at runtime, inside the
-+// callout (one table probe; untracked memories return immediately).
-+// ---------------------------------------------------------------------------
 +bool WasmShadowEnabled();
 +
-+// ---------------------------------------------------------------------------
-+// The store/load tag handoff (see the HONEST PRECISION LIMIT above).
-+// ---------------------------------------------------------------------------
 +
-+// Called by the 0027 interpreter/Factory propagation seam when a TAINTED value is
-+// pushed into wasm: records the tag the next store on this thread applies. As of
-+// 0001-0032 no caller exists yet - see REQUIRED CALLER in the header comment
-+// above for exactly what is wired and what that leaves pending.
 +void WasmShadowPushStoreTaint(uint32_t tag);
 +
-+// The tag the most recent LOAD read out of the shadow on this thread (0 if none
-+// / untainted). The JS boundary seam consumes this when a wasm export returns,
-+// so an in-memory value crossing back into JS still carries its sources.
 +uint32_t WasmShadowConsumeLoadTaint();
 +
-+// Witness counter (folded into the sink-drop stream so a shadow gap is never
-+// read as a dead end). Counts: table-full refusals, mmap failures, untracked
-+// tails past kMaxShadowBytes, truncated bulk ops, truncated migrations.
 +uint64_t WasmShadowDropped();
 +
-+}  // namespace afeye
-+}  // namespace v8
++}
++}
 +
-+#endif  // V8_AFEYE
++#endif
 +
-+#endif  // V8_AFEYE_WASM_SHADOW_H_
++#endif
 diff --git a/v8/src/wasm/baseline/liftoff-compiler.cc b/v8/src/wasm/baseline/liftoff-compiler.cc
-index 7a5aba2..1168950 100644
+index 7a5aba2..0c500b1 100644
 --- a/v8/src/wasm/baseline/liftoff-compiler.cc
 +++ b/v8/src/wasm/baseline/liftoff-compiler.cc
 @@ -39,6 +39,10 @@
@@ -1099,116 +705,30 @@ index 7a5aba2..1168950 100644
  namespace v8::internal::wasm {
  
  using VarState = LiftoffAssembler::VarState;
-@@ -4385,6 +4389,299 @@ class LiftoffCompiler {
+@@ -4385,6 +4389,129 @@ class LiftoffCompiler {
      __ DeallocateStackSlot(sizeof(MemoryTracingInfo));
    }
  
 +#ifdef V8_AFEYE
-+  // -------------------------------------------------------------------------
-+  // afeye (0028): wasm linear-memory taint SHADOW callouts.
-+  //
-+  // TWO-LEVEL GATE. Level 1 is compile time: {afeye_shadow_active_} is read
-+  // ONCE per function compile from v8::afeye::WasmShadowEnabled(), so a
-+  // shadow-disabled build emits ZERO instructions at any hook site and its
-+  // codegen is byte-identical to stock V8. Level 2 is runtime and lives inside
-+  // the callout: one table probe keyed by the memory base, returning
-+  // immediately for an untracked instance.
-+  //
-+  // Why the runtime gate is not compile time too: liftoff code is compiled per
-+  // MODULE and shared across instances through the native module's code space,
-+  // and CompilationEnv exposes only `module` + `enabled_features`
-+  // (compilation-environment.h:46-51) - there is no instance to ask, and at
-+  // compile time one may not exist yet.
-+  //
-+  // SHAPE. These mirror TraceMemoryOperation (immediately above) deliberately:
-+  // spill everything, recompute the memory base from {mem_index}, compute the
-+  // effective offset, then hand pointer-sized arguments to a C function. The
-+  // base register is BRANCH-LOCAL at the call sites (LoadMem declares {mem}
-+  // separately inside each of its two arms), which is exactly why
-+  // TraceMemoryOperation also takes mem_index rather than a register.
-+  //
-+  // NO DefineSafepoint() after these calls, unlike TraceMemoryOperation: that
-+  // one calls a wasm BUILTIN through CallBuiltin, while these are plain C calls,
-+  // and the in-file precedent for a C call from wasm code is GenerateCCall
-+  // (liftoff-compiler.cc:2444-2457), which does SpillAllRegisters + CallC and
-+  // defines no safepoint. Matching it keeps this layer's stack-walking
-+  // assumptions identical to the bulk-memory ops V8 already emits this way.
-+  //
-+  // RAW ExternalReference, not GenerateCCall. GenerateCCall's
-+  // SCOPED_CODE_COMMENT feeds the address to
-+  // ExternalReferenceTable::NameOfIsolateIndependentAddress (:2447-2450), which
-+  // has no name for an address outside the external reference table and would
-+  // hand nullptr to std::string concatenation in a V8_CODE_COMMENTS build. So
-+  // __ CallC / CallCFunction is used directly. That is legal here:
-+  //   - Redirect() is the identity outside USE_SIMULATOR
-+  //     (external-reference.cc:544-549);
-+  //   - CallCFunction(ExternalReference, n) does LoadAddress then an
-+  //     unsandboxed C call (macro-assembler-x64.cc:4686-4694);
-+  //   - LoadAddress falls through to Move because DefaultLiftoffOptions sets
-+  //     only .is_wasm (liftoff-assembler.cc:365-369), leaving both
-+  //     isolate_independent_code (assembler.h:230) and
-+  //     enable_root_relative_access (assembler.h:224) false - so no external
-+  //     reference TABLE indirection is attempted;
-+  //   - Move then emits `movq(dst, Immediate64(ext.address(),
-+  //     RelocInfo::EXTERNAL_REFERENCE))` (macro-assembler-x64.cc:2949-2966).
-+  // This is the same shape the FUNCTION_REFERENCE(wasm_memory_copy,
-+  // wasm::memory_copy_wrapper) table entry uses (external-reference.cc:427-431,
-+  // 688), which liftoff already calls via GenerateCCall for the bulk ops.
-+  //
-+  // 64-BIT ONLY. Every callout is compiled in only when kSystemPointerSize is
-+  // 8, because a memory64 offset on a 32-bit target is a REGISTER PAIR
-+  // (kNeedI64RegPair, liftoff-register.h:23) and cannot be passed as one
-+  // uintptr_t. afeye is an x64 Linux tracing build (its sink is POSIX:
-+  // fcntl.h/unistd.h/sys/mman.h), so nothing real is lost.
-+  // -------------------------------------------------------------------------
 +
-+  // Emit a C callout, then re-establish liftoff's register-cache bookkeeping
-+  // that the C call invalidated.
-+  //
-+  // This is REQUIRED, not cosmetic. GetMemoryStart caches the base it loaded in
-+  // CacheState::cached_mem_start (liftoff-compiler.cc:4442, via
-+  // SetMemStartCacheRegister), and its slow path also caches the instance in
-+  // cached_instance_data (:4440, via LoadInstanceIntoRegister). A C call clobbers
-+  // both registers, so leaving the cache set would make a LATER GetMemoryStart in
-+  // the same function hand out a register holding garbage - corrupting the
-+  // generated code itself, not merely the trace. TraceMemoryOperation never hits
-+  // this because it does not call GetMemoryStart; this layer does, so it has to
-+  // clean up. Every afeye callout goes through this one wrapper so no site can
-+  // forget.
-+  //
-+  // SpillAllRegisters is the in-file idiom for exactly that cleanup, and here it
-+  // emits NOTHING: the SpillAllRegisters each caller performs before its callout
-+  // already moved every cached value to its frame slot, so the spill loop finds
-+  // only stack slots. All that actually runs is ClearAllCacheRegisters +
-+  // reset_used_registers (liftoff-assembler.cc:645-653).
 +  void AfeyeCallC(const std::initializer_list<VarState> args,
 +                  ExternalReference ext_ref) {
 +    __ CallC(args, ext_ref);
 +    __ SpillAllRegisters();
 +  }
 +
-+  // Emit one load or store callout. {augment} is true only for the atomic
-+  // read-modify-write ops, whose result combines the OLD memory value with the
-+  // operand - there the existing tag must be ORed in, not overwritten, or a
-+  // real source the operation consumed would be dropped.
 +  void AfeyeShadowAccess(int mem_index, Register index, uintptr_t offset,
 +                         uint32_t size, bool is_store, bool augment) {
 +    if constexpr (kSystemPointerSize != 8) {
-+      return;  // see the 64-BIT ONLY note above
++      return;
 +    } else {
 +      __ SpillAllRegisters();
 +
 +      LiftoffRegList pinned;
 +      if (index != no_reg) pinned.set(index);
 +
-+      // SpillAllRegisters cleared the cached memory start (it calls
-+      // ClearAllCacheRegisters, liftoff-assembler.cc:645-653), so reload it.
 +      Register mem = pinned.set(GetMemoryStart(mem_index, pinned));
 +
-+      // effective offset = offset + index, computed exactly as
-+      // TraceMemoryOperation does it (liftoff-compiler.cc:4322-4341). That
-+      // function's kNeedI64RegPair half is unreachable here: this code is
-+      // compiled only when kSystemPointerSize == 8.
 +      LiftoffRegister eff = pinned.set(__ GetUnusedRegister(kGpReg, pinned));
 +      const WasmMemory& memory = env_->module->memories[mem_index];
 +      if (memory.is_memory64()) {
@@ -1224,15 +744,6 @@ index 7a5aba2..1168950 100644
 +        }
 +      }
 +
-+      // ABI width. Every argument here is built as kIntPtrKind, which is kI64 on
-+      // a 64-bit target (liftoff-assembler.h:105-106), so the VarState width and
-+      // the uintptr_t parameter width agree by construction. That is what makes
-+      // this safe on Win64, where CallC's stack-argument path stores
-+      // value_kind_size(kind) bytes at kSystemPointerSize stride
-+      // (liftoff-assembler-x64-inl.h:5198-5227): a narrower kind there would
-+      // leave the parameter's high half undefined. (3 args fit every 64-bit
-+      // ABI's register budget, so no argument actually reaches the stack here -
-+      // the invariant is stated for the 5-arg stage callout below.)
 +      if (is_store) {
 +        AfeyeCallC({VarState{kIntPtrKind, LiftoffRegister{mem}, 0},
 +                    VarState{kIntPtrKind, eff, 0},
@@ -1250,37 +761,12 @@ index 7a5aba2..1168950 100644
 +    }
 +  }
 +
-+  // Force a popped operand into a DEDICATED frame slot and rebind it there, so
-+  // it survives BOTH the afeye stage callout and the real bulk-memory runtime
-+  // call that follows it (a C call clobbers the caller-saved registers).
-+  //
-+  // This cannot use the generic Spill(VarState*) path: PopIndexToVarState hands
-+  // back {kIntPtrKind, reg, 0} for the common memory32-on-x64 case
-+  // (liftoff-compiler.cc:7414), and offset 0 is the saved frame pointer
-+  // (liftoff-assembler-x64-inl.h:49-51, GetStackSlot is Operand(rbp, -offset)),
-+  // so spilling there would corrupt the frame. A popped VarState is also no
-+  // longer in cache_state, so SpillAllRegisters will not save it either. Frame
-+  // slots are rbp-relative and therefore survive any C call.
-+  //
-+  // SLOT ALLOCATION must be monotonic. The obvious `__ NextSpillOffset(kind)`
-+  // does NOT work: that member overload chains off TopSpillOffset() ==
-+  // stack_state.back().offset() (liftoff-assembler-inl.h:47-55), which
-+  // RecordUsedSpillOffset does not move, so pinning memory.copy's three operands
-+  // in a row would hand all three the SAME offset and alias them into one slot.
-+  // It could also collide with a live value-stack slot. So the base is taken
-+  // above BOTH high-water marks - the recorded frame size and the current
-+  // top-of-stack offset - and each pin records its offset, which moves
-+  // GetTotalFrameSize() so the next pin lands above it. The 3-arg static
-+  // NextSpillOffset(kind, base) does the per-kind alignment.
 +  VarState AfeyePinToFrame(VarState slot) {
 +    if constexpr (kSystemPointerSize != 8) {
 +      return slot;
 +    } else {
-+      if (!slot.is_reg()) return slot;  // already a frame slot or a constant
++      if (!slot.is_reg()) return slot;
 +      const int base = std::max(__ GetTotalFrameSize(), __ TopSpillOffset());
-+      // The 3-arg static overload (liftoff-assembler.h:493, defined at
-+      // liftoff-assembler-inl.h:39-45, which this TU includes) takes an explicit
-+      // base, so it is called class-qualified rather than through {asm_}.
 +      const int off = LiftoffAssembler::NextSpillOffset(slot.kind(), base);
 +      __ RecordUsedSpillOffset(off);
 +      __ Spill(off, slot.reg(), slot.kind());
@@ -1288,27 +774,6 @@ index 7a5aba2..1168950 100644
 +    }
 +  }
 +
-+  // Emit the STAGE half of a memory.copy callout. The memory BASES are derived
-+  // here from {mem_index} rather than passed in, for the same reason
-+  // AfeyeShadowAccess does it: at the bulk call sites liftoff holds
-+  // {instance_data}, not a base register, and GetMemoryStart is the sanctioned
-+  // way to load one (liftoff-compiler.cc:4423-4444).
-+  //
-+  // The operand VarStates must already have been frame-pinned by the caller via
-+  // AfeyePinToFrame: this emits a C call, which clobbers the caller-saved
-+  // registers, and the real memory.copy GenerateCCall that follows still needs
-+  // those operands. They are also added to {pinned} defensively so
-+  // GetMemoryStart cannot pick one of their registers as a scratch.
-+  //
-+  // ABI width, verified rather than assumed: all three operands reach
-+  // AfeyeShadowStageCopy from PopIndexToVarState, which on a 64-bit target
-+  // always returns kind kIntPtrKind - either the slot was already pointer-sized
-+  // (liftoff-compiler.cc:7396-7398), or it was a kI32 index that the function
-+  // zero-extended via emit_u32_to_uintptr and re-wrapped as
-+  // {kIntPtrKind, reg, 0} (:7409-7414), or a positive constant re-wrapped the
-+  // same way (:7404-7406). So this 5-argument call passes a full 8-byte width
-+  // for the one argument Win64 would place on the stack, and its high half is
-+  // never undefined.
 +  void AfeyeShadowStageCopy(int dst_mem_index, int src_mem_index,
 +                            VarState dst_off, VarState src_off, VarState len) {
 +    if constexpr (kSystemPointerSize != 8) {
@@ -1329,22 +794,6 @@ index 7a5aba2..1168950 100644
 +    }
 +  }
 +
-+  // Emit the STAGE half of a memory.fill or memory.init callout: one base, one
-+  // offset, one length. Same pinning contract as AfeyeShadowStageCopy. The width
-+  // argument here is weaker but still sufficient: a memory.init length comes from
-+  // a raw PopVarState (liftoff-compiler.cc:7553), so unlike StageCopy's operands
-+  // it may be kI32 rather than kIntPtrKind. That is safe because this call takes
-+  // only 3 arguments, all of which land in registers on every 64-bit ABI
-+  // (CallC routes args below arraysize(kCArgRegs) through ParallelMove,
-+  // liftoff-assembler-x64-inl.h:5213-5217), and the register-load path for a kI32
-+  // stack VarState is ParallelMove::LoadIntoRegister
-+  // (parallel-move.h:105-115) -> LoadStackSlot (:199-229) -> Fill
-+  // (liftoff-assembler-x64-inl.h:1292-1294) -> liftoff::LoadFromStack
-+  // (:76-103), whose kI32 case is `movl(dst.gp(), src)` at :82-84 - which
-+  // zero-extends the upper half on x64. The kI32-in-a-stack-slot hazard
-+  // documented on StageCopy above arises only in liftoff::StoreToMemory
-+  // (:105-131, :134-151), i.e. the >4-argument path, which 3 arguments never
-+  // reach.
 +  void AfeyeShadowStageOne(int mem_index, VarState off, VarState len,
 +                           bool is_init) {
 +    if constexpr (kSystemPointerSize != 8) {
@@ -1362,19 +811,6 @@ index 7a5aba2..1168950 100644
 +    }
 +  }
 +
-+  // Emit the COMMIT half. Takes no arguments - the STAGE callout left everything
-+  // in a thread-local - so it needs no register allocation and can be emitted
-+  // while an OolTrapLabel's FreezeCacheState is still alive (SpillAllRegisters
-+  // and GetUnusedRegister both DCHECK(!frozen)).
-+  //
-+  // It also needs no SpillAllRegisters of its own: the real bulk-memory
-+  // GenerateCCall that ran just before already spilled every cached value
-+  // (SpillAllRegisters is its first action, liftoff-compiler.cc:2451), so no
-+  // liftoff value is register-resident here for a C call to clobber.
-+  //
-+  // PrepareCallCFunction + CallCFunction is the same pair liftoff itself uses
-+  // for a C call (liftoff-assembler-x64-inl.h:5176-5177), and CallCFunction
-+  // restores rsp exactly (macro-assembler-x64.cc:4734).
 +  void AfeyeShadowCommit() {
 +    if constexpr (kSystemPointerSize != 8) {
 +      return;
@@ -1399,7 +835,7 @@ index 7a5aba2..1168950 100644
    bool IndexStaticallyInBounds(const WasmMemory* memory,
                                 const VarState& index_slot, int access_size,
                                 uintptr_t* offset) {
-@@ -4518,6 +4815,14 @@ class LiftoffCompiler {
+@@ -4518,6 +4645,14 @@ class LiftoffCompiler {
                             type.mem_type().representation(), index, offset,
                             decoder->position());
      }
@@ -1414,7 +850,7 @@ index 7a5aba2..1168950 100644
    }
  
    void LoadTransform(FullDecoder* decoder, LoadType type,
-@@ -4566,6 +4871,13 @@ class LiftoffCompiler {
+@@ -4566,6 +4701,13 @@ class LiftoffCompiler {
        TraceMemoryOperation(false, imm.mem_index, mem_rep, index, offset,
                             decoder->position());
      }
@@ -1428,7 +864,7 @@ index 7a5aba2..1168950 100644
    }
  
    void LoadLane(FullDecoder* decoder, LoadType type, const Value& _value,
-@@ -4610,6 +4922,10 @@ class LiftoffCompiler {
+@@ -4610,6 +4752,10 @@ class LiftoffCompiler {
                             type.mem_type().representation(), index, offset,
                             decoder->position());
      }
@@ -1439,7 +875,7 @@ index 7a5aba2..1168950 100644
    }
  
    void StoreMem(FullDecoder* decoder, StoreType type,
-@@ -4675,6 +4991,11 @@ class LiftoffCompiler {
+@@ -4675,6 +4821,11 @@ class LiftoffCompiler {
        TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), index, offset,
                             decoder->position());
      }
@@ -1451,7 +887,7 @@ index 7a5aba2..1168950 100644
    }
  
    void StoreLane(FullDecoder* decoder, StoreType type,
-@@ -4714,6 +5035,9 @@ class LiftoffCompiler {
+@@ -4714,6 +4865,9 @@ class LiftoffCompiler {
        TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), index, offset,
                             decoder->position());
      }
@@ -1461,7 +897,7 @@ index 7a5aba2..1168950 100644
    }
  
    void CurrentMemoryPages(FullDecoder* /* decoder */,
-@@ -6400,6 +6724,11 @@ class LiftoffCompiler {
+@@ -6400,6 +6554,11 @@ class LiftoffCompiler {
        TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), index, offset,
                             decoder->position());
      }
@@ -1473,7 +909,7 @@ index 7a5aba2..1168950 100644
    }
  
    void AtomicLoadMem(FullDecoder* decoder, LoadType type,
-@@ -6436,6 +6765,10 @@ class LiftoffCompiler {
+@@ -6436,6 +6595,10 @@ class LiftoffCompiler {
                             type.mem_type().representation(), index, offset,
                             decoder->position());
      }
@@ -1484,7 +920,7 @@ index 7a5aba2..1168950 100644
    }
  
    void AtomicBinop(
-@@ -6487,6 +6820,12 @@ class LiftoffCompiler {
+@@ -6487,6 +6650,12 @@ class LiftoffCompiler {
      (asm_.*emit_fn)(addr, index, offset, value, result, type, nullptr,
                      i64_offset, LiftoffAssembler::kLittle);
      __ PushRegister(result_kind, result);
@@ -1497,7 +933,7 @@ index 7a5aba2..1168950 100644
    }
  
    void AtomicCompareExchange(FullDecoder* decoder, StoreType type,
-@@ -6565,6 +6904,15 @@ class LiftoffCompiler {
+@@ -6565,6 +6734,15 @@ class LiftoffCompiler {
      __ AtomicCompareExchange(addr, index, offset, expected, new_value, result,
                               type, nullptr, i64_offset);
      __ PushRegister(result_kind, result);
@@ -1513,7 +949,7 @@ index 7a5aba2..1168950 100644
  #endif
    }
  
-@@ -7557,6 +7905,23 @@ class LiftoffCompiler {
+@@ -7557,6 +7735,23 @@ class LiftoffCompiler {
      DCHECK(MatchingMemTypeOnTopOfStack(imm.memory.memory));
      VarState dst = PopIndexToVarState(&mem_offsets_high_word, &pinned);
  
@@ -1537,7 +973,7 @@ index 7a5aba2..1168950 100644
      Register instance_data = __ cache_state() -> cached_instance_data;
      if (instance_data == no_reg) {
        instance_data = __ GetUnusedRegister(kGpReg, pinned).gp();
-@@ -7588,6 +7953,12 @@ class LiftoffCompiler {
+@@ -7588,6 +7783,12 @@ class LiftoffCompiler {
          AddOutOfLineTrap(decoder, Builtin::kThrowWasmTrapMemOutOfBounds);
      __ emit_cond_jump(kEqual, trap.label(), kI32, result.gp(), no_reg,
                        trap.frozen());
@@ -1550,7 +986,7 @@ index 7a5aba2..1168950 100644
    }
  
    void DataDrop(FullDecoder* decoder, const IndexImmediate& imm) {
-@@ -7620,6 +7991,16 @@ class LiftoffCompiler {
+@@ -7620,6 +7821,16 @@ class LiftoffCompiler {
      DCHECK(MatchingMemTypeOnTopOfStack(imm.memory_dst.memory));
      VarState dst = PopIndexToVarState(&mem_offsets_high_word, &pinned);
  
@@ -1567,7 +1003,7 @@ index 7a5aba2..1168950 100644
      Register instance_data = __ cache_state() -> cached_instance_data;
      if (instance_data == no_reg) {
        instance_data = __ GetUnusedRegister(kGpReg, pinned).gp();
-@@ -7651,6 +8032,8 @@ class LiftoffCompiler {
+@@ -7651,6 +7862,8 @@ class LiftoffCompiler {
          AddOutOfLineTrap(decoder, Builtin::kThrowWasmTrapMemOutOfBounds);
      __ emit_cond_jump(kEqual, trap.label(), kI32, result.gp(), no_reg,
                        trap.frozen());
@@ -1576,7 +1012,7 @@ index 7a5aba2..1168950 100644
    }
  
    void MemoryFill(FullDecoder* decoder, const MemoryIndexImmediate& imm,
-@@ -7665,6 +8048,16 @@ class LiftoffCompiler {
+@@ -7665,6 +7878,16 @@ class LiftoffCompiler {
      DCHECK(MatchingMemTypeOnTopOfStack(imm.memory));
      VarState dst = PopIndexToVarState(&mem_offsets_high_word, &pinned);
  
@@ -1593,7 +1029,7 @@ index 7a5aba2..1168950 100644
      Register instance_data = __ cache_state() -> cached_instance_data;
      if (instance_data == no_reg) {
        instance_data = __ GetUnusedRegister(kGpReg, pinned).gp();
-@@ -7694,6 +8087,8 @@ class LiftoffCompiler {
+@@ -7694,6 +7917,8 @@ class LiftoffCompiler {
          AddOutOfLineTrap(decoder, Builtin::kThrowWasmTrapMemOutOfBounds);
      __ emit_cond_jump(kEqual, trap.label(), kI32, result.gp(), no_reg,
                        trap.frozen());
@@ -1602,7 +1038,7 @@ index 7a5aba2..1168950 100644
    }
  
    void LoadSmi(LiftoffRegister reg, int value) {
-@@ -11319,6 +11714,18 @@ class LiftoffCompiler {
+@@ -11319,6 +11544,18 @@ class LiftoffCompiler {
    const uint32_t deopt_info_bytecode_offset_;
    const LocationKindForDeopt deopt_location_kind_;
  
@@ -1622,7 +1058,7 @@ index 7a5aba2..1168950 100644
  
    const compiler::NullCheckStrategy null_check_strategy_ =
 diff --git a/v8/src/wasm/wasm-objects.cc b/v8/src/wasm/wasm-objects.cc
-index 82e40ee..a8b35e2 100644
+index 5c1be85..bf5ab45 100644
 --- a/v8/src/wasm/wasm-objects.cc
 +++ b/v8/src/wasm/wasm-objects.cc
 @@ -9,6 +9,7 @@
@@ -1633,28 +1069,11 @@ index 82e40ee..a8b35e2 100644
  #endif
  
  #if V8_TARGET_OS_LINUX
-@@ -855,6 +856,29 @@ DirectHandle<WasmMemoryObject> WasmMemoryObject::New(
+@@ -855,6 +856,12 @@ DirectHandle<WasmMemoryObject> WasmMemoryObject::New(
      backing_store->AttachSharedWasmMemoryObject(isolate, memory_object);
    }
  
 +#ifdef V8_AFEYE
-+  // afeye (0028): open the 1:1 taint SHADOW for this linear memory.
-+  //
-+  // The shadow is keyed by buffer_start(), NOT by the BackingStore*. That base
-+  // pointer is the only identity already live in a register at every emitted
-+  // Load/Store site: SetInstanceMemory computes base_address =
-+  // backing_store->buffer_start() (this file :783-785) and hands it to
-+  // SetRawMemory, which stores it at kMemory0StartOffset (:1419-1435);
-+  // liftoff's LoadMemoryStart then loads exactly that field
-+  // (liftoff-assembler-inl.h:313-327). So the emitted callout passes the `mem`
-+  // register verbatim - no instance_data indirection per access.
-+  //
-+  // The backing store is off-heap and does not move, so the key is GC-stable:
-+  // the same soundness argument taint.h:44-46 makes for kKeyWasm.
-+  //
-+  // `backing_store` is null on the serialization path (upstream :816-821 - the
-+  // store is created and linked later), which simply leaves that memory
-+  // untracked until a Grow.
 +  if (backing_store) {
 +    v8::afeye::ShadowAlloc(backing_store->buffer_start(),
 +                           backing_store->byte_length());
@@ -1663,7 +1082,7 @@ index 82e40ee..a8b35e2 100644
    return memory_object;
  }
  
-@@ -1136,6 +1160,12 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
+@@ -1136,6 +1143,12 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
            reinterpret_cast<const uint8_t*>(
                memory_object->backing_store()->buffer_start()),
            memory_object->backing_store()->byte_length());
@@ -1676,7 +1095,7 @@ index 82e40ee..a8b35e2 100644
      }
      return result;  // success
    }
-@@ -1164,6 +1194,9 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
+@@ -1164,6 +1177,9 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
            reinterpret_cast<const uint8_t*>(
                memory_object->backing_store()->buffer_start()),
            memory_object->backing_store()->byte_length());
@@ -1686,27 +1105,18 @@ index 82e40ee..a8b35e2 100644
      }
      return static_cast<int32_t>(result_inplace.value());  // success
    }
-@@ -1200,6 +1233,19 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
+@@ -1200,6 +1216,10 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
  
    DCHECK_EQ(backing_store.raw(), memory_object->backing_store().raw());
    size_t new_byte_length = new_backing_store->byte_length();
 +#ifdef V8_AFEYE
-+  // afeye (0028): COPY grow. SetManagedObject below installs a NEW BackingStore,
-+  // so buffer_start() - and therefore the shadow KEY - changes. Both bases are
-+  // captured here, while they are still valid: after the std::move below the
-+  // old `backing_store` handle is not readable, and V8 keeps the old buffer
-+  // alive for concurrent wasm threads only until the JSArrayBuffer::Detach in
-+  // the has_old_buffer block just below (upstream wasm-objects.cc:1178-1181).
-+  // Without the migration the tags accumulated so far would be silently
-+  // orphaned on every grow-by-copy - a false dead-end on exactly the
-+  // memory-hungry PoW modules this layer exists to follow.
 +  void* const afeye_old_base = backing_store->buffer_start();
 +  void* const afeye_new_base = new_backing_store->buffer_start();
 +#endif
    memory_object->managed_backing_store()->SetManagedObject(
        std::move(new_backing_store), isolate, new_byte_length);
  
-@@ -1209,6 +1255,10 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
+@@ -1209,6 +1229,10 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
    }
    memory_object->UpdateInstances(isolate);
  

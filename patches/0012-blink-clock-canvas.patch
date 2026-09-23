@@ -1,3 +1,5 @@
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index 40df4b3..2b75091 100644
 --- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 +++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 @@ -27,6 +27,12 @@
@@ -13,18 +15,11 @@
  #include <math.h>
  
  #include <limits>
-@@ -1305,6 +1311,23 @@ String HTMLCanvasElement::ToDataURLInternal(
+@@ -1305,6 +1311,16 @@ String HTMLCanvasElement::ToDataURLInternal(
        return String("data:,");
  
      String data_url = data_buffer->ToDataURL(encoding_mime_type, quality);
 +#ifdef BLINK_AFEYE
-+    // afeye (0012): canvas.toDataURL is THE canvas-fingerprint readback and
-+    // ToDataURLInternal is the single funnel where the encoded data URL is
-+    // materialized - the public toDataURL() and every internal caller land
-+    // here. The kind-29 dom-api thunk sees the CALL by name; this captures
-+    // the RESULT: mime + encoded length (the stable digest signal; the full
-+    // base64 rides on the CDP capture side). The string already exists - no
-+    // second render, no side effect, no extra allocation.
 +    if (blink::afeye::Enabled()) {
 +      char afeye_buf[160];
 +      std::snprintf(afeye_buf, sizeof(afeye_buf),
@@ -37,14 +32,11 @@
      base::TimeDelta elapsed_time = base::TimeTicks::Now() - start_time;
      float sqrt_pixels =
          std::sqrt(image_bitmap->width()) * std::sqrt(image_bitmap->height());
-@@ -1364,6 +1387,19 @@ void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
+@@ -1364,6 +1380,16 @@ void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
                                 const String& mime_type,
                                 const ScriptValue& quality_argument,
                                 ExceptionState& exception_state) {
 +#ifdef BLINK_AFEYE
-+  // afeye (0012): toBlob is the async twin of toDataURL - same fingerprint
-+  // readback, different return path (bytes go to a callback, never through
-+  // ToDataURLInternal). Log the ask: mime + canvas geometry.
 +  if (blink::afeye::Enabled()) {
 +    char afeye_buf[160];
 +    std::snprintf(afeye_buf, sizeof(afeye_buf),
@@ -57,6 +49,8 @@
    if (!OriginClean()) {
      exception_state.ThrowSecurityError("Tainted canvases may not be exported.");
      return;
+diff --git a/third_party/blink/renderer/core/timing/performance.cc b/third_party/blink/renderer/core/timing/performance.cc
+index 8bdad30..9d0a4ae 100644
 --- a/third_party/blink/renderer/core/timing/performance.cc
 +++ b/third_party/blink/renderer/core/timing/performance.cc
 @@ -31,6 +31,14 @@
@@ -74,16 +68,11 @@
  #include <algorithm>
  #include <optional>
  
-@@ -1352,6 +1360,25 @@ DOMHighResTimeStamp Performance::MonotonicTimeToDOMHighResTimeStamp(
+@@ -1352,6 +1360,20 @@ DOMHighResTimeStamp Performance::MonotonicTimeToDOMHighResTimeStamp(
  }
  
  DOMHighResTimeStamp Performance::now() const {
 +#ifdef BLINK_AFEYE
-+  // afeye (0012): performance.now() is the high-resolution clock every
-+  // antifraud timing check reads - PoW loops, human-vs-bot cadence, challenge
-+  // latency probes. kind-33 only caught Date.now() (the v8 builtin); this
-+  // closes the performance.now() half of the clock stream. Capped like the
-+  // Date.now() hook (2M) and env-gated by the same AFEYE_TRACE_CLOCK.
 +  if (blink::afeye::Enabled()) {
 +    static std::atomic<uint64_t> g_afeye_pnow{0};
 +    static bool g_afeye_pnow_off = []() {

@@ -1,74 +1,49 @@
-diff --git a/v8/src/afeye/sink.h b/v8/src/afeye/sink.h
-new file mode 100644
-index 0000000000..1111111111
---- /dev/null
-+++ b/v8/src/afeye/sink.h
-@@ -0,0 +0,59 @@
-+#ifndef V8_AFEYE_SINK_H_
-+#define V8_AFEYE_SINK_H_
+diff --git a/v8/BUILD.gn b/v8/BUILD.gn
+index 0c48f1e..2d4799e 100644
+--- a/v8/BUILD.gn
++++ b/v8/BUILD.gn
+@@ -64,6 +64,9 @@ declare_args() {
+   # Sets -DVERIFY_PREDICTABLE
+   v8_enable_verify_predictable = false
+ 
++  # afeye: env-activated record sink compiled into v8 (patches/SERIES.md).
++  v8_enable_afeye = false
 +
-+#include <stddef.h>
-+#include <stdint.h>
+   # Enable DWARF line info for Torque files.
+   # TODO(olivf): Find out how this works on other platforms.
+   v8_enable_torque_dwarf = is_debug && is_linux
+@@ -7041,6 +7044,25 @@ v8_cluster_source_set("v8_base_without_compiler") {
+     ]
+     deps += [ "third_party/vtune:v8_vtune_trace_mark" ]
+   }
 +
-+#ifdef V8_AFEYE
-+
-+namespace v8 {
-+namespace afeye {
-+
-+enum EventKind : uint8_t {
-+  kSinkHello = 0,
-+  kScriptSource = 1,
-+  kBytecodeEntry = 2,
-+  kWasmModule = 3,
-+  kWasmMemory = 4,
-+  kWasmTable = 5,
-+  kMicrotaskEnqueue = 6,
-+  kMicrotaskRun = 7,
-+  kCallCompleted = 8,
-+  kAtomics = 9,
-+  kSabBacking = 10,
-+  // v6 additions (wire-compatible, new records only)
-+  kMicrotaskDrain = 30,
-+  kWasmInstance = 31,
-+  kFnToString = 32,
-+  kClock = 33,
-+  kIsolateBirth = 34,
-+  // v9 additions (wire-compatible). kind 16 "fingerprint" already named by
-+  // the collector for the blink layer; the v8 layer joins it for the
-+  // in-engine fingerprint reads (JSON.stringify result, Intl resolved
-+  // options, GOPD tamper-checks) that have no blink binding.
-+  kFingerprint = 16,
-+  // 38 error-stack: Error().stack / captureStackTrace materialization
-+  // (0022) - the automation-detection surface AND the JS->JS edge source.
-+  kErrorStack = 38,
-+};
-+
-+bool Enabled();
-+uint64_t NowNs();
-+void EmitFlags(uint8_t kind, uint64_t ts_ns, uint8_t flags, const void* data,
-+               uint32_t len);
-+void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
-+void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s);
-+void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b);
-+void EmitWasmMemGrow(size_t old_pages, size_t new_pages);
-+void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
-+              const uint8_t* bytes, uint32_t n);
-+uint64_t SinkDropped();
-+bool Flush(uint32_t timeout_ms);
-+
-+}
-+}  // namespace v8
-+
-+#endif
-+
-+#endif
-+
++  # afeye: env-activated record sink compiled into v8 (patches/SERIES.md).
++  # SIBLING of the vtune block, NOT nested inside it. v6 had this nested
++  # under `if (v8_enable_vtunetracemark && ...)` which is false by default:
++  # sink.cc never compiled and every `#ifdef V8_AFEYE` hook in api.cc /
++  # compiler.cc / wasm / execution silently compiled to nothing. The
++  # args.gn extra_cflags define is the belt to this suspenders.
++  # v12.1: `defines = []` first - this target scope never declared a
++  # defines list, so a bare `defines +=` is an Undefined identifier error
++  # in GN (the CI build died at exactly BUILD.gn:7059). Same pattern as
++  # the `libs = []` declaration above.
++  defines = []
++  if (v8_enable_afeye) {
++    sources += [
++      "src/afeye/sink.cc",
++      "src/afeye/sink.h",
++    ]
++    defines += [ "V8_AFEYE" ]
++  }
+ }
+ 
+ group("v8_base") {
 diff --git a/v8/src/afeye/sink.cc b/v8/src/afeye/sink.cc
 new file mode 100644
-index 0000000000..1111111111
+index 0000000..4c3278e
 --- /dev/null
 +++ b/v8/src/afeye/sink.cc
-@@ -0,0 +58,378 @@
+@@ -0,0 +1,325 @@
 +#include "src/afeye/sink.h"
 +
 +#ifdef V8_AFEYE
@@ -103,14 +78,7 @@ index 0000000000..1111111111
 +std::atomic<bool> g_on{false};
 +std::atomic<uint64_t> g_dropped{0};
 +std::once_flag g_init_once;
-+// v12.4: atomic + CAS so two child threads post-fork cannot both run
-+// ReinitAfterFork and spawn two drain threads on one file.
-+std::atomic<pid_t> g_pid{0};  // fork safety - see Enabled()
-+// v12.4: getpid() is a REAL syscall on modern glibc (the pid cache was
-+// removed in 2.25) - Enabled() sits in the hottest funnel (Invoke, every
-+// C++->JS entry), so the pid is cached per thread and re-checked only
-+// against the atomic (vDSO-priced load). A fork changes the pid, the
-+// thread-local is refreshed then - one syscall per fork, zero per call.
++std::atomic<pid_t> g_pid{0};
 +thread_local pid_t t_pid = 0;
 +
 +struct Ring {
@@ -141,13 +109,6 @@ index 0000000000..1111111111
 +  return kDir;
 +}
 +
-+// v12.4: write errors are COUNTED, not swallowed. The chunk is already
-+// out of the ring, g_dropped does not move, and the 0023 drop witness
-+// watches ring overflow only - a silent return made ENOSPC/EIO invisible
-+// loss (exactly the class of hidden gap the witness exists to close).
-+// The drain loop reads the counter, folds it into its sink-drop report,
-+// and reopens the fd so a transient failure (full disk, then space) does
-+// not silently kill every subsequent record forever.
 +std::atomic<uint64_t> g_write_err{0};
 +
 +void WriteAll(int fd, const uint8_t* p, size_t n) {
@@ -188,12 +149,6 @@ index 0000000000..1111111111
 +  std::string path = std::string(RawDir()) + "/" + kLayer + "-" + pid + ".rec";
 +  int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
 +  if (fd >= 0) EmitHello(fd);
-+  // v12.4 (N6): fixed stack-of-heap buffer, NOT a std::vector. The old
-+  // buf.assign() ran a malloc + memcpy of up to 1 MiB INSIDE the ring lock
-+  // - if the drain thread descheduled mid-copy, every JS thread in the
-+  // process spun on test_and_set for the whole copy (the v8 ring is one
-+  // per process; main thread + every worker isolate contend on it).
-+  // Now: copy under lock into a pre-sized buffer, write outside it.
 +  static thread_local std::vector<uint8_t> buf;
 +  buf.resize(kMaxRecord);
 +  for (;;) {
@@ -201,8 +156,6 @@ index 0000000000..1111111111
 +    bool have = false;
 +    uint32_t spin = 0;
 +    while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
-+      // bounded spin then yield: an unbounded test_and_set on a contended
-+      // cache line burns the whole timeslice without progress
 +      if (++spin >= 64) {
 +        spin = 0;
 +        std::this_thread::yield();
@@ -215,7 +168,6 @@ index 0000000000..1111111111
 +      if (len < 16 || len > kMaxRecord) {
 +        g_ring.tail = g_ring.head;
 +      } else {
-+        // single memcpy under the lock - no allocation, no syscalls
 +        std::memcpy(buf.data(), g_ring.data + g_ring.tail, len);
 +        size_t nt = g_ring.tail + len;
 +        if (nt >= kRingBytes) nt -= kRingBytes;
@@ -228,9 +180,6 @@ index 0000000000..1111111111
 +    if (have) {
 +      if (fd >= 0) {
 +        WriteAll(fd, buf.data(), len);
-+        // v12.4: a failed write (ENOSPC/EIO) leaves a live fd that would
-+        // keep swallowing records - force the reopen path below so the
-+        // next cycle retries a FRESH open (disk-full-then-space, etc.).
 +        if (g_write_err.load(std::memory_order_relaxed) != werr_before) {
 +          ::close(fd);
 +          fd = -1;
@@ -246,18 +195,7 @@ index 0000000000..1111111111
 +  }
 +}
 +
-+// v12.1: fork safety. Chrome zygote-forks renderers AFTER InitOnce ran in
-+// the parent: the child inherits the once_flag as COMPLETED, the ring, and
-+// g_pid - but the drain thread does NOT survive fork (only the calling
-+// thread continues). The child would fill the inherited 8 MiB ring, drop
-+// everything, and never create its <layer>-<pid>.rec. getpid is vDSO (no
-+// syscall) so the check is free in the hot path.
 +void ReinitAfterFork() {
-+  // v12.4: the parent's drain thread may have HELD the ring lock at fork
-+  // time - the (dead) holder never clears it, and the first child Enabled()
-+  // would spin forever on a test_and_set owned by nobody. In the fresh
-+  // child only the calling thread exists, so an unconditional clear is
-+  // race-free by definition.
 +  g_ring.lock.clear(std::memory_order_release);
 +  g_ring.tail = 0;
 +  g_ring.head = 0;
@@ -276,17 +214,10 @@ index 0000000000..1111111111
 +  std::atexit([] { Flush(500); });
 +}
 +
-+}  // namespace
++}
 +
 +bool Enabled() {
 +  std::call_once(g_init_once, InitOnce);
-+  // v12.4: no raw getpid() here - it is a real syscall on glibc >= 2.25 and
-+  // this sits in the Invoke funnel (every C++->JS entry). The thread-local
-+  // cache holds the last observed pid; only a mismatch (a fork happened on
-+  // THIS thread) pays the syscall + the CAS-reinit. The CAS admits exactly
-+  // one winner when several threads race post-fork; the losers just
-+  // refresh their cache. Sink-off early-exit: a disabled build never spawns
-+  // a drain thread, never leaves a .rec file (the v12.4 N4 fix).
 +  pid_t me = t_pid;
 +  if (me == 0) {
 +    me = ::getpid();
@@ -314,10 +245,6 @@ index 0000000000..1111111111
 +  const size_t need = 16 + static_cast<size_t>(len);
 +  uint32_t afeye_spin = 0;
 +  while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
-+    // v12.4 (N6): emit hot path - every Invoke crosses here. Unbounded
-+    // test_and_set against a descheduled holder burns a full timeslice;
-+    // 64 spins then yield keeps the latency bounded for the holder's
-+    // cache-line release.
 +    if (++afeye_spin >= 64) {
 +      afeye_spin = 0;
 +      std::this_thread::yield();
@@ -399,9 +326,6 @@ index 0000000000..1111111111
 +  EmitFlags(kind, ts_ns, trunc ? 1 : 0, buf.data(),
 +            static_cast<uint32_t>(buf.size()));
 +}
-+// v12.4 (N9): the DEFINITION lives here (was 0025 wasm-objects.cc-only) -
-+// the sink.h declaration alone left every other TU calling it with an
-+// undefined symbol. Same body as 0025; the 0025 copy is removed.
 +void EmitWasmMemGrow(size_t old_pages, size_t new_pages) {
 +  static std::atomic<uint64_t> g_afeye_wmem{0};
 +  static bool g_afeye_wmem_off = []() {
@@ -419,8 +343,6 @@ index 0000000000..1111111111
 +}
 +
 +
-+// v12.4: ring drops AND write errors - the 0023 witness must see both or
-+// ENOSPC is an invisible gap the graph then misreads as dead-end evidence.
 +uint64_t SinkDropped() {
 +  return g_dropped.load(std::memory_order_relaxed) +
 +         g_write_err.load(std::memory_order_relaxed);
@@ -443,45 +365,65 @@ index 0000000000..1111111111
 +}
 +
 +}
-+}  // namespace v8
++}
 +
 +#endif
 +
---- a/v8/BUILD.gn
-+++ b/v8/BUILD.gn
-@@ -63,6 +405,9 @@
- 
-   # Sets -DVERIFY_PREDICTABLE
-   v8_enable_verify_predictable = false
+diff --git a/v8/src/afeye/sink.h b/v8/src/afeye/sink.h
+new file mode 100644
+index 0000000..ca6d2bb
+--- /dev/null
++++ b/v8/src/afeye/sink.h
+@@ -0,0 +1,52 @@
++#ifndef V8_AFEYE_SINK_H_
++#define V8_AFEYE_SINK_H_
 +
-+  # afeye: env-activated record sink compiled into v8 (patches/SERIES.md).
-+  v8_enable_afeye = false
- 
-   # Enable DWARF line info for Torque files.
-   # TODO(olivf): Find out how this works on other platforms.
-@@ -7040,6 +7385,25 @@
-       "src/extensions/vtunedomain-support-extension.h",
-     ]
-     deps += [ "third_party/vtune:v8_vtune_trace_mark" ]
-   }
++#include <stddef.h>
++#include <stdint.h>
 +
-+  # afeye: env-activated record sink compiled into v8 (patches/SERIES.md).
-+  # SIBLING of the vtune block, NOT nested inside it. v6 had this nested
-+  # under `if (v8_enable_vtunetracemark && ...)` which is false by default:
-+  # sink.cc never compiled and every `#ifdef V8_AFEYE` hook in api.cc /
-+  # compiler.cc / wasm / execution silently compiled to nothing. The
-+  # args.gn extra_cflags define is the belt to this suspenders.
-+  # v12.1: `defines = []` first - this target scope never declared a
-+  # defines list, so a bare `defines +=` is an Undefined identifier error
-+  # in GN (the CI build died at exactly BUILD.gn:7059). Same pattern as
-+  # the `libs = []` declaration above.
-+  defines = []
-+  if (v8_enable_afeye) {
-+    sources += [
-+      "src/afeye/sink.cc",
-+      "src/afeye/sink.h",
-+    ]
-+    defines += [ "V8_AFEYE" ]
-+  }
- }
- 
++#ifdef V8_AFEYE
++
++namespace v8 {
++namespace afeye {
++
++enum EventKind : uint8_t {
++  kSinkHello = 0,
++  kScriptSource = 1,
++  kBytecodeEntry = 2,
++  kWasmModule = 3,
++  kWasmMemory = 4,
++  kWasmTable = 5,
++  kMicrotaskEnqueue = 6,
++  kMicrotaskRun = 7,
++  kCallCompleted = 8,
++  kAtomics = 9,
++  kSabBacking = 10,
++  kMicrotaskDrain = 30,
++  kWasmInstance = 31,
++  kFnToString = 32,
++  kClock = 33,
++  kIsolateBirth = 34,
++  kFingerprint = 16,
++  kErrorStack = 38,
++};
++
++bool Enabled();
++uint64_t NowNs();
++void EmitFlags(uint8_t kind, uint64_t ts_ns, uint8_t flags, const void* data,
++               uint32_t len);
++void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
++void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s);
++void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b);
++void EmitWasmMemGrow(size_t old_pages, size_t new_pages);
++void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
++              const uint8_t* bytes, uint32_t n);
++uint64_t SinkDropped();
++bool Flush(uint32_t timeout_ms);
++
++}
++}
++
++#endif
++
++#endif
++

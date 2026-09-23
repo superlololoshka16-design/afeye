@@ -1,3 +1,5 @@
+diff --git a/v8/src/builtins/builtins-json.cc b/v8/src/builtins/builtins-json.cc
+index 1ed282f..e67cbc4 100644
 --- a/v8/src/builtins/builtins-json.cc
 +++ b/v8/src/builtins/builtins-json.cc
 @@ -3,6 +3,14 @@
@@ -15,19 +17,16 @@
  #include "src/builtins/builtins.h"
  #include "src/json/json-parser.h"
  #include "src/json/json-stringifier.h"
-@@ -30,14 +38,91 @@ BUILTIN(JsonParse) {
+@@ -30,14 +38,72 @@ BUILTIN(JsonParse) {
                                          std::nullopt));
  }
  
 +#ifdef V8_AFEYE
 +namespace {
-+// no-alloc flat-string head copy (the 0003/0004 pattern). Returns bytes
-+// copied; skips non-flat strings rather than calling Flatten (Flatten can GC).
 +int AfeyeJsonCopyHead(Tagged<String> str, char* dst, uint32_t cap) {
 +  DisallowGarbageCollection no_gc;
 +  String::FlatContent flat = str->GetFlatContent(no_gc);
 +  if (!flat.IsFlat()) {
-+    // v12.4 (N7): -1 = non-flat marker, see the stack variant above.
 +    dst[0] = '\0';
 +    return -1;
 +  }
@@ -49,7 +48,7 @@
 +  dst[len] = '\0';
 +  return static_cast<int>(len);
 +}
-+}  // namespace
++}
 +#endif
 +
  // ES6 section 24.3.2 JSON.stringify.
@@ -63,16 +62,6 @@
 +  MaybeDirectHandle<Object> afeye_result =
 +      JsonStringify(isolate, object, replacer, indent);
 +#ifdef V8_AFEYE
-+  // afeye (0021, G3): the ASSEMBLED PLAINTEXT. This is the single highest-
-+  // signal v8 record for token reconstruction: the fingerprint object becomes
-+  // a string here, immediately before the crypto layer (kind 11) encrypts it
-+  // and the wire layer (kind 17/18) sends it. The Rust content-slice can
-+  // blake3-match this head against the uploaded body / crypto raw_data
-+  // instead of inferring payload formation from timing alone. Logs the result
-+  // head (960 B, same cap as the 0013 cookie/storage values) under
-+  // DisallowGarbageCollection via GetFlatContent - no Utf8Value, no
-+  // std::string, no second allocation. A replacer is logged as a flag: it is
-+  // how antifraud walks/serializes selectively. AFEYE_TRACE_JSON=0 disables.
 +  DirectHandle<Object> afeye_r;
 +  if (v8::afeye::Enabled() && afeye_result.ToHandle(&afeye_r) &&
 +      IsString(*afeye_r)) {
@@ -86,12 +75,6 @@
 +      char afeye_head[961];
 +      int afeye_n =
 +          AfeyeJsonCopyHead(Cast<String>(*afeye_r), afeye_head, 960);
-+      // v12.1: EmitSpan tag\0value (was EmitStr prose) - the NUL split is
-+      // what admits the plaintext head into the Rust content graph
-+      // (VALUE_TAGS prefix match; the prose form was skipped at
-+      // sinkfilter.rs:1575, so the advertised stringify->req-body content
-+      // edge never existed). Metadata rides in the tag; body = head bytes.
-+      // v12.4 (N7): -1 = non-flat marker survives (was: silently skipped)
 +      if (afeye_n != 0) {
 +        char afeye_tag[64];
 +        std::snprintf(afeye_tag, sizeof(afeye_tag),
@@ -109,9 +92,11 @@
  }
  
  // https://tc39.es/proposal-json-parse-with-source/#sec-json.rawjson
+diff --git a/v8/src/execution/messages.cc b/v8/src/execution/messages.cc
+index 2bd0247..94ae1e4 100644
 --- a/v8/src/execution/messages.cc
 +++ b/v8/src/execution/messages.cc
-@@ -6,6 +89,15 @@
+@@ -6,6 +6,15 @@
  
  #include <memory>
  
@@ -127,23 +112,16 @@
  #include "src/api/api-inl.h"
  #include "src/ast/ast.h"
  #include "src/ast/prettyprinter.h"
-@@ -1145,8 +1237,45 @@ ErrorUtils::StackPropertyLookupResult ErrorUtils::GetErrorStackProperty(
+@@ -1145,8 +1154,38 @@ ErrorUtils::StackPropertyLookupResult ErrorUtils::GetErrorStackProperty(
    return {it.GetHolder<JSObject>(), result};
  }
  
 +#ifdef V8_AFEYE
 +namespace {
-+// no-alloc flat-string head copy (the 0003/0004 pattern). Skips non-flat
-+// strings rather than calling Flatten (Flatten can GC).
 +int AfeyeStackCopyHead(Tagged<String> str, char* dst, uint32_t cap) {
 +  DisallowGarbageCollection no_gc;
 +  String::FlatContent flat = str->GetFlatContent(no_gc);
 +  if (!flat.IsFlat()) {
-+    // v12.4 (N7): a cons/sliced string returns a MARKER, not a silent
-+    // empty record - "errstack len=0 head=" was indistinguishable from
-+    // "stack was empty". -1 = non-flat (a real stack is virtually always
-+    // flat; a marker keeps the data-gap visible in the stream instead of
-+    // folding it into nothing.
 +    dst[0] = '\0';
 +    return -1;
 +  }
@@ -165,7 +143,7 @@
 +  dst[len] = '\0';
 +  return static_cast<int>(len);
 +}
-+}  // namespace
++}
 +#endif
 +
  // static
@@ -174,22 +152,11 @@
      Isolate* isolate, DirectHandle<JSObject> maybe_error_object) {
    TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.stack_trace"),
                perfetto::StaticString(__func__));
-@@ -1193,6 +1317,47 @@ MaybeDirectHandle<Object> ErrorUtils::GetFormattedStack(
+@@ -1193,6 +1232,36 @@ MaybeDirectHandle<Object> ErrorUtils::GetFormattedStack(
    return lookup.error_stack;
  }
  
 +#ifdef V8_AFEYE
-+// afeye (0022, G2): Error().stack / Error.captureStackTrace / prepareStackTrace
-+// - the string that materializes the whole JS call stack. Two antifraud uses:
-+// (a) DETECTOR - automation leaves patterns in the stack (puppeteer/playwright
-+// internals, `at eval (eval at <anonymous>)`, CDP-injected frames); Cloudflare
-+// Turnstile / DataDome / Kasada hash stack-derived facts into the token;
-+// (b) DATA - the script URLs + function names in the stack are themselves a
-+// per-install fingerprint, AND the only cheap JS->JS call-edge source in the
-+// engine (0003's Invoke sees C++->JS only). This is the single funnel every
-+// .stack read converges on; GetFormattedStackImpl above is the renamed
-+// original (all 4 of its return paths funnel back through here).
-+// static
 +MaybeDirectHandle<Object> ErrorUtils::GetFormattedStack(
 +    Isolate* isolate, DirectHandle<JSObject> maybe_error_object) {
 +  MaybeDirectHandle<Object> afeye_stack =
@@ -222,15 +189,15 @@
  // static
  void ErrorUtils::SetFormattedStack(Isolate* isolate,
                                     DirectHandle<JSObject> maybe_error_object,
+diff --git a/v8/src/execution/messages.h b/v8/src/execution/messages.h
+index 0e63e76..95fe981 100644
 --- a/v8/src/execution/messages.h
 +++ b/v8/src/execution/messages.h
-@@ -142,6 +307,12 @@ class ErrorUtils : public AllStatic {
+@@ -142,6 +142,10 @@ class ErrorUtils : public AllStatic {
  
    static MaybeDirectHandle<Object> GetFormattedStack(
        Isolate* isolate, DirectHandle<JSObject> maybe_error_object);
 +#ifdef V8_AFEYE
-+  // afeye (0022, G2): the original body, renamed so GetFormattedStack can wrap
-+  // it with the stack-materialization sink. Identical signature/semantics.
 +  static MaybeDirectHandle<Object> GetFormattedStackImpl(
 +      Isolate* isolate, DirectHandle<JSObject> maybe_error_object);
 +#endif

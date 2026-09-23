@@ -1,3 +1,5 @@
+diff --git a/third_party/blink/renderer/core/loader/document_load_timing.cc b/third_party/blink/renderer/core/loader/document_load_timing.cc
+index af6a5cb..4b295c6 100644
 --- a/third_party/blink/renderer/core/loader/document_load_timing.cc
 +++ b/third_party/blink/renderer/core/loader/document_load_timing.cc
 @@ -24,6 +24,10 @@
@@ -11,15 +13,12 @@
  
  #include "base/memory/scoped_refptr.h"
  #include "services/network/public/mojom/timing_allow_origin.mojom-blink.h"
-@@ -128,6 +132,20 @@
+@@ -128,6 +132,17 @@ void DocumentLoadTiming::SetNavigationStart(base::TimeTicks navigation_start) {
    // navigationStart. We must set these to the current time if they haven't
    // been set yet in order to have a valid reference time in both units.
    EnsureReferenceTimesSet();
 +#ifdef BLINK_AFEYE
 +  if (blink::afeye::Enabled()) {
-+    // afeye (v6): T0 for the whole page timeline. base::TimeTicks on POSIX
-+    // is CLOCK_MONOTONIC - the SAME clock domain the sinks use, so the
-+    // filter can diff every record against navigation start exactly.
 +    char afeye_buf[96];
 +    std::snprintf(afeye_buf, sizeof(afeye_buf), "nav-start mono_ns=%lld",
 +                  static_cast<long long>(
@@ -32,6 +31,8 @@
    navigation_start_ = navigation_start;
    TRACE_EVENT_MARK_WITH_TIMESTAMP2(
        "blink.user_timing", "navigationStart", navigation_start_, "frame",
+diff --git a/third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.cc b/third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.cc
+index 52bfd9f..6cc4724 100644
 --- a/third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.cc
 +++ b/third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.cc
 @@ -3,6 +3,10 @@
@@ -45,15 +46,11 @@
  
  #include <utility>
  
-@@ -248,6 +252,21 @@
+@@ -248,6 +252,17 @@ WorkerOrWorkletGlobalScope::WorkerOrWorkletGlobalScope(
    SetPolicyContainer(PolicyContainer::CreateEmpty());
    if (worker_clients_)
      worker_clients_->ReattachThread();
 +#ifdef BLINK_AFEYE
-+  // afeye (v6): worker/worklet global scope birth: the isolate pointer is
-+  // the join key for the "iso:" script-source prefixes - a worker's script
-+  // stream is attributable to its isolate even though the pid is shared
-+  // with the main thread (dedicated workers) or not (service workers).
 +  if (blink::afeye::Enabled()) {
 +    char afeye_buf[160];
 +    std::snprintf(afeye_buf, sizeof(afeye_buf),
