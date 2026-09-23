@@ -40,10 +40,10 @@ index 4c72860..40eea6e 100644
      // Utf8Length/WriteOneByte pairing (WriteOneByte copies CODE UNITS, not
      // bytes - multi-byte strings were truncated and the tail leaked stale
 diff --git a/v8/BUILD.gn b/v8/BUILD.gn
-index 2d4799e..afdc24a 100644
+index 2d4799e..6f63a62 100644
 --- a/v8/BUILD.gn
 +++ b/v8/BUILD.gn
-@@ -7060,6 +7060,24 @@ v8_cluster_source_set("v8_base_without_compiler") {
+@@ -7060,6 +7060,21 @@ v8_cluster_source_set("v8_base_without_compiler") {
      sources += [
        "src/afeye/sink.cc",
        "src/afeye/sink.h",
@@ -56,9 +56,6 @@ index 2d4799e..afdc24a 100644
 +      # Exported default-visibility; blink declares the identical sigs.
 +      "src/afeye/taint_abi.cc",
 +      "src/afeye/taint_abi.h",
-+      # 0028 (WasmShadow): per-instance wasm linear-memory shadow.
-+      "src/afeye/wasm_shadow.cc",
-+      "src/afeye/wasm_shadow.h",
 +      # 0031 (AsyncCausality): async trace_id causality graph.
 +      "src/afeye/causality.cc",
 +      "src/afeye/causality.h",
