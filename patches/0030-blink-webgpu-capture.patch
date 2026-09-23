@@ -74,7 +74,7 @@ index 6b2c153..454b097 100644
    ArrayBufferContents contents(v8::ArrayBuffer::NewBackingStore(
        data, data_length, v8::BackingStore::EmptyDeleter, nullptr));
 diff --git a/third_party/blink/renderer/modules/webgpu/gpu_queue.cc b/third_party/blink/renderer/modules/webgpu/gpu_queue.cc
-index b51671d..273f8bf 100644
+index b51671d..28b7df2 100644
 --- a/third_party/blink/renderer/modules/webgpu/gpu_queue.cc
 +++ b/third_party/blink/renderer/modules/webgpu/gpu_queue.cc
 @@ -4,6 +4,15 @@
@@ -150,6 +150,31 @@ index b51671d..273f8bf 100644
    GetHandle().WriteBuffer(buffer->GetHandle(), buffer_offset, data_span.data(),
                            data_span.size());
    EnsureFlush(ToEventLoop(script_state));
+@@ -318,6 +370,24 @@ void GPUQueue::WriteTextureImpl(ScriptState* script_state,
+       dawn_destination.aspect);
+   size_t required_copy_size = std::min(data_span.size(), data_size_upper_bound);
+ 
++#ifdef BLINK_AFEYE
++  // afeye (0030): writeTexture egress - the texture-upload half of the
++  // WebGPU exfil/compute surface. A GPU fingerprint (canvas raster,
++  // image-derived texture) or a compute input staged as a texture crosses
++  // here; like writeBuffer it bypasses url_loader/websocket/WebTransport.
++  // required_copy_size is the TIGHT upper bound of bytes actually handed to
++  // Dawn's WriteTexture (not the whole input span), so this is the wire
++  // extent. data_span is already offset-adjusted (dawn_data_layout.offset
++  // folded into the pointer above).
++  if (blink::afeye::Enabled() && AfeyeWebGpuOn() && required_copy_size > 0) {
++    char afeye_tag[96];
++    std::snprintf(afeye_tag, sizeof(afeye_tag),
++                  "webgpu/write-texture len=%zu", required_copy_size);
++    blink::afeye::EmitSpan(blink::afeye::kWebSocket, blink::afeye::NowNs(),
++                           afeye_tag, data_span.data(),
++                           static_cast<uint32_t>(required_copy_size));
++  }
++#endif
+   GetHandle().WriteTexture(&dawn_destination, data_span.data(),
+                            required_copy_size, &dawn_data_layout,
+                            &dawn_write_size);
 diff --git a/third_party/blink/renderer/modules/webgpu/gpu_shader_module.cc b/third_party/blink/renderer/modules/webgpu/gpu_shader_module.cc
 index c8f1321..d9fcd4c 100644
 --- a/third_party/blink/renderer/modules/webgpu/gpu_shader_module.cc
