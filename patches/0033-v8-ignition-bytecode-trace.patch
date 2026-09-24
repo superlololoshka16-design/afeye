@@ -1,3 +1,369 @@
+diff --git a/v8/src/afeye/bcrec.h b/v8/src/afeye/bcrec.h
+new file mode 100644
+index 0000000..270d2b8
+--- /dev/null
++++ b/v8/src/afeye/bcrec.h
+@@ -0,0 +1,360 @@
++#ifndef V8_AFEYE_BCREC_H_
++#define V8_AFEYE_BCREC_H_
++
++// afeye 0033 bytecode-trace wire format. Header-only, ZERO v8
++// dependencies by design: tools/bcrec_main.cc compiles this standalone
++// and tests/bcrec_roundtrip.rs round-trips its output through the Rust
++// decoder, so encoder and decoder are proven to agree byte-for-byte
++// WITHOUT building chromium. runtime-trace.cc feeds the same builders
++// with engine-extracted values - one implementation of the format.
++//
++// No limits anywhere: every executed instruction is recorded, operand
++// values are decoded BY THE ENGINE and emitted verbatim, string payloads
++// are emitted in full (8-bit or UTF-16LE, tag-distinguished), and any
++// record larger than one sink slot is split into kFlagCont parts that
++// the consumer reassembles byte-exactly. Nothing is truncated, capped or
++// silently dropped.
++
++#include <stdint.h>
++#include <string.h>
++
++#include <vector>
++
++namespace v8 {
++namespace afeye {
++namespace bcrec {
++
++constexpr uint8_t kKind = 40;  // sink.h kBytecodeTrace
++
++// Record header. 72 bytes, little-endian, no padding.
++struct Hdr {
++  uint8_t opcode;    // post-prefix opcode byte.
++                     // 0xff = func-def part, 0xfe = meta part,
++                     // else the executed instruction's opcode
++  uint8_t scale;     // raw OperandScale enum value (1/2/4)
++  uint8_t n_payload; // payload blocks in this part (saturates at 255;
++                     // consumers parse blocks structurally to part end)
++  uint8_t flags;     // kFlag* below
++  uint32_t offset;   // instruction: logical bytecode offset (same on all
++                     // parts of one record - the glue key).
++                     // func-def: byte position of this part in the blob.
++                     // meta: part position, same scheme.
++  uint32_t func_id;  // deterministic identity, see MakeFuncId. GC-stable:
++                     // identical for every record of one function.
++  uint32_t line;     // instruction: isolate tag (result attribution must
++                     // not cross isolates when workers share a pid).
++                     // func-def: function start line. meta: 0.
++  uint64_t acc;      // instruction: raw tagged accumulator word.
++                     // func-def/meta: total blob length in bytes.
++  uint64_t regs[6];  // first six input-register raw tagged words
++};
++static_assert(sizeof(Hdr) == 72, "bcrec Hdr must be exactly 72 bytes");
++
++constexpr uint8_t kFlagFuncDef = 1u << 0;
++constexpr uint8_t kFlagCont = 1u << 1;     // MORE PARTS FOLLOW this one
++constexpr uint8_t kFlagAccPayload = 1u << 2;
++constexpr uint8_t kOpFuncDef = 0xff;
++constexpr uint8_t kOpMeta = 0xfe;
++
++// Payload block framing: [u8 tag][u32 len][len bytes]. Decode is
++// tag-driven - a type is NEVER inferred from byte length.
++enum PayloadTag : uint8_t {
++  kTagAccStr = 0,     // accumulator String, 8-bit bytes
++  kTagAccF64 = 1,     // accumulator HeapNumber, 8 raw f64 bits
++  kTagAccSmi = 2,     // accumulator Smi, 4 raw int32 bits
++  kTagReg = 3,        // [u16 reg_index][u64 raw tagged word]
++  kTagRegStr = 4,     // [u16 reg_index][8-bit string bytes]
++  kTagRegF64 = 5,     // [u16 reg_index][8 f64 bits]
++  kTagRegSmi = 6,     // [u16 reg_index][4 int32 bits]
++  kTagOperand = 7,    // [u8 operand_index][u64 engine-decoded value].
++                      // For register-typed operands the value is the
++                      // register index (signed, as the engine decoded).
++  kTagCpStr = 8,      // func-def blob only (see CpSpan)
++  kTagCpF64 = 9,
++  kTagCpRaw = 10,
++  kTagAccStr16 = 11,  // accumulator String, UTF-16LE bytes
++  kTagRegStr16 = 12,  // [u16 reg_index][UTF-16LE bytes]
++};
++
++constexpr uint32_t kBlockPrefixSize = 5;  // tag(1) + len(4)
++
++// One sink record carries at most this payload; larger records split.
++// sink kMaxRecord is 1MiB, wire header is 16 bytes.
++constexpr uint32_t kSinkRecordCap = (1u << 20) - 16;
++
++inline void PutU16(uint8_t* p, uint16_t v) { memcpy(p, &v, 2); }
++inline void PutU32(uint8_t* p, uint32_t v) { memcpy(p, &v, 4); }
++inline void PutI32(uint8_t* p, int32_t v) { memcpy(p, &v, 4); }
++inline void PutU64(uint8_t* p, uint64_t v) { memcpy(p, &v, 8); }
++
++inline uint16_t GetU16(const uint8_t* p) {
++  uint16_t v;
++  memcpy(&v, p, 2);
++  return v;
++}
++inline uint32_t GetU32(const uint8_t* p) {
++  uint32_t v;
++  memcpy(&v, p, 4);
++  return v;
++}
++inline int32_t GetI32(const uint8_t* p) {
++  int32_t v;
++  memcpy(&v, p, 4);
++  return v;
++}
++inline uint64_t GetU64(const uint8_t* p) {
++  uint64_t v;
++  memcpy(&v, p, 8);
++  return v;
++}
++
++// Deterministic function identity from GC-immovable facts only: script
++// id, function literal id, source start position, isolate tag. The same
++// function hashes identically for the whole run even if the SFI moves.
++inline uint32_t MakeFuncId(int32_t script_id, int32_t literal_id,
++                           int32_t start_pos, uint32_t isolate_tag) {
++  uint8_t tmp[16];
++  PutI32(tmp, script_id);
++  PutI32(tmp + 4, literal_id);
++  PutI32(tmp + 8, start_pos);
++  PutU32(tmp + 12, isolate_tag);
++  uint64_t h = 1469598103934665603ull;  // FNV-1a over the 16 bytes
++  for (int i = 0; i < 16; ++i) {
++    h ^= tmp[i];
++    h *= 1099511628211ull;
++  }
++  return static_cast<uint32_t>(h >> 16);
++}
++
++// Append one framed block. No length cap - u32 len covers any JS string.
++inline void AppendBlock(std::vector<uint8_t>* out, uint8_t tag,
++                        const void* data, size_t n) {
++  size_t at = out->size();
++  out->resize(at + kBlockPrefixSize + n);
++  uint8_t* p = out->data() + at;
++  p[0] = tag;
++  PutU32(p + 1, static_cast<uint32_t>(n));
++  if (n != 0) memcpy(p + kBlockPrefixSize, data, n);
++}
++
++// ---- instruction record builder ----
++class InstrBuilder {
++ public:
++  void Begin(uint8_t opcode, uint8_t scale, uint32_t offset, uint32_t func_id,
++             uint32_t iso_tag, uint64_t acc_word) {
++    memset(&hdr_, 0, sizeof(hdr_));
++    hdr_.opcode = opcode;
++    hdr_.scale = scale;
++    hdr_.offset = offset;
++    hdr_.func_id = func_id;
++    hdr_.line = iso_tag;
++    hdr_.acc = acc_word;
++    payload_.clear();
++    blocks_ = 0;
++    n_regs_ = 0;
++  }
++
++  void Operand(uint8_t index, uint64_t value) {
++    uint8_t b[9];
++    b[0] = index;
++    PutU64(b + 1, value);
++    AppendBlock(&payload_, kTagOperand, b, sizeof(b));
++    ++blocks_;
++  }
++
++  void Reg(uint16_t index, uint64_t word) {
++    uint8_t b[10];
++    PutU16(b, index);
++    PutU64(b + 2, word);
++    AppendBlock(&payload_, kTagReg, b, sizeof(b));
++    ++blocks_;
++    if (n_regs_ < 6) hdr_.regs[n_regs_++] = word;
++  }
++
++  void RegStr(uint16_t index, const uint8_t* bytes, uint32_t n, bool utf16) {
++    std::vector<uint8_t> b(2 + n);
++    PutU16(b.data(), index);
++    if (n) memcpy(b.data() + 2, bytes, n);
++    AppendBlock(&payload_, utf16 ? kTagRegStr16 : kTagRegStr, b.data(),
++                b.size());
++    ++blocks_;
++  }
++
++  void RegF64(uint16_t index, uint64_t bits) {
++    uint8_t b[10];
++    PutU16(b, index);
++    PutU64(b + 2, bits);
++    AppendBlock(&payload_, kTagRegF64, b, sizeof(b));
++    ++blocks_;
++  }
++
++  void RegSmi(uint16_t index, int32_t v) {
++    uint8_t b[6];
++    PutU16(b, index);
++    PutI32(b + 2, v);
++    AppendBlock(&payload_, kTagRegSmi, b, sizeof(b));
++    ++blocks_;
++  }
++
++  void AccStr(const uint8_t* bytes, uint32_t n, bool utf16) {
++    AppendBlock(&payload_, utf16 ? kTagAccStr16 : kTagAccStr, bytes, n);
++    ++blocks_;
++    hdr_.flags |= kFlagAccPayload;
++  }
++  void AccF64(uint64_t bits) {
++    uint8_t b[8];
++    PutU64(b, bits);
++    AppendBlock(&payload_, kTagAccF64, b, sizeof(b));
++    ++blocks_;
++    hdr_.flags |= kFlagAccPayload;
++  }
++  void AccSmi(int32_t v) {
++    uint8_t b[4];
++    PutI32(b, v);
++    AppendBlock(&payload_, kTagAccSmi, b, sizeof(b));
++    ++blocks_;
++    hdr_.flags |= kFlagAccPayload;
++  }
++
++  const uint8_t* payload() const { return payload_.data(); }
++  size_t payload_len() const { return payload_.size(); }
++  Hdr FinishHdr() {
++    hdr_.n_payload = blocks_ > 255 ? 255 : static_cast<uint8_t>(blocks_);
++    return hdr_;
++  }
++
++ private:
++  Hdr hdr_;
++  std::vector<uint8_t> payload_;
++  uint32_t blocks_ = 0;
++  int n_regs_ = 0;
++};
++
++// ---- func-def blob ----
++// [u32 bc_len][u32 name_len][u32 cp_bytes][i32 frame_size]
++// [u32 param_count] | bc bytes | name bytes | cp entries
++// cp entry: framed block, tag kCpTag* (see PayloadTag; string tags carry
++// bytes, kCpTagF64/kCpTagRaw carry 8 raw bytes).
++constexpr uint8_t kCpTagStr = 8;
++constexpr uint8_t kCpTagF64 = 9;
++constexpr uint8_t kCpTagRaw = 10;
++constexpr uint8_t kCpTagStr16 = 13;
++
++struct CpSpan {
++  uint8_t tag;
++  const uint8_t* data;  // string bytes, or 8-byte f64/raw word
++  uint32_t len;         // string byte length; 8 for f64/raw
++};
++
++class FuncDefBuilder {
++ public:
++  void Build(const uint8_t* bc, uint32_t bc_len, const uint8_t* name,
++             uint32_t name_len, int32_t frame_size, uint32_t param_count,
++             const CpSpan* cp, uint32_t cp_count) {
++    blob_.clear();
++    cp_.clear();
++    for (uint32_t i = 0; i < cp_count; ++i) {
++      if (cp[i].tag == kCpTagStr || cp[i].tag == kCpTagStr16) {
++        AppendBlock(&cp_, cp[i].tag, cp[i].data, cp[i].len);
++      } else {
++        AppendBlock(&cp_, cp[i].tag, cp[i].data, 8);
++      }
++    }
++    size_t head = 24;
++    blob_.resize(head);
++    uint8_t* h = blob_.data();
++    PutU32(h, bc_len);
++    PutU32(h + 4, name_len);
++    PutU32(h + 8, static_cast<uint32_t>(cp_.size()));
++    PutI32(h + 12, frame_size);
++    PutU32(h + 16, param_count);
++    blob_.insert(blob_.end(), bc, bc + bc_len);
++    blob_.insert(blob_.end(), name, name + name_len);
++    blob_.insert(blob_.end(), cp_.begin(), cp_.end());
++  }
++  const uint8_t* data() const { return blob_.data(); }
++  size_t size() const { return blob_.size(); }
++
++ private:
++  std::vector<uint8_t> blob_;
++  std::vector<uint8_t> cp_;
++};
++
++// ---- meta blob ----
++// [u16 n_bytecodes][i32 reg_file_start_offset]
++// per bytecode: name\0 u8 n_ops u8 flags u8 acc_use
++//   3 scales x (u8 total_size, n_ops x (u8 operand_type, u8 operand_offset))
++// [u16 n_runtime_fns] per fn: name\0
++class MetaBuilder {
++ public:
++  void Begin(uint16_t n_bytecodes, int32_t reg_file_start) {
++    buf_.clear();
++    buf_.resize(6);
++    PutU16(buf_.data(), n_bytecodes);
++    PutI32(buf_.data() + 2, reg_file_start);
++  }
++  void Opcode(const char* name, uint8_t n_ops, uint8_t flags, uint8_t acc_use) {
++    size_t nl = strlen(name);
++    buf_.insert(buf_.end(), name, name + nl);
++    buf_.push_back(0);
++    buf_.push_back(n_ops);
++    buf_.push_back(flags);
++    buf_.push_back(acc_use);
++  }
++  void Scale(uint8_t total_size) { buf_.push_back(total_size); }
++  void Operand(uint8_t type, uint8_t offset) {
++    buf_.push_back(type);
++    buf_.push_back(offset);
++  }
++  void RuntimeNames(uint16_t n) {
++    size_t at = buf_.size();
++    buf_.resize(at + 2);
++    PutU16(buf_.data() + at, n);
++  }
++  void RuntimeName(const char* name) {
++    size_t nl = strlen(name);
++    buf_.insert(buf_.end(), name, name + nl);
++    buf_.push_back(0);
++  }
++  const uint8_t* data() const { return buf_.data(); }
++  size_t size() const { return buf_.size(); }
++
++ private:
++  std::vector<uint8_t> buf_;
++};
++
++// ---- split emitter ----
++// Emits hdr+payload as one or more sink records of <= kSinkRecordCap
++// payload bytes. All parts but the last carry kFlagCont. For func-def /
++// meta blobs each part's hdr.offset is its byte position in the blob;
++// instruction parts keep the logical offset (the glue key) on every part.
++template <typename EmitFn>
++inline void EmitSplit(const Hdr& base, const uint8_t* payload, size_t n,
++                      bool offset_is_position, EmitFn emit) {
++  const size_t cap = kSinkRecordCap - sizeof(Hdr);
++  size_t sent = 0;
++  if (n <= cap) {
++    Hdr h = base;
++    h.flags &= ~kFlagCont;
++    emit(h, payload, n);
++    return;
++  }
++  while (sent < n) {
++    size_t take = n - sent < cap ? n - sent : cap;
++    Hdr h = base;
++    if (offset_is_position) h.offset = static_cast<uint32_t>(sent);
++    if (sent + take < n) {
++      h.flags |= kFlagCont;
++    } else {
++      h.flags &= ~kFlagCont;
++    }
++    emit(h, payload + sent, take);
++    sent += take;
++  }
++}
++
++}  // namespace bcrec
++}  // namespace afeye
++}  // namespace v8
++
++#endif  // V8_AFEYE_BCREC_H_
 diff --git a/v8/src/afeye/sink.cc b/v8/src/afeye/sink.cc
 index 84145fd..21b6d27 100644
 --- a/v8/src/afeye/sink.cc
@@ -87,18 +453,10 @@ index 074f827..d7df67e 100644
    TraceBytecode(Runtime::kTraceUnoptimizedBytecodeEntry);
  #endif
 diff --git a/v8/src/runtime/runtime-trace.cc b/v8/src/runtime/runtime-trace.cc
-index 1e3f6ed..27ae83a 100644
+index 1e3f6ed..d8915fa 100644
 --- a/v8/src/runtime/runtime-trace.cc
 +++ b/v8/src/runtime/runtime-trace.cc
-@@ -11,6 +11,7 @@
- #include "src/interpreter/bytecode-decoder.h"
- #include "src/interpreter/bytecode-flags-and-tokens.h"
- #include "src/interpreter/bytecode-register.h"
-+#include "src/runtime/runtime.h"
- #include "src/interpreter/bytecodes.h"
- #include "src/interpreter/interpreter.h"
- #include "src/logging/counters.h"
-@@ -20,6 +21,21 @@
+@@ -20,6 +20,24 @@
  #include "src/dumpling/dumpling-manager.h"
  #endif
  #include "src/utils/ostreams.h"
@@ -106,11 +464,14 @@ index 1e3f6ed..27ae83a 100644
 +#include <atomic>
 +#include <cstdlib>
 +#include <cstring>
++#include <unordered_set>
 +#include <vector>
++#include "src/afeye/bcrec.h"
 +#include "src/afeye/sink.h"
 +#include "src/interpreter/bytecode-decoder.h"
 +#include "src/interpreter/bytecode-operands.h"
 +#include "src/interpreter/bytecode-register.h"
++#include "src/objects/fixed-array-inl.h"
 +#include "src/objects/heap-number.h"
 +#include "src/objects/script-inl.h"
 +#include "src/objects/shared-function-info.h"
@@ -120,7 +481,7 @@ index 1e3f6ed..27ae83a 100644
  
  namespace v8 {
  namespace internal {
-@@ -114,6 +130,521 @@ void PrintRegisters(UnoptimizedJSFrame* frame, std::ostream& os, bool is_input,
+@@ -114,6 +132,416 @@ void PrintRegisters(UnoptimizedJSFrame* frame, std::ostream& os, bool is_input,
  
  }  // namespace
  
@@ -128,53 +489,14 @@ index 1e3f6ed..27ae83a 100644
 +
 +namespace {
 +
-+// ---- record formats (little-endian, fixed layout, zero heap) ----
-+//
-+// instruction record:
-+//   [0]  u8   opcode (post-prefix; Wide/ExtraWide resolved via scale arg)
-+//   [1]  u8   operand_scale raw enum value (1/2/4)
-+//   [2]  u8   n_payload (0..7)
-+//   [3]  u8   flags (bit0=func-def, bit1=payload truncated at cap)
-+//   [4]  u32  bytecode offset (logical, instruction start)
-+//   [8]  u32  func_id (SFI pointer hash, stable per function per run)
-+//   [12] u32  source line (func-def only)
-+//   [16] u64  accumulator RAW tagged word
-+//   [24] u64[6] input register RAW tagged words (operand order)
-+//   then n_payload blocks, u16 len + raw bytes:
-+//     String register/acc value -> verbatim bytes (cap 256)
-+//     HeapNumber acc -> 8 raw f64 bits
-+//     Smi acc -> 4 raw int32 bits
-+//     order: String regs first, then acc payload
-+//
-+// func-def record (flags bit0, opcode 0xff), once per BytecodeArray:
-+//   hdr (func_id, line) + u32 bc_len + u32 name_len +
-+//   RAW bytecode bytes + script name bytes
-+//
-+// meta record (opcode 0xfe), once per process:
-+//   u16 n_bytecodes, then per bytecode:
-+//     name\0, u8 n_ops, u8 op_flags (bit0=jump bit1=returns bit2=calls)
-+//     then per scale in {kSingle,kDouble,kQuadruple}, per operand:
-+//       u8 operand_type, u8 size, u8 offset
-+//   The Rust decoder uses THESE tables (sizes/offsets straight from the
-+//   engine) - no hardcoded tables, no drift on v8 bumps.
-+struct AfeyeBcHdr {
-+  uint8_t opcode;
-+  uint8_t scale;
-+  uint8_t n_payload;
-+  uint8_t flags;
-+  uint32_t offset;
-+  uint32_t func_id;
-+  uint32_t line;
-+  uint64_t acc;
-+  uint64_t regs[6];
-+};
-+static_assert(sizeof(AfeyeBcHdr) == 72, "fixed record layout");
++using v8::afeye::bcrec::Hdr;
++using v8::afeye::bcrec::InstrBuilder;
 +
-+constexpr uint32_t kAfeyeStrCap = 256;
-+constexpr int kAfeyeMaxRegs = 6;
-+constexpr int kAfeyeMaxPayload = kAfeyeMaxRegs + 1;
-+
-+std::atomic<uint64_t> g_afeye_bc_n{0};
++// No caps, no truncation, no dedupe table overflow paths. Every record
++// is emitted in full; oversized records split via EmitSplit (kFlagCont).
++// func_id is deterministic from GC-immovable facts, so a moved SFI keeps
++// its identity. Operand VALUES are decoded by the engine itself
++// (BytecodeDecoder) - the Rust side never re-derives the layout.
 +
 +bool AfeyeBcOff() {
 +  static bool off = []() {
@@ -182,15 +504,6 @@ index 1e3f6ed..27ae83a 100644
 +    return v != nullptr && *v != '\0' && v[0] == '0';
 +  }();
 +  return off;
-+}
-+
-+uint64_t AfeyeBcCap() {
-+  static uint64_t cap = []() {
-+    const char* v = ::getenv("AFEYE_BC_CAP");
-+    unsigned long long n = v ? strtoull(v, nullptr, 10) : 0;
-+    return n > 0 ? static_cast<uint64_t>(n) : 50000000ull;
-+  }();
-+  return cap;
 +}
 +
 +bool AfeyeVclockOn() {
@@ -210,102 +523,88 @@ index 1e3f6ed..27ae83a 100644
 +  return n;
 +}
 +
-+uint32_t AfeyeFuncId(Tagged<SharedFunctionInfo> sfi) {
-+  uintptr_t w = reinterpret_cast<uintptr_t>(sfi.ptr()) >> 2;
-+  return static_cast<uint32_t>((w * 2654435761u) >> 16);
++uint32_t AfeyeIsoTag(Isolate* isolate) {
++  return static_cast<uint32_t>(
++      (reinterpret_cast<uintptr_t>(isolate) >> 3) & 0xffffffffu);
 +}
 +
-+// func-def dedupe: open-addressed table of seen BytecodeArray addresses.
-+// 16k slots, linear probe, CAS insert, no alloc, no lock.
-+struct AfeyeSeen {
-+  static constexpr size_t kSlots = 16384;
-+  std::atomic<uintptr_t> slots[kSlots];
-+  bool InsertOrExists(uintptr_t key) {
-+    size_t h = (key >> 4) & (kSlots - 1);
-+    for (size_t i = 0; i < 64; ++i) {
-+      size_t idx = (h + i) & (kSlots - 1);
-+      uintptr_t cur = slots[idx].load(std::memory_order_acquire);
-+      if (cur == key) return true;
-+      if (cur == 0) {
-+        uintptr_t expected = 0;
-+        if (slots[idx].compare_exchange_strong(expected, key,
-+                                               std::memory_order_acq_rel)) {
-+          return false;
-+        }
-+        if (expected == key) return true;
-+      }
-+    }
-+    return true;
++// func-def dedupe keyed on the deterministic func_id: exact, unbounded
++// (std::unordered_set), never silently skips. A recompiled function with
++// the same id and a new bytecode array re-emits its def only if the
++// array length differs - the identity is (id, bc_len).
++struct AfeyeSeenKey {
++  uint32_t id;
++  uint32_t len;
++  bool operator==(const AfeyeSeenKey& o) const {
++    return id == o.id && len == o.len;
 +  }
 +};
-+AfeyeSeen g_afeye_seen;
++struct AfeyeSeenKeyHash {
++  size_t operator()(const AfeyeSeenKey& k) const {
++    return std::hash<uint64_t>()(
++        (static_cast<uint64_t>(k.id) << 32) | k.len);
++  }
++};
++thread_local std::unordered_set<AfeyeSeenKey, AfeyeSeenKeyHash>
++    g_afeye_seen;
 +
-+uint32_t AfeyeStringBytes(Tagged<Object> obj, uint8_t* out,
++// Raw string bytes, FULL length, no cap. Returns byte count; sets utf16
++// when the flat content is two-byte (bytes are UTF-16LE).
++uint32_t AfeyeStringBytes(Tagged<Object> obj, std::vector<uint8_t>* out,
++                          bool* utf16,
 +                          const DisallowGarbageCollection& no_gc) {
++  *utf16 = false;
 +  if (!IsString(obj)) return 0;
 +  Tagged<String> str = Cast<String>(obj);
 +  String::FlatContent fc = str->GetFlatContent(no_gc);
 +  if (!fc.IsFlat()) return 0;
++  size_t at = out->size();
 +  if (fc.IsOneByte()) {
 +    base::Vector<const uint8_t> v = fc.ToOneByteVector();
-+    uint32_t n = v.length() > kAfeyeStrCap ? kAfeyeStrCap : v.length();
-+    std::memcpy(out, v.begin(), n);
-+    return n;
++    out->resize(at + v.length());
++    memcpy(out->data() + at, v.begin(), v.length());
++    return static_cast<uint32_t>(v.length());
 +  }
 +  base::Vector<const base::uc16> v = fc.ToUC16Vector();
-+  uint32_t n = v.length() > kAfeyeStrCap ? kAfeyeStrCap : v.length();
-+  for (uint32_t i = 0; i < n; ++i) out[i] = static_cast<uint8_t>(v[i]);
-+  return n;
++  *utf16 = true;
++  out->resize(at + v.length() * 2);
++  for (uint32_t i = 0; i < static_cast<uint32_t>(v.length()); ++i) {
++    v8::afeye::bcrec::PutU16(out->data() + at + i * 2, v[i]);
++  }
++  return static_cast<uint32_t>(v.length() * 2);
 +}
 +
-+// meta: engine tables, once per process. thread_local vector = one
-+// allocation per process lifetime, not per instruction.
-+void AfeyeEmitMeta() {
++void AfeyeEmit(Isolate* isolate, const Hdr& hdr, const uint8_t* payload,
++               size_t n) {
++  // thread_local scratch: no ~1MiB stack buffer, no per-call heap alloc.
++  static thread_local std::vector<uint8_t> buf;
++  buf.resize(sizeof(Hdr) + n);
++  memcpy(buf.data(), &hdr, sizeof(hdr));
++  if (n) memcpy(buf.data() + sizeof(hdr), payload, n);
++  v8::afeye::Emit(v8::afeye::kBytecodeTrace, v8::afeye::NowNs(),
++                  buf.data(), static_cast<uint32_t>(buf.size()));
++  (void)isolate;
++}
++
++void AfeyeEmitMeta(Isolate* isolate) {
 +  static std::atomic<bool> done{false};
 +  bool expected = false;
 +  if (!done.compare_exchange_strong(expected, true)) return;
 +
-+  static thread_local std::vector<uint8_t> buf;
-+  buf.clear();
-+  buf.resize(2 + 1024 * 1024);
-+  uint8_t* p = buf.data();
-+  uint16_t n_bc = static_cast<uint16_t>(interpreter::Bytecodes::kBytecodeCount);
-+  std::memcpy(p, &n_bc, 2);
-+  p += 2;
-+  // register-file origin: index = reg_start - operand. Lets the Rust
-+  // decoder name registers r0/r1/... with no guesswork.
-+  int32_t reg_start = interpreter::Register::kRegisterFileStartOffset;
-+  std::memcpy(p, &reg_start, 4);
-+  p += 4;
-+
++  v8::afeye::bcrec::MetaBuilder mb;
++  mb.Begin(static_cast<uint16_t>(interpreter::Bytecodes::kBytecodeCount),
++           interpreter::Register::kRegisterFileStartOffset);
 +  const interpreter::OperandScale scales[3] = {
 +      interpreter::OperandScale::kSingle,
 +      interpreter::OperandScale::kDouble,
 +      interpreter::OperandScale::kQuadruple};
-+
 +  for (int b = 0; b < interpreter::Bytecodes::kBytecodeCount; ++b) {
-+    interpreter::Bytecode bc = interpreter::Bytecodes::FromByte(
-+        static_cast<uint8_t>(b));
-+    const char* nm = interpreter::Bytecodes::ToString(bc);
-+    size_t nl = std::strlen(nm);
-+    std::memcpy(p, nm, nl);
-+    p += nl;
-+    *p++ = 0;
++    interpreter::Bytecode bc =
++        interpreter::Bytecodes::FromByte(static_cast<uint8_t>(b));
 +    int nops = interpreter::Bytecodes::NumberOfOperands(bc);
-+    *p++ = static_cast<uint8_t>(nops);
 +    uint8_t opf = 0;
-+    if (interpreter::Bytecodes::IsJump(bc)) opf |= 1;
-+    if (interpreter::Bytecodes::Returns(bc)) opf |= 2;
-+    if (interpreter::Bytecodes::MakesCallAlongCriticalPath(bc)) opf |= 4;
-+    // jump subtype so the Rust CFG resolves targets with v8's exact
-+    // semantics, not a guess:
-+    //   bits 3-4: 1 = immediate forward (target = offset + imm)
-+    //             2 = JumpLoop backward (target = offset - imm)
-+    //             3 = constant-pool (JumpIfTrueConstant etc: target is a
-+    //                 Smi in the pool at cp[imm])
-+    //             4 = switch table (targets in pool, table_start/size)
-+    //   bit 5: conditional (has a fall-through edge)
 +    if (interpreter::Bytecodes::IsJump(bc)) {
++      opf |= 1;
 +      if (bc == interpreter::Bytecode::kJumpLoop) {
 +        opf |= 2 << 3;
 +      } else if (interpreter::Bytecodes::IsJumpImmediate(bc)) {
@@ -313,156 +612,137 @@ index 1e3f6ed..27ae83a 100644
 +      } else if (interpreter::Bytecodes::IsJumpConstant(bc)) {
 +        opf |= 3 << 3;
 +      } else {
-+        opf |= 4 << 3;  // SwitchOnSmiNoFeedback / SwitchOnGeneratorState
++        opf |= 4 << 3;
 +      }
 +      if (bc != interpreter::Bytecode::kJump &&
 +          bc != interpreter::Bytecode::kJumpLoop) {
-+        opf |= 1 << 5;  // everything but unconditional jumps falls through
++        opf |= 1 << 5;
 +      }
 +    }
-+    *p++ = opf;
-+    // implicit accumulator use: bit1 = writes acc (so the NEXT executed
-+    // instruction's acc field is THIS instruction's result - the engine's
-+    // own dataflow edge, not a guess), bit0 = reads acc, bit2 = clobbers.
-+    *p++ = static_cast<uint8_t>(
-+        interpreter::Bytecodes::GetImplicitRegisterUse(bc));
++    if (interpreter::Bytecodes::Returns(bc)) opf |= 2;
++    if (interpreter::Bytecodes::MakesCallAlongCriticalPath(bc)) opf |= 4;
++    mb.Opcode(interpreter::Bytecodes::ToString(bc),
++              static_cast<uint8_t>(nops), opf,
++              static_cast<uint8_t>(
++                  interpreter::Bytecodes::GetImplicitRegisterUse(bc)));
 +    for (int sc = 0; sc < 3; ++sc) {
-+      // total instruction size at this scale, then per-operand
-+      // (type, offset). Operand WIDTH = next_offset - offset (last
-+      // operand: total_size - offset). All from engine tables - the
-+      // Rust decoder never hardcodes a layout.
-+      *p++ = static_cast<uint8_t>(
-+          interpreter::Bytecodes::Size(bc, scales[sc]));
++      mb.Scale(static_cast<uint8_t>(
++          interpreter::Bytecodes::Size(bc, scales[sc])));
 +      for (int i = 0; i < nops; ++i) {
-+        interpreter::OperandType ot =
-+            interpreter::Bytecodes::GetOperandType(bc, i);
-+        *p++ = static_cast<uint8_t>(ot);
-+        *p++ = static_cast<uint8_t>(
-+            interpreter::Bytecodes::GetOperandOffset(bc, i, scales[sc]));
++        mb.Operand(
++            static_cast<uint8_t>(
++                interpreter::Bytecodes::GetOperandType(bc, i)),
++            static_cast<uint8_t>(interpreter::Bytecodes::GetOperandOffset(
++                bc, i, scales[sc])));
 +      }
 +    }
 +  }
-+  // runtime function name table: id -> C-string. Resolves CallRuntime
-+  // operands (RuntimeId) to the actual runtime function name.
-+  {
-+    uint16_t n_rt = static_cast<uint16_t>(Runtime::kNumFunctions);
-+    std::memcpy(p, &n_rt, 2);
-+    p += 2;
-+    for (int id = 0; id < Runtime::kNumFunctions; ++id) {
-+      const Runtime::Function* f =
-+          Runtime::FunctionForId(static_cast<Runtime::FunctionId>(id));
-+      const char* rnm = (f && f->name) ? f->name : "";
-+      size_t rl = std::strlen(rnm);
-+      std::memcpy(p, rnm, rl);
-+      p += rl;
-+      *p++ = 0;
-+    }
++  mb.RuntimeNames(static_cast<uint16_t>(Runtime::kNumFunctions));
++  for (int id = 0; id < Runtime::kNumFunctions; ++id) {
++    const Runtime::Function* f =
++        Runtime::FunctionForId(static_cast<Runtime::FunctionId>(id));
++    mb.RuntimeName((f && f->name) ? f->name : "");
 +  }
-+  uint8_t hdr[4] = {0xfe, 0, 0, 0};
-+  // meta = its own record: 4-byte tag header then the table blob
-+  static thread_local std::vector<uint8_t> rec;
-+  rec.resize(4 + static_cast<size_t>(p - buf.data()));
-+  std::memcpy(rec.data(), hdr, 4);
-+  std::memcpy(rec.data() + 4, buf.data(), static_cast<size_t>(p - buf.data()));
-+  v8::afeye::Emit(v8::afeye::kBytecodeTrace, v8::afeye::NowNs(), rec.data(),
-+                  static_cast<uint32_t>(rec.size()));
++
++  Hdr hdr;
++  memset(&hdr, 0, sizeof(hdr));
++  hdr.opcode = v8::afeye::bcrec::kOpMeta;
++  hdr.acc = mb.size();
++  v8::afeye::bcrec::EmitSplit(
++      hdr, mb.data(), mb.size(), true,
++      [&](const Hdr& h, const uint8_t* pl, size_t n) {
++        AfeyeEmit(isolate, h, pl, n);
++      });
 +}
 +
-+void AfeyeEmitFuncDef(Tagged<BytecodeArray> arr,
-+                      Tagged<SharedFunctionInfo> sfi,
++void AfeyeEmitFuncDef(Isolate* isolate, Tagged<BytecodeArray> arr,
++                      Tagged<SharedFunctionInfo> sfi, uint32_t func_id,
 +                      const DisallowGarbageCollection& no_gc) {
 +  int bc_len = arr->length();
-+  if (bc_len <= 0 || bc_len > 900 * 1024) return;
++  if (bc_len <= 0) return;
 +
-+  char sc_buf[161];
-+  uint32_t sc_len = 6;
-+  std::memcpy(sc_buf, "native", 6);
++  // script name, full bytes
++  std::vector<uint8_t> name_buf;
++  bool name_utf16 = false;
 +  int line = 0;
++  int32_t script_id = -1;
 +  if (IsScript(sfi->script())) {
 +    Tagged<Script> sc = Cast<Script>(sfi->script());
 +    line = sc->GetLineNumber(sfi->StartPosition());
 +    if (line < 0) line = 0;
++    script_id = sc->id();
 +    Tagged<Object> nm = sc->name();
 +    if (IsString(nm)) {
-+      String::FlatContent fc = Cast<String>(nm)->GetFlatContent(no_gc);
-+      if (fc.IsFlat() && fc.IsOneByte()) {
-+        uint32_t l = fc.length();
-+        if (l > 160) l = 160;
-+        const uint8_t* src = fc.ToOneByteVector().begin();
-+        for (uint32_t i = 0; i < l; ++i) {
-+          sc_buf[i] = (src[i] >= 0x20 && src[i] < 0x7f)
-+                          ? static_cast<char>(src[i])
-+                          : '?';
-+        }
-+        sc_len = l;
++      AfeyeStringBytes(nm, &name_buf, &name_utf16, no_gc);
++    }
++  }
++
++  // constant pool: raw_constant_pool is Union<Smi, TrustedFixedArray> -
++  // an empty pool is a Smi, dereferencing it as an array is a crash.
++  std::vector<v8::afeye::bcrec::CpSpan> spans;
++  std::vector<uint8_t> cp_scratch;
++  std::vector<size_t> cp_off;  // (tag, offset, len) packed below
++  std::vector<uint8_t> cp_tags;
++  std::vector<uint32_t> cp_lens;
++  Tagged<Object> raw_pool = arr->raw_constant_pool();
++  if (!IsSmi(raw_pool)) {
++    Tagged<TrustedFixedArray> pool = Cast<TrustedFixedArray>(raw_pool);
++    for (int i = 0; i < pool.length(); ++i) {
++      Tagged<Object> cv = pool.get(i);
++      cp_off.push_back(cp_scratch.size());
++      if (IsString(cv)) {
++        bool u16 = false;
++        uint32_t n = AfeyeStringBytes(cv, &cp_scratch, &u16, no_gc);
++        cp_tags.push_back(u16 ? v8::afeye::bcrec::kCpTagStr16
++                              : v8::afeye::bcrec::kCpTagStr);
++        cp_lens.push_back(n);
++      } else if (IsHeapNumber(cv)) {
++        double d = Cast<HeapNumber>(cv)->value();
++        uint64_t bits;
++        memcpy(&bits, &d, 8);
++        cp_off.back() = cp_scratch.size();
++        cp_scratch.resize(cp_scratch.size() + 8);
++        v8::afeye::bcrec::PutU64(cp_scratch.data() + cp_scratch.size() - 8,
++                                 bits);
++        cp_tags.push_back(v8::afeye::bcrec::kCpTagF64);
++        cp_lens.push_back(8);
++      } else {
++        uint64_t w = static_cast<uint64_t>(cv.ptr());
++        cp_off.back() = cp_scratch.size();
++        cp_scratch.resize(cp_scratch.size() + 8);
++        v8::afeye::bcrec::PutU64(cp_scratch.data() + cp_scratch.size() - 8,
++                                 w);
++        cp_tags.push_back(v8::afeye::bcrec::kCpTagRaw);
++        cp_lens.push_back(8);
 +      }
 +    }
 +  }
-+
-+  // constant pool: LdaConstant reads the challenge's string literals and
-+  // numbers from here - without it the Rust side cannot resolve operands.
-+  // Raw words verbatim; Strings as bytes; HeapNumbers as f64 bits.
-+  Tagged<TrustedFixedArray> cp_arr = arr->constant_pool();
-+  int cp_len = cp_arr.length();
-+  if (cp_len < 0) cp_len = 0;
-+  if (cp_len > 65535) cp_len = 65535;
-+
-+  static thread_local std::vector<uint8_t> def_buf;
-+  static thread_local std::vector<uint8_t> cp_buf;
-+  cp_buf.clear();
-+  cp_buf.resize(static_cast<size_t>(cp_len) * (3 + kAfeyeStrCap + 8));
-+  uint8_t* cp = cp_buf.data();
-+  for (int i = 0; i < cp_len; ++i) {
-+    Tagged<Object> cv = cp_arr.get(i);
-+    if (IsString(cv)) {
-+      *cp++ = 1;
-+      uint32_t sl = AfeyeStringBytes(cv, cp + 2, no_gc);
-+      uint16_t sl16 = static_cast<uint16_t>(sl);
-+      std::memcpy(cp, &sl16, 2);
-+      cp += 2 + sl;
-+    } else if (IsHeapNumber(cv)) {
-+      *cp++ = 2;
-+      double d = Cast<HeapNumber>(cv)->value();
-+      uint64_t bits;
-+      std::memcpy(&bits, &d, 8);
-+      cp += 8;
-+      std::memcpy(cp - 8, &bits, 8);
-+    } else {
-+      *cp++ = 0;
-+      uint64_t w = static_cast<uint64_t>(cv.ptr());
-+      std::memcpy(cp, &w, 8);
-+      cp += 8;
-+    }
++  spans.resize(cp_tags.size());
++  for (size_t i = 0; i < spans.size(); ++i) {
++    spans[i].tag = cp_tags[i];
++    spans[i].data = cp_scratch.data() + cp_off[i];
++    spans[i].len = cp_lens[i];
 +  }
-+  uint32_t cp_total = static_cast<uint32_t>(cp - cp_buf.data());
 +
-+  def_buf.resize(sizeof(AfeyeBcHdr) + 12 + static_cast<size_t>(bc_len) +
-+                 sc_len + cp_total);
-+  AfeyeBcHdr* hdr = reinterpret_cast<AfeyeBcHdr*>(def_buf.data());
-+  std::memset(hdr, 0, sizeof(*hdr));
-+  hdr->opcode = 0xff;
-+  hdr->flags = 1;
-+  hdr->func_id = AfeyeFuncId(sfi);
-+  hdr->line = static_cast<uint32_t>(line);
-+  // def-record field overload: offset = frame_size, acc = parameter_count.
-+  hdr->offset = static_cast<uint32_t>(arr->frame_size());
-+  hdr->acc = static_cast<uint64_t>(arr->parameter_count());
-+  uint8_t* p = def_buf.data() + sizeof(AfeyeBcHdr);
-+  uint32_t bl = static_cast<uint32_t>(bc_len);
-+  std::memcpy(p, &bl, 4);
-+  std::memcpy(p + 4, &sc_len, 4);
-+  std::memcpy(p + 8, &cp_total, 4);
-+  p += 12;
-+  std::memcpy(p,
-+              reinterpret_cast<const void*>(arr->GetFirstBytecodeAddress()),
-+              static_cast<size_t>(bc_len));
-+  p += bc_len;
-+  std::memcpy(p, sc_buf, sc_len);
-+  p += sc_len;
-+  std::memcpy(p, cp_buf.data(), cp_total);
-+  p += cp_total;
-+  v8::afeye::Emit(v8::afeye::kBytecodeTrace, v8::afeye::NowNs(),
-+                  def_buf.data(), static_cast<uint32_t>(p - def_buf.data()));
++  v8::afeye::bcrec::FuncDefBuilder fb;
++  fb.Build(reinterpret_cast<const uint8_t*>(arr->GetFirstBytecodeAddress()),
++           static_cast<uint32_t>(bc_len), name_buf.data(),
++           static_cast<uint32_t>(name_buf.size()), arr->frame_size(),
++           static_cast<uint32_t>(arr->parameter_count()), spans.data(),
++           static_cast<uint32_t>(spans.size()));
++
++  Hdr hdr;
++  memset(&hdr, 0, sizeof(hdr));
++  hdr.opcode = v8::afeye::bcrec::kOpFuncDef;
++  hdr.flags = v8::afeye::bcrec::kFlagFuncDef;
++  hdr.func_id = func_id;
++  hdr.line = static_cast<uint32_t>(line);
++  hdr.acc = fb.size();
++  v8::afeye::bcrec::EmitSplit(
++      hdr, fb.data(), fb.size(), true,
++      [&](const Hdr& h, const uint8_t* pl, size_t n) {
++        AfeyeEmit(isolate, h, pl, n);
++      });
 +}
 +
 +}  // namespace
@@ -472,9 +752,6 @@ index 1e3f6ed..27ae83a 100644
 +    return ReadOnlyRoots(isolate).undefined_value();
 +  }
 +  if (AfeyeBcOff()) {
-+    return ReadOnlyRoots(isolate).undefined_value();
-+  }
-+  if (g_afeye_bc_n.fetch_add(1, std::memory_order_relaxed) >= AfeyeBcCap()) {
 +    return ReadOnlyRoots(isolate).undefined_value();
 +  }
 +
@@ -491,7 +768,7 @@ index 1e3f6ed..27ae83a 100644
 +  if (AfeyeVclockOn()) {
 +    v8::afeye::VclockTick(AfeyeVclockNsPerInstr());
 +  }
-+  AfeyeEmitMeta();
++  AfeyeEmitMeta(isolate);
 +
 +  int offset = bytecode_offset - BytecodeArray::kHeaderSize + kHeapObjectTag;
 +  if (offset < 0 || offset >= arr->length()) {
@@ -502,9 +779,8 @@ index 1e3f6ed..27ae83a 100644
 +      reinterpret_cast<const uint8_t*>(arr->GetFirstBytecodeAddress()) +
 +      offset;
 +
-+  // scale comes from codegen (handler constant), so at pc we already
-+  // stand on the REAL opcode - Wide/ExtraWide prefixes were consumed by
-+  // the dispatch, offset points past them.
++  // scale is the handler's codegen constant: at pc stands the REAL
++  // opcode, Wide/ExtraWide prefixes were consumed by the dispatch.
 +  interpreter::OperandScale scale =
 +      static_cast<interpreter::OperandScale>(scale_raw);
 +  uint8_t op_byte = *pc;
@@ -515,125 +791,105 @@ index 1e3f6ed..27ae83a 100644
 +      reinterpret_cast<UnoptimizedJSFrame*>(frame_iterator.frame());
 +  Tagged<JSFunction> fn = frame->function();
 +  Tagged<SharedFunctionInfo> sfi = fn->shared();
-+  uint32_t func_id = AfeyeFuncId(sfi);
++  uint32_t iso_tag = AfeyeIsoTag(isolate);
++  int32_t script_id =
++      IsScript(sfi->script()) ? Cast<Script>(sfi->script())->id() : -1;
++  uint32_t func_id = v8::afeye::bcrec::MakeFuncId(
++      script_id, sfi->function_literal_id(), sfi->StartPosition(), iso_tag);
 +
-+  if (!g_afeye_seen.InsertOrExists(
-+          reinterpret_cast<uintptr_t>(arr.ptr()))) {
-+    AfeyeEmitFuncDef(arr, sfi, no_gc);
++  AfeyeSeenKey key{func_id, static_cast<uint32_t>(arr->length())};
++  if (g_afeye_seen.insert(key).second) {
++    AfeyeEmitFuncDef(isolate, arr, sfi, func_id, no_gc);
 +  }
 +
-+  uint8_t rec[sizeof(AfeyeBcHdr) + kAfeyeMaxPayload * (3 + kAfeyeStrCap)];
-+  AfeyeBcHdr* hdr = reinterpret_cast<AfeyeBcHdr*>(rec);
-+  std::memset(hdr, 0, sizeof(*hdr));
-+  hdr->opcode = op_byte;
-+  hdr->scale = static_cast<uint8_t>(scale_raw);
-+  hdr->offset = static_cast<uint32_t>(offset);
-+  hdr->func_id = func_id;
-+  // instruction records carry the isolate tag in `line` (start line lives
-+  // on the func-def). Result attribution (acc of record N+1 = result of
-+  // record N) must not cross isolates when workers interleave in one pid.
-+  hdr->line = static_cast<uint32_t>(
-+      (reinterpret_cast<uintptr_t>(isolate) >> 3) & 0xffffffffu);
-+  hdr->acc = static_cast<uint64_t>(acc.ptr());
++  static thread_local std::vector<uint8_t> str_scratch;
++  InstrBuilder ib;
++  ib.Begin(op_byte, static_cast<uint8_t>(scale_raw),
++           static_cast<uint32_t>(offset), func_id, iso_tag,
++           static_cast<uint64_t>(acc.ptr()));
 +
-+  uint8_t* pp = rec + sizeof(AfeyeBcHdr);
-+  int n_pay = 0;
-+  int n_regs = 0;
-+
-+  // Payload blocks: [u8 tag][u16 len][bytes]. Tags:
-+  //   0 = accumulator string, 1 = accumulator f64 bits, 2 = accumulator
-+  //       smi int32
-+  //   3..250 = string value of input register (hdr->regs[tag-3])
-+  // The tag carries the type - the Rust decoder never guesses f64 vs
-+  // string from length.
-+  //
-+  // Input registers: decoded with the engine's own signed decoder
-+  // (DecodeRegisterOperand - FromOperand on an unsigned read would turn
-+  // r0 (-1) into 255 and read garbage). RegPair/RegList contribute all
-+  // their registers, not just the first.
++  // operands: decoded by the ENGINE, emitted as values. Register-typed
++  // operands additionally dump the register's raw word and, when the
++  // register holds a String/HeapNumber/Smi, its full value.
 +  Address pc_addr =
 +      reinterpret_cast<Address>(const_cast<uint8_t*>(pc));
 +  int nops = interpreter::Bytecodes::NumberOfOperands(bc);
-+  for (int i = 0; i < nops && n_regs < kAfeyeMaxRegs; ++i) {
++  for (int i = 0; i < nops; ++i) {
 +    interpreter::OperandType ot =
 +        interpreter::Bytecodes::GetOperandType(bc, i);
-+    if (!interpreter::Bytecodes::IsRegisterInputOperandType(ot)) continue;
 +    Address operand_start =
 +        pc_addr + interpreter::Bytecodes::GetOperandOffset(bc, i, scale);
-+    interpreter::Register first =
-+        interpreter::BytecodeDecoder::DecodeRegisterOperand(operand_start,
-+                                                            ot, scale);
-+    uint32_t count;
-+    if (ot == interpreter::OperandType::kRegList && i + 1 < nops) {
-+      // RegList: register count lives in the NEXT operand (kRegCount).
-+      Address count_start =
-+          pc_addr +
-+          interpreter::Bytecodes::GetOperandOffset(bc, i + 1, scale);
-+      count = interpreter::BytecodeDecoder::DecodeUnsignedOperand(
-+          count_start, interpreter::OperandType::kRegCount, scale);
-+      if (count > 32) count = 32;
-+    } else {
-+      count = interpreter::Bytecodes::GetNumberOfRegistersRepresentedBy(ot);
-+    }
-+    for (uint32_t j = 0; j < count && n_regs < kAfeyeMaxRegs; ++j) {
-+      Tagged<Object> val =
-+          frame->ReadInterpreterRegister(first.index() + static_cast<int>(j));
-+      hdr->regs[n_regs] = static_cast<uint64_t>(val.ptr());
-+      if (n_pay < kAfeyeMaxPayload) {
-+        uint32_t sl = AfeyeStringBytes(val, pp + 3, no_gc);
-+        if (sl > 0) {
-+          pp[0] = static_cast<uint8_t>(3 + n_regs);
-+          uint16_t sl16 = static_cast<uint16_t>(sl);
-+          std::memcpy(pp + 1, &sl16, 2);
-+          pp += 3 + sl;
-+          n_pay++;
-+          if (sl == kAfeyeStrCap) hdr->flags |= 2;
++    if (interpreter::Bytecodes::IsRegisterInputOperandType(ot)) {
++      interpreter::Register first =
++          interpreter::BytecodeDecoder::DecodeRegisterOperand(operand_start,
++                                                              ot, scale);
++      uint32_t count = 1;
++      if (ot == interpreter::OperandType::kRegList && i + 1 < nops) {
++        Address count_start =
++            pc_addr +
++            interpreter::Bytecodes::GetOperandOffset(bc, i + 1, scale);
++        count = interpreter::BytecodeDecoder::DecodeUnsignedOperand(
++            count_start, interpreter::OperandType::kRegCount, scale);
++      } else {
++        count =
++            interpreter::Bytecodes::GetNumberOfRegistersRepresentedBy(ot);
++      }
++      for (uint32_t j = 0; j < count; ++j) {
++        int ridx = first.index() + static_cast<int>(j);
++        Tagged<Object> val = frame->ReadInterpreterRegister(ridx);
++        uint16_t ru = static_cast<uint16_t>(ridx);
++        ib.Reg(ru, static_cast<uint64_t>(val.ptr()));
++        if (IsString(val)) {
++          str_scratch.clear();
++          bool u16 = false;
++          AfeyeStringBytes(val, &str_scratch, &u16, no_gc);
++          ib.RegStr(ru, str_scratch.data(),
++                    static_cast<uint32_t>(str_scratch.size()), u16);
++        } else if (IsHeapNumber(val)) {
++          double d = Cast<HeapNumber>(val)->value();
++          uint64_t bits;
++          memcpy(&bits, &d, 8);
++          ib.RegF64(ru, bits);
++        } else if (IsSmi(val)) {
++          ib.RegSmi(ru, Smi::ToInt(val));
 +        }
 +      }
-+      n_regs++;
++      // the decoded operand value itself (register index, signed)
++      ib.Operand(static_cast<uint8_t>(i),
++                 static_cast<uint64_t>(static_cast<int64_t>(first.index())));
++    } else {
++      uint32_t uv = interpreter::BytecodeDecoder::DecodeUnsignedOperand(
++          operand_start, ot, scale);
++      int32_t sv = interpreter::BytecodeDecoder::DecodeSignedOperand(
++          operand_start, ot, scale);
++      ib.Operand(static_cast<uint8_t>(i),
++                 static_cast<uint64_t>(static_cast<int64_t>(sv)));
++      (void)uv;
 +    }
 +  }
 +
-+  if (n_pay < kAfeyeMaxPayload) {
-+    uint32_t sl = AfeyeStringBytes(acc, pp + 3, no_gc);
-+    if (sl > 0) {
-+      pp[0] = 0;
-+      uint16_t sl16 = static_cast<uint16_t>(sl);
-+      std::memcpy(pp + 1, &sl16, 2);
-+      pp += 3 + sl;
-+      n_pay++;
-+      hdr->flags |= 4;
-+      if (sl == kAfeyeStrCap) hdr->flags |= 2;
-+    } else if (IsHeapNumber(acc)) {
-+      double d = Cast<HeapNumber>(acc)->value();
-+      uint64_t bits;
-+      std::memcpy(&bits, &d, 8);
-+      pp[0] = 1;
-+      uint16_t sl16 = 8;
-+      std::memcpy(pp + 1, &sl16, 2);
-+      std::memcpy(pp + 3, &bits, 8);
-+      pp += 11;
-+      n_pay++;
-+      hdr->flags |= 4;
-+    } else if (IsSmi(acc)) {
-+      int32_t v = Smi::ToInt(acc);
-+      pp[0] = 2;
-+      uint16_t sl16 = 4;
-+      std::memcpy(pp + 1, &sl16, 2);
-+      std::memcpy(pp + 3, &v, 4);
-+      pp += 7;
-+      n_pay++;
-+      hdr->flags |= 4;
-+    }
++  // accumulator value in full
++  if (IsString(acc)) {
++    str_scratch.clear();
++    bool u16 = false;
++    AfeyeStringBytes(acc, &str_scratch, &u16, no_gc);
++    ib.AccStr(str_scratch.data(),
++              static_cast<uint32_t>(str_scratch.size()), u16);
++  } else if (IsHeapNumber(acc)) {
++    double d = Cast<HeapNumber>(acc)->value();
++    uint64_t bits;
++    memcpy(&bits, &d, 8);
++    ib.AccF64(bits);
++  } else if (IsSmi(acc)) {
++    ib.AccSmi(Smi::ToInt(acc));
 +  }
-+  hdr->n_payload = static_cast<uint8_t>(n_pay);
-+  // register count in flags bits 5-7: Rust keeps ALL 6 reg slots and
-+  // slices [0, n_regs) - never skips zero words (Smi 0 has tagged word 0
-+  // and skipping it would shift tag 3+k attribution).
-+  hdr->flags = static_cast<uint8_t>((hdr->flags & 0x1f) | (n_regs << 5));
 +
-+  v8::afeye::Emit(v8::afeye::kBytecodeTrace, v8::afeye::NowNs(), rec,
-+                  static_cast<uint32_t>(pp - rec));
++  Hdr hdr = ib.FinishHdr();
++  v8::afeye::bcrec::EmitSplit(
++      hdr, ib.payload(), ib.payload_len(), false,
++      [&](const Hdr& h, const uint8_t* pl, size_t n) {
++        AfeyeEmit(isolate, h, pl, n);
++      });
 +  return ReadOnlyRoots(isolate).undefined_value();
 +}
 +
