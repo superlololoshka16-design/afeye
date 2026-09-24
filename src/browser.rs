@@ -90,6 +90,13 @@ fn chrome_flags(f: &Flags) -> Vec<String> {
         a.push("--headless".into());
         a.push("--disable-gpu".into());
     }
+    if std::env::var("AF_JITLESS").map(|v| v == "1").unwrap_or(false) {
+        // afeye 0033: interpreter-only mode. Every JS instruction stays in
+        // Ignition forever - the bytecode trace sees the entire hot loop,
+        // nothing escapes to Sparkplug/Maglev/TurboFan machine code.
+        // Timing anomalies are covered by AFEYE_VIRTUAL_CLOCK (0034).
+        a.push("--jitless".into());
+    }
     a.push("about:blank".into());
     a
 }

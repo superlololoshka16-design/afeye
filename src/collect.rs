@@ -12,7 +12,7 @@ pub const DEFAULT_RAW_DIR: &str = "/tmp/afeye-raw";
 const MAX_RECORD: u32 = 16 + (1 << 20);
 const PREVIEW: usize = 4096;
 
-const KINDS: [&str; 40] = [
+const KINDS: [&str; 41] = [
     "sink-hello",
     "script-source",
     "bytecode-entry",
@@ -53,9 +53,10 @@ const KINDS: [&str; 40] = [
     "taint-edge",
     "error-stack",
     "sink-drop",
+    "bytecode-trace",
 ];
 
-const BATCHED_KINDS: [&str; 7] = [
+const BATCHED_KINDS: [&str; 8] = [
     "dom-api",
     "call-completed",
     "event-dispatch",
@@ -63,6 +64,7 @@ const BATCHED_KINDS: [&str; 7] = [
     "clock",
     "microtask",
     "timer",
+    "bytecode-trace",
 ];
 const PART_ROLL_BYTES: u64 = 8 << 20;
 

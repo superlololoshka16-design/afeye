@@ -544,6 +544,19 @@ async fn run() -> Result<(), String> {
         "[afeye] collect: records={} bytes={} truncated={} corrupt={} files={}",
         cstats.records, cstats.bytes, cstats.truncated, cstats.corrupt, cstats.files
     );
+    // bctrace (0033): decode the raw Ignition instruction stream, build
+    // per-function CFG, mark dead blocks BY FACT (decoded offset never
+    // appears in the executed stream). Runs before sinkfilter because
+    // sinkfilter deletes collect/raw on success and the trace records
+    // live in part files under collect/raw.
+    match afeye::bctrace::run(&stage_run.join("collect")) {
+        Ok(bc) if bc.instructions > 0 => eprintln!(
+            "[afeye] bctrace: instructions={} funcs={} blocks live={} dead={} bytes live={} dead={}",
+            bc.instructions, bc.funcs, bc.live_blocks, bc.dead_blocks, bc.live_bytes, bc.dead_bytes
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("[afeye] bctrace: {e}"),
+    }
     let mut sf_stats = sinkfilter::SinkFilterStats::default();
     match sinkfilter::run(&stage_run.join("collect")) {
         Ok(sf) => {
