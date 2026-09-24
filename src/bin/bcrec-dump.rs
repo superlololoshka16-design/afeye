@@ -24,10 +24,10 @@ fn main() {
             println!("--- functions ---");
             for f in rep["functions"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
                 println!(
-                    "{} line={} bc_len={} instrs={} exec={} live={} dead={} dead_ranges={}",
-                    f["name"], f["line"], f["bc_len"], f["instructions"],
-                    f["executions"], f["live_blocks"], f["dead_blocks"],
-                    f["dead_ranges"]
+                    "fn={} script={} script_id={} line={} bc_len={} instrs={} exec={} live={} dead={} dead_ranges={}",
+                    f["fn"], f["script"], f["script_id"], f["line"], f["bc_len"],
+                    f["instructions"], f["executions"], f["live_blocks"],
+                    f["dead_blocks"], f["dead_ranges"]
                 );
             }
         }

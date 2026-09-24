@@ -71,8 +71,10 @@ int main() {
   cp[0].tag = kCpTagStr;
   cp[0].data = reinterpret_cast<const uint8_t*>(cpstr);
   cp[0].len = static_cast<uint32_t>(strlen(cpstr));
-  fb.Build(bc, sizeof(bc), nameb, static_cast<uint32_t>(strlen(nm)), 4, 1,
-           cp, 1);
+  const char* fname = "translitFn";
+  fb.Build(bc, sizeof(bc), nameb, static_cast<uint32_t>(strlen(nm)),
+           reinterpret_cast<const uint8_t*>(fname),
+           static_cast<uint32_t>(strlen(fname)), 7, 4, 1, cp, 1);
   uint32_t fid = MakeFuncId(7, 0, 0, 0x1234);
   {
     Hdr h;
@@ -92,6 +94,7 @@ int main() {
     ib.Begin(0x00, 1, 0, fid, 0x1234, 0x0e);  // 0x0e = tagged Smi 7
     ib.Operand(0, 0);
     ib.AccSmi(7);
+    ib.Vclock(1000);  // virtual timestamp_virtual = 10ns * 100 instr
     Hdr h = ib.FinishHdr();
     EmitSplit(h, ib.payload(), ib.payload_len(), false, emit);
   }

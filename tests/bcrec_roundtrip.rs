@@ -147,13 +147,11 @@ fn bcrec_wire_roundtrip_is_byte_exact() {
     assert_eq!(st.dead_bytes, 2);
 
     // semantic stream: engine-decoded operands + cp resolution + result
-    let fid_hex = {
-        let rep: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(collect_dir.join("filtered/bctrace.json")).unwrap(),
-        )
-        .unwrap();
-        rep["functions"][0]["func_id"].as_u64().unwrap()
-    };
+    let rep: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(collect_dir.join("filtered/bctrace.json")).unwrap(),
+    )
+    .unwrap();
+    let fid_hex = rep["functions"][0]["func_id"].as_u64().unwrap();
     let sem = std::fs::read_to_string(
         collect_dir
             .join("filtered/bctrace/sem")
@@ -176,4 +174,16 @@ fn bcrec_wire_roundtrip_is_byte_exact() {
     // Return: terminator, reads acc, writes nothing -> no res
     assert_eq!(lines[2]["op"], "Return");
     assert!(lines[2].get("res").is_none());
+
+    // timestamp_virtual: vclock block rode on record 1 (emitter set
+    // ib.Vclock(1000)) -> sem line carries vts
+    assert_eq!(lines[0]["vts"], 1000);
+    assert!(lines[1].get("vts").is_none());
+
+    // function identity: fn_name and script_id are REAL fields now, not
+    // the script name masquerading as function name
+    let f0 = &rep["functions"][0];
+    assert_eq!(f0["script"], "translit.js");
+    assert_eq!(f0["fn"], "translitFn");
+    assert_eq!(f0["script_id"], 7);
 }

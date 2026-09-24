@@ -34,6 +34,7 @@ const TAG_REG_SMI: u8 = 6;
 const TAG_OPERAND: u8 = 7;
 const TAG_ACC_STR16: u8 = 11;
 const TAG_REG_STR16: u8 = 12;
+const TAG_VCLOCK: u8 = 14;
 
 #[derive(Clone)]
 pub struct OpScaleMeta {
@@ -62,7 +63,9 @@ pub struct FuncDef {
     pub line: u32,
     pub frame_size: i32,
     pub param_count: u32,
-    pub name: String,
+    pub script_id: i32,
+    pub script_name: String,
+    pub fn_name: String,
     pub bytecode: Vec<u8>,
     pub cp: Vec<CpEntry>,
 }
@@ -80,6 +83,7 @@ pub enum Pv {
     RegF64(u16, f64),
     RegSmi(u16, i32),
     Operand(u8, i64),
+    Vclock(u64),
 }
 
 pub struct InstrRec {
@@ -92,6 +96,7 @@ pub struct InstrRec {
     pub flags: u8,
     pub iso: u32,
     pub acc: u64,
+    pub vclock: u64, // 0 = not emitted (AFEYE_VIRTUAL_CLOCK off)
     pub payloads: Vec<Pv>,
 }
 
@@ -159,6 +164,7 @@ fn parse_blocks(rec: &[u8]) -> Vec<Pv> {
             TAG_OPERAND if len == 9 => {
                 Pv::Operand(b[0], rd_u64(b, 1) as i64)
             }
+            TAG_VCLOCK if len == 8 => Pv::Vclock(rd_u64(b, 0)),
             _ => continue,
         };
         out.push(pv);
@@ -246,22 +252,30 @@ fn parse_func_def_blob(
     line: u32,
     blob: &[u8],
 ) -> Option<FuncDef> {
-    if blob.len() < 24 {
+    // head (32 bytes): [u32 bc_len][u32 script_name_len][u32 fn_name_len]
+    // [u32 cp_bytes][i32 frame_size][u32 param_count][i32 script_id]
+    // [u32 _reserved]
+    if blob.len() < 32 {
         return None;
     }
     let bc_len = rd_u32(blob, 0) as usize;
-    let name_len = rd_u32(blob, 4) as usize;
-    let cp_bytes = rd_u32(blob, 8) as usize;
-    let frame_size = rd_i32(blob, 12);
-    let param_count = rd_u32(blob, 16);
-    let mut i = 24;
-    if i + bc_len + name_len + cp_bytes > blob.len() {
+    let script_name_len = rd_u32(blob, 4) as usize;
+    let fn_name_len = rd_u32(blob, 8) as usize;
+    let cp_bytes = rd_u32(blob, 12) as usize;
+    let frame_size = rd_i32(blob, 16);
+    let param_count = rd_u32(blob, 20);
+    let script_id = rd_i32(blob, 24);
+    let mut i = 32;
+    if i + bc_len + script_name_len + fn_name_len + cp_bytes > blob.len() {
         return None;
     }
     let bytecode = blob[i..i + bc_len].to_vec();
     i += bc_len;
-    let name = String::from_utf8_lossy(&blob[i..i + name_len]).into_owned();
-    i += name_len;
+    let script_name =
+        String::from_utf8_lossy(&blob[i..i + script_name_len]).into_owned();
+    i += script_name_len;
+    let fn_name = String::from_utf8_lossy(&blob[i..i + fn_name_len]).into_owned();
+    i += fn_name_len;
     let cp_end = i + cp_bytes;
     let mut cp = Vec::new();
     while i + 5 <= cp_end {
@@ -286,7 +300,9 @@ fn parse_func_def_blob(
         line,
         frame_size,
         param_count,
-        name,
+        script_id,
+        script_name,
+        fn_name,
         bytecode,
         cp,
     })
@@ -296,6 +312,14 @@ fn parse_instr(rec: &[u8], ts: u64, pid: u64) -> Option<InstrRec> {
     if rec.len() < HDR_LEN || rec[0] == OP_FUNC_DEF || rec[0] == OP_META {
         return None;
     }
+    let payloads = parse_blocks(rec);
+    let vclock = payloads
+        .iter()
+        .find_map(|pv| match pv {
+            Pv::Vclock(v) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or(0);
     Some(InstrRec {
         ts,
         pid,
@@ -306,7 +330,8 @@ fn parse_instr(rec: &[u8], ts: u64, pid: u64) -> Option<InstrRec> {
         flags: rec[3],
         iso: rd_u32(rec, 12),
         acc: rd_u64(rec, 16),
-        payloads: parse_blocks(rec),
+        vclock,
+        payloads,
     })
 }
 
@@ -567,7 +592,9 @@ pub fn run(collect_dir: &Path) -> Result<Stats, String> {
 
         let report = json!({
             "func_id": fid,
-            "name": def.name,
+            "script_id": def.script_id,
+            "script": def.script_name,
+            "fn": def.fn_name,
             "line": def.line,
             "frame_size": def.frame_size,
             "param_count": def.param_count,
@@ -717,6 +744,12 @@ pub fn run(collect_dir: &Path) -> Result<Stats, String> {
             "off": r.offset,
             "op": m.name,
         });
+        if r.vclock != 0 {
+            // timestamp_virtual: instruction-count-driven clock from 0034.
+            // Physical ts stays for wall correlation; vts is deterministic
+            // regardless of host speed.
+            line["vts"] = json!(r.vclock);
+        }
         if !args.is_empty() {
             line["args"] = json!(args);
         }

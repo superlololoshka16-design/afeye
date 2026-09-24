@@ -1,9 +1,9 @@
 diff --git a/v8/src/afeye/bcrec.h b/v8/src/afeye/bcrec.h
 new file mode 100644
-index 0000000..270d2b8
+index 0000000..4d0d53d
 --- /dev/null
 +++ b/v8/src/afeye/bcrec.h
-@@ -0,0 +1,360 @@
+@@ -0,0 +1,380 @@
 +#ifndef V8_AFEYE_BCREC_H_
 +#define V8_AFEYE_BCREC_H_
 +
@@ -80,6 +80,10 @@ index 0000000..270d2b8
 +  kTagCpRaw = 10,
 +  kTagAccStr16 = 11,  // accumulator String, UTF-16LE bytes
 +  kTagRegStr16 = 12,  // [u16 reg_index][UTF-16LE bytes]
++  kTagVclock = 14,    // [u64 virtual clock ns] - present only when
++                      // AFEYE_VIRTUAL_CLOCK=1; gives every instruction a
++                      // timestamp_virtual = cost*instruction_count, on top
++                      // of the physical sink ts. Distinct from cp tag 13.
 +};
 +
 +constexpr uint32_t kBlockPrefixSize = 5;  // tag(1) + len(4)
@@ -222,6 +226,13 @@ index 0000000..270d2b8
 +    hdr_.flags |= kFlagAccPayload;
 +  }
 +
++  void Vclock(uint64_t ns) {
++    uint8_t b[8];
++    PutU64(b, ns);
++    AppendBlock(&payload_, kTagVclock, b, sizeof(b));
++    ++blocks_;
++  }
++
 +  const uint8_t* payload() const { return payload_.data(); }
 +  size_t payload_len() const { return payload_.size(); }
 +  Hdr FinishHdr() {
@@ -254,9 +265,14 @@ index 0000000..270d2b8
 +
 +class FuncDefBuilder {
 + public:
-+  void Build(const uint8_t* bc, uint32_t bc_len, const uint8_t* name,
-+             uint32_t name_len, int32_t frame_size, uint32_t param_count,
-+             const CpSpan* cp, uint32_t cp_count) {
++  // head (32 bytes): [u32 bc_len][u32 script_name_len][u32 fn_name_len]
++  //   [u32 cp_bytes][i32 frame_size][u32 param_count][i32 script_id]
++  //   [u32 _reserved]
++  // body: | bc | script name | JS function name | cp entries |
++  void Build(const uint8_t* bc, uint32_t bc_len, const uint8_t* script_name,
++             uint32_t script_name_len, const uint8_t* fn_name,
++             uint32_t fn_name_len, int32_t script_id, int32_t frame_size,
++             uint32_t param_count, const CpSpan* cp, uint32_t cp_count) {
 +    blob_.clear();
 +    cp_.clear();
 +    for (uint32_t i = 0; i < cp_count; ++i) {
@@ -266,16 +282,20 @@ index 0000000..270d2b8
 +        AppendBlock(&cp_, cp[i].tag, cp[i].data, 8);
 +      }
 +    }
-+    size_t head = 24;
++    const size_t head = 32;
 +    blob_.resize(head);
 +    uint8_t* h = blob_.data();
 +    PutU32(h, bc_len);
-+    PutU32(h + 4, name_len);
-+    PutU32(h + 8, static_cast<uint32_t>(cp_.size()));
-+    PutI32(h + 12, frame_size);
-+    PutU32(h + 16, param_count);
++    PutU32(h + 4, script_name_len);
++    PutU32(h + 8, fn_name_len);
++    PutU32(h + 12, static_cast<uint32_t>(cp_.size()));
++    PutI32(h + 16, frame_size);
++    PutU32(h + 20, param_count);
++    PutI32(h + 24, script_id);
++    PutU32(h + 28, 0);  // reserved
 +    blob_.insert(blob_.end(), bc, bc + bc_len);
-+    blob_.insert(blob_.end(), name, name + name_len);
++    blob_.insert(blob_.end(), script_name, script_name + script_name_len);
++    blob_.insert(blob_.end(), fn_name, fn_name + fn_name_len);
 +    blob_.insert(blob_.end(), cp_.begin(), cp_.end());
 +  }
 +  const uint8_t* data() const { return blob_.data(); }
@@ -453,7 +473,7 @@ index 074f827..d7df67e 100644
    TraceBytecode(Runtime::kTraceUnoptimizedBytecodeEntry);
  #endif
 diff --git a/v8/src/runtime/runtime-trace.cc b/v8/src/runtime/runtime-trace.cc
-index 1e3f6ed..d8915fa 100644
+index 1e3f6ed..8135eea 100644
 --- a/v8/src/runtime/runtime-trace.cc
 +++ b/v8/src/runtime/runtime-trace.cc
 @@ -20,6 +20,24 @@
@@ -481,7 +501,7 @@ index 1e3f6ed..d8915fa 100644
  
  namespace v8 {
  namespace internal {
-@@ -114,6 +132,416 @@ void PrintRegisters(UnoptimizedJSFrame* frame, std::ostream& os, bool is_input,
+@@ -114,6 +132,430 @@ void PrintRegisters(UnoptimizedJSFrame* frame, std::ostream& os, bool is_input,
  
  }  // namespace
  
@@ -661,9 +681,13 @@ index 1e3f6ed..d8915fa 100644
 +  int bc_len = arr->length();
 +  if (bc_len <= 0) return;
 +
-+  // script name, full bytes
++  // script name + JS function name, full bytes. The function name was
++  // previously NOT emitted at all - reports showed the script name under
++  // "function" (audit finding). Both now travel in the func-def head.
 +  std::vector<uint8_t> name_buf;
 +  bool name_utf16 = false;
++  std::vector<uint8_t> fn_buf;
++  bool fn_utf16 = false;
 +  int line = 0;
 +  int32_t script_id = -1;
 +  if (IsScript(sfi->script())) {
@@ -675,6 +699,10 @@ index 1e3f6ed..d8915fa 100644
 +    if (IsString(nm)) {
 +      AfeyeStringBytes(nm, &name_buf, &name_utf16, no_gc);
 +    }
++  }
++  Tagged<String> fn_name = sfi->Name();
++  if (IsString(fn_name)) {
++    AfeyeStringBytes(fn_name, &fn_buf, &fn_utf16, no_gc);
 +  }
 +
 +  // constant pool: raw_constant_pool is Union<Smi, TrustedFixedArray> -
@@ -727,7 +755,9 @@ index 1e3f6ed..d8915fa 100644
 +  v8::afeye::bcrec::FuncDefBuilder fb;
 +  fb.Build(reinterpret_cast<const uint8_t*>(arr->GetFirstBytecodeAddress()),
 +           static_cast<uint32_t>(bc_len), name_buf.data(),
-+           static_cast<uint32_t>(name_buf.size()), arr->frame_size(),
++           static_cast<uint32_t>(name_buf.size()), fn_buf.data(),
++           static_cast<uint32_t>(fn_buf.size()), script_id,
++           arr->frame_size(),
 +           static_cast<uint32_t>(arr->parameter_count()), spans.data(),
 +           static_cast<uint32_t>(spans.size()));
 +
@@ -882,6 +912,10 @@ index 1e3f6ed..d8915fa 100644
 +    ib.AccF64(bits);
 +  } else if (IsSmi(acc)) {
 +    ib.AccSmi(Smi::ToInt(acc));
++  }
++
++  if (AfeyeVclockOn()) {
++    ib.Vclock(v8::afeye::afeye_vclock_ns());
 +  }
 +
 +  Hdr hdr = ib.FinishHdr();
