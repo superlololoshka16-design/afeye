@@ -8,7 +8,6 @@ each @@ header must match the hunk body exactly. This script recomputes them.
 import glob
 import sys
 
-MARKERS = ("diff --git ", "@@", "index ", "--- ", "+++ ", "new file mode", "deleted file mode")
 
 
 def body_line(l: str) -> bool:

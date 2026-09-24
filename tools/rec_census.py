@@ -64,6 +64,7 @@ KIND_NAMES = {
     37: "taint-edge",
     38: "error-stack",
     39: "sink-drop",
+    40: "bytecode-trace",
 }
 
 HDR = struct.Struct("<IBHI")
@@ -84,7 +85,7 @@ def census(path: str):
         rec_len, kind, flags, _rsv = HDR.unpack_from(buf, off)
         if rec_len < 16 or off + rec_len > len(buf):
             tail = len(buf) - off
-            if 16 <= rec_len <= 1 << 20 and 0 <= kind <= 39 and flags <= 1 and tail >= 16:
+            if 16 <= rec_len <= 1 << 20 and 0 <= kind <= 40 and flags <= 1 and tail >= 16:
                 print(f"torn tail at {path}:{off} rec_len={rec_len} have={tail}")
                 break
             bad += 1

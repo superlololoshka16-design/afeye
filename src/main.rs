@@ -79,8 +79,9 @@ struct MRun {
     collect_corrupt: u64,
     sink_alive: bool,
     sink_chains: u64,
-    sink_hot: u64,
-    sink_cold: u64,
+    sink_frags: u64,
+    bc_instructions: u64,
+    bc_dead_blocks: u64,
     sink_wasm: u64,
     test: bool,
 }
@@ -118,26 +119,6 @@ fn meta_ev(ctx: &Ctx, tun: u32, d: Bytes) {
     });
 }
 
-fn dummy_tunnel() -> Tunnel {
-    Tunnel {
-        i: 0,
-        name: "local".into(),
-        user: "local".into(),
-        ns: "local".into(),
-        wg_if: "local".into(),
-        h_if: "local".into(),
-        n_if: "local".into(),
-        host_ip: "127.0.0.1".into(),
-        ns_ip: "127.0.0.1".into(),
-        port: 0,
-        endpoint: "local".into(),
-        pubkey: String::new(),
-        privkey: String::new(),
-        addr: vec![],
-        dns: vec![],
-        egress: None,
-    }
-}
 
 fn load_targets(p: &PathBuf) -> Result<Vec<Target>, String> {
     let raw = std::fs::read(p).map_err(|e| e.to_string())?;
@@ -362,7 +343,6 @@ async fn run() -> Result<(), String> {
     }
     let mut tbs: Vec<capture::Tb> = Vec::new();
     let mut children: Vec<tokio::process::Child> = Vec::new();
-    let _dummy = Arc::new(dummy_tunnel());
     let spawn_tabs = |b: chromiumoxide::Browser, tun: u32| {
         let b = Arc::new(b);
         let jobs: Vec<_> = ctx
@@ -508,7 +488,6 @@ async fn run() -> Result<(), String> {
     for mut c in children {
         #[cfg(unix)]
         {
-            use std::os::unix::process::ExitStatusExt;
             let _ = c.start_kill();
             let _ = c.wait().await;
             let _ = std::process::Command::new("pkill")
@@ -549,30 +528,30 @@ async fn run() -> Result<(), String> {
     // appears in the executed stream). Runs before sinkfilter because
     // sinkfilter deletes collect/raw on success and the trace records
     // live in part files under collect/raw.
+    let mut bc_stats = afeye::bctrace::Stats::default();
     match afeye::bctrace::run(&stage_run.join("collect")) {
-        Ok(bc) if bc.instructions > 0 => eprintln!(
-            "[afeye] bctrace: instructions={} funcs={} blocks live={} dead={} bytes live={} dead={}",
-            bc.instructions, bc.funcs, bc.live_blocks, bc.dead_blocks, bc.live_bytes, bc.dead_bytes
-        ),
-        Ok(_) => {}
+        Ok(bc) => {
+            if bc.instructions > 0 {
+                eprintln!(
+                    "[afeye] bctrace: instructions={} funcs={} blocks live={} dead={} bytes live={} dead={}",
+                    bc.instructions, bc.funcs, bc.live_blocks, bc.dead_blocks, bc.live_bytes, bc.dead_bytes
+                );
+            }
+            bc_stats = bc;
+        }
         Err(e) => eprintln!("[afeye] bctrace: {e}"),
     }
     let mut sf_stats = sinkfilter::SinkFilterStats::default();
     match sinkfilter::run(&stage_run.join("collect")) {
         Ok(sf) => {
             eprintln!(
-                "[afeye] sinkfilter: fragments={} chains={} hot={} cold={} wasm={} net_chains={} token={} dead_end={} net_adjacent={}",
-                sf.fragments, sf.chains, sf.hot_chains, sf.cold_chains, sf.wasm_modules, sf.net_chains,
-                sf.token_chains, sf.dead_end_chains, sf.net_adjacent_chains
+                "[afeye] sinkfilter: records={} fragments={} chains={} chain_bytes={} wasm={} net={} net_vendor={} drops={} automation_tells={}",
+                sf.records, sf.fragments, sf.chains, sf.chain_bytes, sf.wasm_modules,
+                sf.net_requests, sf.net_vendor_requests, sf.drop_total, sf.automation_tells
             );
             eprintln!(
-                "[afeye] verdicts: proven={} heuristic={} dead_end_proven={} unresolved={} graph: nodes={} edges={} tainted={} seeds={} fanout_dropped={}",
-                sf.proven_chains, sf.heuristic_chains, sf.dead_end_proven, sf.unresolved_chains,
-                sf.graph_nodes, sf.graph_edges, sf.graph_tainted, sf.graph_sinks, sf.graph_fanout_dropped
-            );
-            eprintln!(
-                "[afeye] dead-end split: filtered zip carries the {} token-forming chains; all {} chains stay whole in the raw run zip",
-                sf.token_chains, sf.chains
+                "[afeye] liveness is bctrace's job: executed instructions={} over {} functions, dead blocks={} (facts, not verdicts)",
+                bc_stats.instructions, bc_stats.funcs, bc_stats.dead_blocks
             );
             let raw_dir = stage_run.join("collect/raw");
             if sf.records > 0 {
@@ -621,30 +600,59 @@ async fn run() -> Result<(), String> {
             eprintln!("[afeye] filtered copy failed: {e}");
         } else {
             classify::strict(&fdir);
+            // PRUNE BY FACT: a script chain stays iff the bytecode trace saw
+            // at least one executed instruction of a function from that
+            // script (bctrace.json functions[].executions > 0, joined by
+            // script name). No trace data -> prune nothing (never guess).
             let mut dropped = 0usize;
-            if let Ok(rep) = std::fs::read(fdir.join("collect/filtered/report.json")) {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&rep) {
-                    if let Some(prune) = v.get("prune").and_then(|p| p.as_array()) {
-                        for ch in prune {
-                            let path = ch.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                            if !path.is_empty() {
-                                let _ = std::fs::remove_file(fdir.join("collect").join(path));
-                                dropped += 1;
+            if bc_stats.instructions > 0 {
+                let mut executed: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                if let Ok(bcrep) =
+                    std::fs::read(fdir.join("collect/filtered/bctrace.json"))
+                {
+                    if let Ok(bv) = serde_json::from_slice::<serde_json::Value>(&bcrep) {
+                        if let Some(fns) = bv.get("functions").and_then(|f| f.as_array()) {
+                            for f in fns {
+                                let ex = f.get("executions").and_then(|e| e.as_u64()).unwrap_or(0);
+                                if ex > 0 {
+                                    if let Some(n) = f.get("name").and_then(|n| n.as_str()) {
+                                        executed.insert(n.to_string());
+                                    }
+                                }
                             }
                         }
-                    } else if let Some(chains) = v.get("chains").and_then(|c| c.as_array()) {
-                        for ch in chains {
-                            let token = ch.get("token_forming").and_then(|t| t.as_bool()).unwrap_or(false);
-                            let path = ch.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                            if !token && !path.is_empty() {
-                                let _ = std::fs::remove_file(fdir.join("collect").join(path));
-                                dropped += 1;
+                    }
+                }
+                if !executed.is_empty() {
+                    if let Ok(rep) = std::fs::read(fdir.join("collect/filtered/report.json")) {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&rep) {
+                            if let Some(chains) = v.get("chains").and_then(|c| c.as_array()) {
+                                for ch in chains {
+                                    let name =
+                                        ch.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                    let path =
+                                        ch.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                                    if path.is_empty() || name.is_empty() {
+                                        continue;
+                                    }
+                                    // chain name may be truncated to 200
+                                    // chars in the report (printable); match
+                                    // by prefix either way
+                                    let hit = executed.iter().any(|e| {
+                                        e == name || e.starts_with(name) || name.starts_with(e.as_str())
+                                    });
+                                    if !hit {
+                                        let _ = std::fs::remove_file(fdir.join("collect").join(path));
+                                        dropped += 1;
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-            eprintln!("[afeye] filtered zip: {dropped} dead-end chains removed (token-only)");
+            eprintln!("[afeye] filtered zip: {dropped} never-executed script chains removed (bytecode-trace fact)");
             let f7z = out.join(format!("{stem}-filtered.7z"));
             if arch::have_7z() {
                 match arch::sz_pack(&fdir, &f7z, 0).await {
@@ -719,8 +727,9 @@ async fn run() -> Result<(), String> {
         collect_corrupt: cstats.corrupt,
         sink_alive,
         sink_chains: sf_stats.chains,
-        sink_hot: sf_stats.hot_chains,
-        sink_cold: sf_stats.cold_chains,
+        sink_frags: sf_stats.fragments,
+        bc_instructions: bc_stats.instructions,
+        bc_dead_blocks: bc_stats.dead_blocks,
         sink_wasm: sf_stats.wasm_modules,
         test,
     };

@@ -96,6 +96,10 @@ fn chrome_flags(f: &Flags) -> Vec<String> {
         // nothing escapes to Sparkplug/Maglev/TurboFan machine code.
         // Timing anomalies are covered by AFEYE_VIRTUAL_CLOCK (0034).
         a.push("--jitless".into());
+        // --jitless (chrome flag) already forbids all code generation;
+        // pin the two v8 tiers explicitly too so the contract is literal:
+        // no optimizing tier, no baseline tier, interpreter-only forever.
+        a.push("--js-flags=--no-opt --no-sparkplug".into());
     }
     a.push("about:blank".into());
     a

@@ -409,7 +409,6 @@ struct SiteState {
     ep: HashMap<String, Ep>,
     tn_sum: HashMap<String, u64>,
     ws_url: HashMap<String, String>,
-    scripts_seen: HashSet<String>,
     art_bodies: HashMap<String, String>,
     art_src: HashMap<String, String>,
 }
@@ -423,7 +422,6 @@ impl SiteState {
             ep: HashMap::new(),
             tn_sum: HashMap::new(),
             ws_url: HashMap::new(),
-            scripts_seen: HashSet::new(),
             art_bodies: HashMap::new(),
             art_src: HashMap::new(),
         }
@@ -563,7 +561,6 @@ fn collect_site(state: &mut SiteState, tl: &std::path::Path) {
             7 => {
                 if let Some(u) = d.get("u").and_then(|x| x.as_str()) {
                     if u.starts_with("http") {
-                        state.scripts_seen.insert(u.to_owned());
                     }
                 }
             }
