@@ -52,7 +52,33 @@ pub struct InstrRec {
     pub iso: u32,  // isolate tag (hdr.line on instruction records)
     pub acc: u64,
     pub regs: Vec<u64>,
-    pub payloads: Vec<Vec<u8>>,
+    // tagged payload blocks: (tag, bytes). Tags: 0=acc string,
+    // 1=acc f64 bits, 2=acc smi, 3..=250 = string of regs[tag-3].
+    pub payloads: Vec<(u8, Vec<u8>)>,
+}
+
+// typed value from a payload block. Tag-driven, zero length-guessing.
+pub enum Pv {
+    Str(Vec<u8>),
+    F64(f64),
+    Smi(i32),
+}
+
+fn pv_json(pv: &Pv) -> serde_json::Value {
+    match pv {
+        Pv::Str(b) => json!(String::from_utf8_lossy(b)),
+        Pv::F64(f) => json!(f),
+        Pv::Smi(i) => json!(i),
+    }
+}
+
+fn decode_tagged(tag: u8, b: &[u8]) -> Option<Pv> {
+    match tag {
+        0 => Some(Pv::Str(b.to_vec())),
+        1 if b.len() == 8 => Some(Pv::F64(f64::from_bits(rd_u64(b, 0)))),
+        2 if b.len() == 4 => Some(Pv::Smi(rd_i32(b, 0))),
+        _ => Some(Pv::Str(b.to_vec())), // register string blocks (tag >= 3)
+    }
 }
 
 #[derive(Default)]
@@ -226,25 +252,27 @@ fn parse_instr(rec: &[u8], ts: u64) -> Option<InstrRec> {
     let func_id = rd_u32(rec, 8);
     let iso = rd_u32(rec, 12);
     let acc = rd_u64(rec, 16);
+    // flags bits 5-7 = register count; keep ALL slots including zero
+    // words (Smi 0 tags to word 0 - skipping would shift tag 3+k
+    // attribution).
+    let n_regs = ((flags >> 5) & 7) as usize;
     let mut regs = Vec::new();
-    for r in 0..6 {
-        let w = rd_u64(rec, 24 + r * 8);
-        if w != 0 {
-            regs.push(w);
-        }
+    for r in 0..n_regs.min(6) {
+        regs.push(rd_u64(rec, 24 + r * 8));
     }
     let mut i = HDR_LEN;
     let mut payloads = Vec::new();
     for _ in 0..n_payload {
-        if i + 2 > rec.len() {
+        if i + 3 > rec.len() {
             break;
         }
-        let l = rd_u16(rec, i) as usize;
-        i += 2;
+        let tag = rec[i];
+        let l = rd_u16(rec, i + 1) as usize;
+        i += 3;
         if i + l > rec.len() {
             break;
         }
-        payloads.push(rec[i..i + l].to_vec());
+        payloads.push((tag, rec[i..i + l].to_vec()));
         i += l;
     }
     Some(InstrRec {
@@ -431,14 +459,29 @@ fn build_cfg(
     (sv, edges)
 }
 
-// decode one payload block: f64 bits (8B from HeapNumber), smi int32 (4B),
-// otherwise raw bytes as a string.
-fn decode_payload(pl: &[u8]) -> serde_json::Value {
-    match pl.len() {
-        8 => json!(f64::from_bits(rd_u64(pl, 0))),
-        4 => json!(rd_i32(pl, 0)),
-        _ => json!(String::from_utf8_lossy(pl)),
+// accumulator value of a record: the payload block with tag 0/1/2,
+// decoded BY TAG. Register string blocks (tag>=3) are separate.
+fn acc_value(r: &InstrRec) -> Option<serde_json::Value> {
+    if r.flags & 4 == 0 {
+        return None;
     }
+    r.payloads
+        .iter()
+        .find(|(t, _)| *t <= 2)
+        .and_then(|(t, b)| decode_tagged(*t, b))
+        .map(|pv| pv_json(&pv))
+}
+
+// register string values: tag 3+k -> regs[k] slot.
+fn reg_values(r: &InstrRec) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (t, b) in &r.payloads {
+        if *t >= 3 {
+            let k = (*t - 3) as usize;
+            out.push((k, String::from_utf8_lossy(b).into_owned()));
+        }
+    }
+    out
 }
 
 // resolve one operand to a JSON value using engine tables:
@@ -738,29 +781,17 @@ pub fn run(collect_dir: &Path) -> Result<Stats, String> {
             None => Vec::new(),
         };
 
-        // acc payload of THIS record = accumulator value entering the
-        // instruction (flag bit2 says the last payload block is acc).
-        let acc_in = if r.flags & 4 != 0 {
-            r.payloads.last().map(|pl| decode_payload(pl))
-        } else {
-            None
-        };
+        // accumulator entering this instruction (tag-decoded, no length
+        // guessing).
+        let acc_in = acc_value(r);
         // result = acc of the next same-(pid,iso) record when this opcode
-        // writes the accumulator.
+        // writes the accumulator (engine acc_use fact).
         let result = if m.acc_use & 2 != 0 {
-            match result_at[n].and_then(|j| stream.get(j)) {
-                Some(nx) => {
-                    if nx.flags & 4 != 0 {
-                        nx.payloads.last().map(|pl| decode_payload(pl))
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            }
+            result_at[n].and_then(|j| stream.get(j)).and_then(acc_value)
         } else {
             None
         };
+        let rvals = reg_values(r);
 
         // what it pulls: globals, property names, methods, runtime fns,
         // constant strings - counted with resolved names, values sampled.
@@ -810,6 +841,12 @@ pub fn run(collect_dir: &Path) -> Result<Stats, String> {
         }
         if let Some(res) = result {
             line["res"] = res;
+        }
+        if !rvals.is_empty() {
+            line["regs"] = json!(rvals
+                .iter()
+                .map(|(k, v)| json!({ "reg": *k, "v": v }))
+                .collect::<Vec<_>>());
         }
         let _ = writeln!(f, "{}", line);
     }
@@ -937,8 +974,10 @@ mod tests {
         h
     }
 
-    // append a string payload block and set flags bit2 (acc payload)
+    // append an acc-string payload block [tag=0][u16 len][bytes] and set
+    // flags bit2 (acc payload present) - matches the C++ wire format.
     fn with_str_payload(mut rec: Vec<u8>, s: &str) -> Vec<u8> {
+        rec.push(0); // tag 0 = acc string
         rec.extend_from_slice(&(s.len() as u16).to_le_bytes());
         rec.extend_from_slice(s.as_bytes());
         rec[2] += 1; // n_payload
@@ -1070,6 +1109,44 @@ mod tests {
         let g = api.iter().find(|e| e["what"] == "global navigator").unwrap();
         assert_eq!(g["times"], 1);
         assert_eq!(g["values"][0], "Mozilla/5.0");
+    }
+
+    #[test]
+    fn reg_payload_attribution_survives_zero_words() {
+        // Star-like instruction with two input registers: r0 = Smi 0
+        // (tagged word 0 - the slot MUST be kept), r1 = string "tok".
+        // Payload blocks: tag 4 (= regs[1]) string, tag 0 acc smi 7.
+        // Wire: hdr flags n_regs=2 (bits 5-7), regs[0]=0, regs[1]=word,
+        // then blocks [4][len]["tok"], [0][4][7i32].
+        let bc = vec![209, 181]; // Star0 ; Return
+        let dir = tempfile::tempdir().unwrap();
+        let cd = dir.path().join("collect");
+        let mut recs = vec![mini_meta(), func_def(13, &bc, &[])];
+        let mut h = hdr(209, 0, 13, 2, 0);
+        h[3] |= 4 | (2 << 5); // acc payload + n_regs=2
+        h[24..32].copy_from_slice(&0u64.to_le_bytes()); // r0 = Smi 0 word
+        h[32..40].copy_from_slice(&0x1234u64.to_le_bytes()); // r1 word
+        // reg block: tag 4 -> regs[1]
+        h.push(4);
+        h.extend_from_slice(&3u16.to_le_bytes());
+        h.extend_from_slice(b"tok");
+        // acc block: tag 0 string
+        h.push(0);
+        h.extend_from_slice(&1u16.to_le_bytes());
+        h.extend_from_slice(b"x");
+        recs.push(h);
+        recs.push(hdr(181, 1, 13, 0, 0));
+        write_run(&cd, &recs);
+        let st = run(&cd).unwrap();
+        assert_eq!(st.instructions, 2);
+        let sem = fs::read_to_string(cd.join("filtered/bctrace/sem/0000000d.jsonl")).unwrap();
+        let l0: serde_json::Value = serde_json::from_str(sem.lines().next().unwrap()).unwrap();
+        // the "tok" string must be attributed to register slot 1, not 0
+        let regs = l0["regs"].as_array().unwrap();
+        assert_eq!(regs.len(), 1);
+        assert_eq!(regs[0]["reg"], 1);
+        assert_eq!(regs[0]["v"], "tok");
+        assert_eq!(l0["acc"], "x");
     }
 
     #[test]
