@@ -1,5 +1,5 @@
 diff --git a/v8/src/afeye/sink.cc b/v8/src/afeye/sink.cc
-index 84145fd..af732b5 100644
+index 84145fd..21b6d27 100644
 --- a/v8/src/afeye/sink.cc
 +++ b/v8/src/afeye/sink.cc
 @@ -219,6 +219,16 @@ bool Enabled() {
@@ -8,7 +8,7 @@ index 84145fd..af732b5 100644
  
 +std::atomic<uint64_t> g_vclock_ns{0};
 +
-+__attribute__((visibility("default"))) extern "C" uint64_t afeye_vclock_ns(void) {
++extern "C" uint64_t afeye_vclock_ns(void) {
 +  return g_vclock_ns.load(std::memory_order_relaxed);
 +}
 +
@@ -20,7 +20,7 @@ index 84145fd..af732b5 100644
                 uint32_t len) {
    if (!g_on.load(std::memory_order_acquire)) return;
 diff --git a/v8/src/afeye/sink.h b/v8/src/afeye/sink.h
-index f1b2b2b..8417e6d 100644
+index f1b2b2b..69ffeff 100644
 --- a/v8/src/afeye/sink.h
 +++ b/v8/src/afeye/sink.h
 @@ -25,6 +25,7 @@ enum EventKind : uint8_t {
@@ -40,7 +40,7 @@ index f1b2b2b..8417e6d 100644
 +// is set). Read by performance.now()/Date under BLINK_AFEYE/V8_AFEYE so
 +// the page sees time advance by instruction count, not wall clock -
 +// tracing slowdown is invisible to timing detectors.
-+__attribute__((visibility("default"))) extern "C" uint64_t afeye_vclock_ns(void);
++extern "C" uint64_t afeye_vclock_ns(void);
 +void VclockTick(uint64_t ns);
 +
  }
@@ -70,10 +70,18 @@ index 074f827..83c95de 100644
    TraceBytecode(Runtime::kTraceUnoptimizedBytecodeEntry);
  #endif
 diff --git a/v8/src/runtime/runtime-trace.cc b/v8/src/runtime/runtime-trace.cc
-index 1e3f6ed..78c81ff 100644
+index 1e3f6ed..12f13f6 100644
 --- a/v8/src/runtime/runtime-trace.cc
 +++ b/v8/src/runtime/runtime-trace.cc
-@@ -20,6 +20,21 @@
+@@ -11,6 +11,7 @@
+ #include "src/interpreter/bytecode-decoder.h"
+ #include "src/interpreter/bytecode-flags-and-tokens.h"
+ #include "src/interpreter/bytecode-register.h"
++#include "src/runtime/runtime.h"
+ #include "src/interpreter/bytecodes.h"
+ #include "src/interpreter/interpreter.h"
+ #include "src/logging/counters.h"
+@@ -20,6 +21,21 @@
  #include "src/dumpling/dumpling-manager.h"
  #endif
  #include "src/utils/ostreams.h"
@@ -95,7 +103,7 @@ index 1e3f6ed..78c81ff 100644
  
  namespace v8 {
  namespace internal {
-@@ -114,6 +129,452 @@ void PrintRegisters(UnoptimizedJSFrame* frame, std::ostream& os, bool is_input,
+@@ -114,6 +130,486 @@ void PrintRegisters(UnoptimizedJSFrame* frame, std::ostream& os, bool is_input,
  
  }  // namespace
  
@@ -242,11 +250,16 @@ index 1e3f6ed..78c81ff 100644
 +
 +  static thread_local std::vector<uint8_t> buf;
 +  buf.clear();
-+  buf.resize(2 + 512 * 1024);
++  buf.resize(2 + 1024 * 1024);
 +  uint8_t* p = buf.data();
 +  uint16_t n_bc = static_cast<uint16_t>(interpreter::Bytecodes::kBytecodeCount);
 +  std::memcpy(p, &n_bc, 2);
 +  p += 2;
++  // register-file origin: index = reg_start - operand. Lets the Rust
++  // decoder name registers r0/r1/... with no guesswork.
++  int32_t reg_start = interpreter::Register::kRegisterFileStartOffset;
++  std::memcpy(p, &reg_start, 4);
++  p += 4;
 +
 +  const interpreter::OperandScale scales[3] = {
 +      interpreter::OperandScale::kSingle,
@@ -291,6 +304,11 @@ index 1e3f6ed..78c81ff 100644
 +      }
 +    }
 +    *p++ = opf;
++    // implicit accumulator use: bit1 = writes acc (so the NEXT executed
++    // instruction's acc field is THIS instruction's result - the engine's
++    // own dataflow edge, not a guess), bit0 = reads acc, bit2 = clobbers.
++    *p++ = static_cast<uint8_t>(
++        interpreter::Bytecodes::GetImplicitRegisterUse(bc));
 +    for (int sc = 0; sc < 3; ++sc) {
 +      // total instruction size at this scale, then per-operand
 +      // (type, offset). Operand WIDTH = next_offset - offset (last
@@ -305,6 +323,22 @@ index 1e3f6ed..78c81ff 100644
 +        *p++ = static_cast<uint8_t>(
 +            interpreter::Bytecodes::GetOperandOffset(bc, i, scales[sc]));
 +      }
++    }
++  }
++  // runtime function name table: id -> C-string. Resolves CallRuntime
++  // operands (RuntimeId) to the actual runtime function name.
++  {
++    uint16_t n_rt = static_cast<uint16_t>(Runtime::kNumFunctions);
++    std::memcpy(p, &n_rt, 2);
++    p += 2;
++    for (int id = 0; id < Runtime::kNumFunctions; ++id) {
++      const Runtime::Function* f =
++          Runtime::FunctionForId(static_cast<Runtime::FunctionId>(id));
++      const char* rnm = (f && f->name) ? f->name : "";
++      size_t rl = std::strlen(rnm);
++      std::memcpy(p, rnm, rl);
++      p += rl;
++      *p++ = 0;
 +    }
 +  }
 +  uint8_t hdr[4] = {0xfe, 0, 0, 0};
@@ -478,6 +512,11 @@ index 1e3f6ed..78c81ff 100644
 +  hdr->scale = static_cast<uint8_t>(scale_raw);
 +  hdr->offset = static_cast<uint32_t>(offset);
 +  hdr->func_id = func_id;
++  // instruction records carry the isolate tag in `line` (start line lives
++  // on the func-def). Result attribution (acc of record N+1 = result of
++  // record N) must not cross isolates when workers interleave in one pid.
++  hdr->line = static_cast<uint32_t>(
++      (reinterpret_cast<uintptr_t>(isolate) >> 3) & 0xffffffffu);
 +  hdr->acc = static_cast<uint64_t>(acc.ptr());
 +
 +  uint8_t* pp = rec + sizeof(AfeyeBcHdr);
@@ -517,6 +556,7 @@ index 1e3f6ed..78c81ff 100644
 +      std::memcpy(pp, &sl16, 2);
 +      pp += 2 + sl;
 +      n_pay++;
++      hdr->flags |= 4;  // acc payload present (last payload block)
 +      if (sl == kAfeyeStrCap) hdr->flags |= 2;
 +    } else if (IsHeapNumber(acc)) {
 +      double d = Cast<HeapNumber>(acc)->value();
@@ -527,6 +567,7 @@ index 1e3f6ed..78c81ff 100644
 +      std::memcpy(pp + 2, &bits, 8);
 +      pp += 10;
 +      n_pay++;
++      hdr->flags |= 4;
 +    } else if (IsSmi(acc)) {
 +      int32_t v = Smi::ToInt(acc);
 +      uint16_t sl16 = 4;
@@ -534,6 +575,7 @@ index 1e3f6ed..78c81ff 100644
 +      std::memcpy(pp + 2, &v, 4);
 +      pp += 6;
 +      n_pay++;
++      hdr->flags |= 4;
 +    }
 +  }
 +  hdr->n_payload = static_cast<uint8_t>(n_pay);
