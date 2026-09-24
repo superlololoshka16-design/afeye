@@ -109,6 +109,25 @@ pub struct Stats {
     pub live_blocks: u64,
     pub dead_bytes: u64,
     pub live_bytes: u64,
+    /// Values that executed bytecode instructions actually carried:
+    /// accumulator strings, register strings, and constant-pool string
+    /// literals. value bytes -> (representative origin, occurrence count).
+    /// This is the LOW-LEVEL replacement for the old blake3-window content
+    /// graph: sinkfilter runs these exact byte sequences through an
+    /// Aho-Corasick matcher against sink payloads. A match = this value
+    /// crossed the C++ boundary, byte-exact, no window, no hash.
+    pub valuebook: HashMap<Vec<u8>, (ValueOrigin, u64)>,
+    /// func_id -> script name (from func-def blobs). sinkfilter joins
+    /// value matches back to script-source chains through this.
+    pub func_scripts: HashMap<u32, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ValueOrigin {
+    pub func_id: u32,
+    pub off: u32,
+    pub op: String,
+    pub src: &'static str, // "acc" | "reg" | "cp"
 }
 
 fn rd_u16(b: &[u8], i: usize) -> u16 {
@@ -547,6 +566,10 @@ pub fn run(collect_dir: &Path) -> Result<Stats, String> {
     if meta.is_empty() {
         return Err("bctrace: no meta record (0033 patch not active?)".into());
     }
+    stats.func_scripts = funcs
+        .iter()
+        .map(|(fid, def)| (*fid, def.script_name.clone()))
+        .collect();
 
     let out_dir = collect_dir.join("filtered").join("bctrace");
     let _ = fs::create_dir_all(&out_dir);
@@ -634,6 +657,37 @@ pub fn run(collect_dir: &Path) -> Result<Stats, String> {
     let mut api_calls: BTreeMap<String, u64> = BTreeMap::new();
     let mut api_values: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
     let mut sem_files: HashMap<u32, fs::File> = HashMap::new();
+    let mut valuebook: HashMap<Vec<u8>, (ValueOrigin, u64)> = HashMap::new();
+
+    // seed the book with constant-pool string literals of every function:
+    // these are the exact byte sequences the challenge embeds (alphabets,
+    // keys, format strings). They are FACTS - bytes straight from the
+    // func-def blob the engine emitted.
+    const MIN_VALUE_LEN: usize = 4;
+    for (fid, def) in &funcs {
+        for entry in &def.cp {
+            let bytes = match entry {
+                CpEntry::Str(b) => b.as_slice(),
+                CpEntry::Str16(b) => b.as_slice(),
+                _ => continue,
+            };
+            if bytes.len() < MIN_VALUE_LEN {
+                continue;
+            }
+            let e = valuebook
+                .entry(bytes.to_vec())
+                .or_insert((
+                    ValueOrigin {
+                        func_id: *fid,
+                        off: 0,
+                        op: "cp".to_string(),
+                        src: "cp",
+                    },
+                    0,
+                ));
+            e.1 += 1;
+        }
+    }
 
     let acc_of = |r: &InstrRec| -> Option<serde_json::Value> {
         if r.flags & FLAG_ACC_PAYLOAD == 0 {
@@ -780,7 +834,37 @@ pub fn run(collect_dir: &Path) -> Result<Stats, String> {
             line["regs"] = json!(regs);
         }
         let _ = writeln!(f, "{}", line);
+
+        // valuebook: every string value this instruction really carried
+        // (accumulator + registers). Byte-exact, from the trace. These
+        // become Aho-Corasick patterns in sinkfilter's value-provenance
+        // scan - the low-level replacement for blake3-window matching.
+        for pv in &r.payloads {
+            let (bytes, src) = match pv {
+                Pv::Str(b) if r.flags & FLAG_ACC_PAYLOAD != 0 => (b.as_slice(), "acc"),
+                Pv::Str16(b) if r.flags & FLAG_ACC_PAYLOAD != 0 => (b.as_slice(), "acc"),
+                Pv::RegStr(_, b) => (b.as_slice(), "reg"),
+                Pv::RegStr16(_, b) => (b.as_slice(), "reg"),
+                _ => continue,
+            };
+            if bytes.len() < MIN_VALUE_LEN {
+                continue;
+            }
+            let e = valuebook
+                .entry(bytes.to_vec())
+                .or_insert((
+                    ValueOrigin {
+                        func_id: r.func_id,
+                        off: r.offset,
+                        op: m.name.clone(),
+                        src,
+                    },
+                    0,
+                ));
+            e.1 += 1;
+        }
     }
+    stats.valuebook = valuebook;
 
     let api_list: Vec<serde_json::Value> = api_calls
         .iter()
