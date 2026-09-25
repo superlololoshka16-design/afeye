@@ -1,0 +1,73 @@
+diff --git a/services/network/url_loader.cc b/services/network/url_loader.cc
+index 1720130..9364a3e 100644
+--- a/services/network/url_loader.cc
++++ b/services/network/url_loader.cc
+@@ -683,6 +683,68 @@ void URLLoader::SetUpUpload(
+   url_request_->set_upload(url_loader_util::CreateUploadDataStream(
+       request.request_body.get(), file_open_result.value(), task_runner.get()));
+ 
++#ifdef NET_AFEYE
++  // afeye 0039: file-upload elements were INVISIBLE - the 0011 hook skips
++  // everything but kBytes, so multipart/form-data with files logged only
++  // the text parts. Here: every element is enumerated; kFile elements get
++  // path/offset/length/expected-mtime metadata + the first 4KiB of the
++  // opened file (file_open_result is aligned with the kFile elements, in
++  // OpenFilesForUpload order). kDataPipe bodies get a marker record.
++  if (network::afeye::Enabled() && request.request_body) {
++    size_t afeye_file_i = 0;
++    for (const auto& afeye_el : *request.request_body->elements()) {
++      using Tag = network::DataElement::Tag;
++      if (afeye_el.type() == Tag::kFile) {
++        const network::DataElementFile& afeye_f =
++            afeye_el.As<network::DataElementFile>();
++        std::string afeye_disp = afeye_f.path().AsUTF8Unsafe();
++        if (afeye_disp.size() > 280) afeye_disp.resize(280);
++        for (char& c : afeye_disp) {
++          unsigned char uc = static_cast<unsigned char>(c);
++          if (uc < 0x20 || uc >= 0x7f) c = '?';
++        }
++        char afeye_meta[600];
++        std::snprintf(afeye_meta, sizeof(afeye_meta),
++                      "req-file path=%s offset=%llu length=%llu mtime=%lld",
++                      afeye_disp.c_str(),
++                      static_cast<unsigned long long>(afeye_f.offset()),
++                      static_cast<unsigned long long>(afeye_f.length()),
++                      static_cast<long long>(
++                          afeye_f.expected_modification_time()
++                              .InMillisecondsFSinceUnixEpoch()));
++        network::afeye::EmitStr(network::afeye::kNetReq,
++                                network::afeye::NowNs(), afeye_meta);
++        if (afeye_file_i < file_open_result->size()) {
++          base::File& afeye_fh = (*file_open_result)[afeye_file_i];
++          if (afeye_fh.IsValid()) {
++            constexpr int64_t kAfeyeHead = 4096;
++            int64_t afeye_len = static_cast<int64_t>(afeye_f.length());
++            if (afeye_len > kAfeyeHead) afeye_len = kAfeyeHead;
++            if (afeye_len > 0) {
++              std::vector<uint8_t> afeye_buf(static_cast<size_t>(afeye_len));
++              int64_t afeye_got = afeye_fh.Read(
++                  static_cast<int64_t>(afeye_f.offset()),
++                  reinterpret_cast<char*>(afeye_buf.data()), afeye_len);
++              if (afeye_got > 0) {
++                network::afeye::EmitSpan(
++                    network::afeye::kNetReq, network::afeye::NowNs(),
++                    "req-file-head", afeye_buf.data(),
++                    static_cast<uint32_t>(afeye_got));
++              }
++            }
++          }
++        }
++        ++afeye_file_i;
++      } else if (afeye_el.type() == Tag::kDataPipe ||
++                 afeye_el.type() == Tag::kChunkedDataPipe) {
++        network::afeye::EmitStr(network::afeye::kNetReq,
++                                network::afeye::NowNs(),
++                                "req-datapipe len=unbounded");
++      }
++    }
++  }
++#endif  // NET_AFEYE
++
+   if (request.enable_upload_progress) {
+     upload_progress_tracker_ = std::make_unique<UploadProgressTracker>(
+         FROM_HERE,
