@@ -1,0 +1,42 @@
+diff --git a/third_party/blink/renderer/modules/crypto/crypto_result_impl.cc b/third_party/blink/renderer/modules/crypto/crypto_result_impl.cc
+index 10141d8..8931f3d 100644
+--- a/third_party/blink/renderer/modules/crypto/crypto_result_impl.cc
++++ b/third_party/blink/renderer/modules/crypto/crypto_result_impl.cc
+@@ -32,6 +32,7 @@
+ 
+ #ifdef BLINK_AFEYE
+ #include <atomic>
++#include <cstdio>
+ 
+ #include "third_party/blink/renderer/platform/afeye/sink.h"
+ #endif
+@@ -166,6 +167,29 @@ void CryptoResultImpl::CompleteWithJson(std::string_view utf8_data) {
+   if (!resolver_)
+     return;
+ 
++#ifdef BLINK_AFEYE
++  // afeye 0037: JWK key material out. 0018 hooks CompleteWithBuffer (the
++  // ArrayBuffer output path), but exportKey("jwk") and wrapKey resolve
++  // through CompleteWithJson - the actual key material as JSON. That path
++  // was a blind spot: a JWK export of a private key was never captured.
++  // utf8_data is the verbatim JSON string about to become the resolved
++  // value. Emit it byte-for-byte (EmitSpan caps at 64KiB, flags=1 on cut).
++  if (blink::afeye::Enabled() && !utf8_data.empty()) {
++    static std::atomic<uint64_t> g_afeye_jwkout{0};
++    static bool g_afeye_jwkout_off = []() {
++      const char* v = ::getenv("AFEYE_TRACE_CRYPTO_JWKOUT");
++      return v != nullptr && *v != '\0' && v[0] == '0';
++    }();
++    if (!g_afeye_jwkout_off &&
++        g_afeye_jwkout.fetch_add(1, std::memory_order_relaxed) < 200000) {
++      blink::afeye::EmitSpan(
++          blink::afeye::kCryptoOp, blink::afeye::NowNs(), "crypto-jwk-out",
++          reinterpret_cast<const uint8_t*>(utf8_data.data()),
++          static_cast<uint32_t>(utf8_data.size()));
++    }
++  }
++#endif
++
+   ScriptState* script_state = resolver_->GetScriptState();
+   ScriptState::Scope scope(script_state);
+ 
