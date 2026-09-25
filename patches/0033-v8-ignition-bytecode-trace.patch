@@ -473,7 +473,7 @@ index 074f827..d7df67e 100644
    TraceBytecode(Runtime::kTraceUnoptimizedBytecodeEntry);
  #endif
 diff --git a/v8/src/runtime/runtime-trace.cc b/v8/src/runtime/runtime-trace.cc
-index 1e3f6ed..8135eea 100644
+index 1e3f6ed..688fd1f 100644
 --- a/v8/src/runtime/runtime-trace.cc
 +++ b/v8/src/runtime/runtime-trace.cc
 @@ -20,6 +20,24 @@
@@ -501,7 +501,7 @@ index 1e3f6ed..8135eea 100644
  
  namespace v8 {
  namespace internal {
-@@ -114,6 +132,430 @@ void PrintRegisters(UnoptimizedJSFrame* frame, std::ostream& os, bool is_input,
+@@ -114,6 +132,433 @@ void PrintRegisters(UnoptimizedJSFrame* frame, std::ostream& os, bool is_input,
  
  }  // namespace
  
@@ -781,6 +781,12 @@ index 1e3f6ed..8135eea 100644
 +  if (!v8::afeye::Enabled()) {
 +    return ReadOnlyRoots(isolate).undefined_value();
 +  }
++  // virtual clock ticks on EVERY executed instruction, independent of the
++  // trace switch: AFEYE_TRACE_BYTECODE=0 must not freeze page time
++  // (interlock bug - the old order returned before VclockTick).
++  if (AfeyeVclockOn()) {
++    v8::afeye::VclockTick(AfeyeVclockNsPerInstr());
++  }
 +  if (AfeyeBcOff()) {
 +    return ReadOnlyRoots(isolate).undefined_value();
 +  }
@@ -795,9 +801,6 @@ index 1e3f6ed..8135eea 100644
 +  Tagged<BytecodeArray> arr = *bytecode_array;
 +  Tagged<Object> acc = *accumulator;
 +
-+  if (AfeyeVclockOn()) {
-+    v8::afeye::VclockTick(AfeyeVclockNsPerInstr());
-+  }
 +  AfeyeEmitMeta(isolate);
 +
 +  int offset = bytecode_offset - BytecodeArray::kHeaderSize + kHeapObjectTag;
