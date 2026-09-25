@@ -1,0 +1,87 @@
+diff --git a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
+index cdec501..e0b21b0 100644
+--- a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
++++ b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
+@@ -38,6 +38,10 @@ bool g_afeye_api_values_off = []() {
+   const char* v = ::getenv("AFEYE_TRACE_DOM_VALUES");
+   return v != nullptr && *v != '\0' && v[0] == '0';
+ }();
++bool g_afeye_api_args_off = []() {
++  const char* v = ::getenv("AFEYE_TRACE_DOM_ARGS");
++  return v != nullptr && *v != '\0' && v[0] == '0';
++}();
+ 
+ void AfeyeCaptureValue(v8::Isolate* isolate,
+                        v8::Local<v8::Value> rv,
+@@ -74,6 +78,20 @@ void AfeyeCaptureValue(v8::Isolate* isolate,
+   }
+ }
+ 
++// Explicit JS type tag. The etalon requires the RETURN TYPE as a field,
++// not inferred from the value's render shape ("[object]" told an
++// HTMLCanvasElement from a plain Object). This gives the type directly.
++const char* AfeyeTypeOf(v8::Local<v8::Value> v) {
++  if (v.IsEmpty() || v->IsUndefined()) return "undefined";
++  if (v->IsNull()) return "null";
++  if (v->IsBoolean()) return "bool";
++  if (v->IsNumber()) return "number";
++  if (v->IsString()) return "string";
++  if (v->IsArray()) return "array";
++  if (v->IsFunction()) return "function";
++  return "object";
++}
++
+ void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
+   AfeyeApiCell* cell = nullptr;
+   v8::Local<v8::Value> data = info.Data();
+@@ -91,12 +109,45 @@ void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
+         blink::afeye::EmitStr(blink::afeye::kDomApi, blink::afeye::NowNs(),
+                               cell->what);
+       } else {
++        v8::Isolate* afeye_iso = info.GetIsolate();
++        v8::Local<v8::Value> afeye_rv = info.GetReturnValue().Get();
++        // explicit return type (etalon: "тип возвращаемого значения")
++        const char* afeye_rtype = AfeyeTypeOf(afeye_rv);
++        // arguments (etalon: "с переданными аргументами"). Each arg is
++        // type-tagged and value-rendered. Capped at 8 args / 72 chars of
++        // value each - enough for every DOM/WebCrypto/canvas call shape.
++        char afeye_args[1024];
++        afeye_args[0] = '\0';
++        int afeye_ap = 0;
++        if (!g_afeye_api_args_off && info.Length() > 0) {
++          int afeye_argc = info.Length();
++          if (afeye_argc > 8) afeye_argc = 8;
++          afeye_ap = std::snprintf(afeye_args, sizeof(afeye_args), " args=[");
++          for (int ai = 0; ai < afeye_argc; ++ai) {
++            if (afeye_ap < 0 ||
++                static_cast<size_t>(afeye_ap) >= sizeof(afeye_args) - 96) {
++              break;
++            }
++            char afeye_av[96];
++            AfeyeCaptureValue(afeye_iso, info[ai], afeye_av, sizeof(afeye_av));
++            int w = std::snprintf(
++                afeye_args + afeye_ap, sizeof(afeye_args) - afeye_ap,
++                "%s%s:%.72s", ai ? "," : "", AfeyeTypeOf(info[ai]), afeye_av);
++            if (w < 0) break;
++            afeye_ap += w;
++          }
++          if (afeye_ap >= 0 &&
++              static_cast<size_t>(afeye_ap) < sizeof(afeye_args) - 2) {
++            afeye_args[afeye_ap++] = ']';
++            afeye_args[afeye_ap] = '\0';
++          }
++        }
+         char afeye_val[160];
+-        AfeyeCaptureValue(info.GetIsolate(), info.GetReturnValue().Get(),
+-                          afeye_val, sizeof(afeye_val));
+-        char afeye_buf[320];
+-        std::snprintf(afeye_buf, sizeof(afeye_buf), "%s val=%.150s",
+-                      cell->what, afeye_val);
++        AfeyeCaptureValue(afeye_iso, afeye_rv, afeye_val, sizeof(afeye_val));
++        char afeye_buf[2048];
++        std::snprintf(afeye_buf, sizeof(afeye_buf),
++                      "%s argc=%d rtype=%s%s val=%.150s", cell->what,
++                      info.Length(), afeye_rtype, afeye_args, afeye_val);
+         blink::afeye::EmitStr(blink::afeye::kDomApi, blink::afeye::NowNs(),
+                               afeye_buf);
+       }
