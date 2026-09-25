@@ -1,0 +1,17 @@
+diff --git a/services/network/url_loader.cc b/services/network/url_loader.cc
+index 12f5c19..f6c0ed4 100644
+--- a/services/network/url_loader.cc
++++ b/services/network/url_loader.cc
+@@ -2277,8 +2277,10 @@ void URLLoader::SetRawRequestHeadersAndNotify(
+         const std::string& afeye_u = url_request_->url().spec();
+         afeye_tag +=
+             afeye_u.substr(0, afeye_u.size() < 48 ? afeye_u.size() : 48);
+-        const std::string afeye_line =
+-            value.substr(0, value.size() < 640 ? value.size() : 640);
++        // afeye 0041: full cookie value, no silent 640-byte cut - the
++        // session cookie IS the secret. EmitSpan caps at 256KiB and sets
++        // flags=1 when it cuts, so truncation is honest, never silent.
++        const std::string& afeye_line = value;
+         network::afeye::EmitSpan(
+             network::afeye::kNetReq, network::afeye::NowNs(),
+             afeye_tag.c_str(),
