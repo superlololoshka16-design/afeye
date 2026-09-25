@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
-index cdec501..e0b21b0 100644
+index cdec501..21c1921 100644
 --- a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
 +++ b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
 @@ -38,6 +38,10 @@ bool g_afeye_api_values_off = []() {
@@ -85,3 +85,19 @@ index cdec501..e0b21b0 100644
          blink::afeye::EmitStr(blink::afeye::kDomApi, blink::afeye::NowNs(),
                                afeye_buf);
        }
+@@ -274,6 +325,15 @@ v8::Local<v8::FunctionTemplate> CreateFunctionTemplate(
+                                   afeye_access, config.property_name);
+     if (!afeye_data.IsEmpty()) {
+       callback = &AfeyeDomApiThunk;
++      // CRITICAL: drop the CFunction fast-path table. V8's
++      // NoAllocDirectCall dispatches straight to the ORIGINAL callback,
++      // bypassing the thunk entirely - those calls would never be
++      // logged, breaking "capture every DOM access". With the table
++      // nulled, every call takes the slow path through the thunk.
++      // Cost: fast-API DOM calls lose their no-alloc path while tracing
++      // is active. Acceptable and required for total coverage.
++      v8_cfunction_table_data = nullptr;
++      v8_cfunction_table_size = 0;
+     }
+   }
+ #endif
