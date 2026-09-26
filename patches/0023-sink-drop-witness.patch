@@ -1,53 +1,94 @@
 diff --git a/services/network/afeye_sink.cc b/services/network/afeye_sink.cc
-index 84e4952..7e5ec4b 100644
+index ba980f1..66c5ddb 100644
 --- a/services/network/afeye_sink.cc
 +++ b/services/network/afeye_sink.cc
-@@ -96,6 +96,25 @@ void EmitHello(int fd) {
+@@ -15,6 +15,7 @@
+ #include <vector>
+ 
+ #include <fcntl.h>
++#include <signal.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <time.h>
+@@ -63,6 +64,7 @@ const char* RawDir() {
+ }
+ 
+ std::atomic<uint64_t> g_write_err{0};
++std::atomic<int> g_report_fd{-1};
+ 
+ void WriteAll(int fd, const uint8_t* p, size_t n) {
+   size_t off = 0;
+@@ -99,14 +101,46 @@ void EmitHello(int fd) {
    WriteAll(fd, rec, total);
  }
  
-+void WriteDropReport(int fd, uint64_t dropped) {
++void WriteDropReport(int fd, uint64_t dropped, uint64_t write_err) {
 +  if (fd < 0) return;
-+  char msg[96];
-+  int n = std::snprintf(msg, sizeof(msg), "sink-drop layer=%s dropped=%llu",
-+                        kLayer, static_cast<unsigned long long>(dropped));
++  char msg[128];
++  int n = std::snprintf(msg, sizeof(msg),
++                        "sink-drop layer=%s dropped=%llu write_err=%llu",
++                        kLayer, static_cast<unsigned long long>(dropped),
++                        static_cast<unsigned long long>(write_err));
 +  if (n <= 0) return;
-+  uint8_t rec[16 + 96];
-+  uint32_t total = 16 + static_cast<uint32_t>(n);
++  uint8_t rec[24 + 128];
++  uint32_t total = 24 + static_cast<uint32_t>(n);
 +  std::memcpy(rec, &total, sizeof(total));
 +  rec[4] = kSinkDrop;
 +  rec[5] = 0;
-+  rec[6] = 0;
-+  rec[7] = 0;
++  std::memset(rec + 6, 0, 10);
 +  uint64_t ts = MonoNs();
-+  std::memcpy(rec + 8, &ts, sizeof(ts));
-+  std::memcpy(rec + 16, msg, static_cast<size_t>(n));
++  std::memcpy(rec + 16, &ts, sizeof(ts));
++  std::memcpy(rec + 24, msg, static_cast<size_t>(n));
 +  WriteAll(fd, rec, total);
++}
++
++void AfeyeSignal(int) {
++  Flush(500);
++  WriteDropReport(g_report_fd.load(std::memory_order_relaxed),
++                  g_dropped.load(std::memory_order_relaxed),
++                  g_write_err.load(std::memory_order_relaxed));
++  _exit(0);
 +}
 +
  void DrainLoop() {
    char pid[16];
    std::snprintf(pid, sizeof(pid), "%d", static_cast<int>(::getpid()));
-@@ -104,6 +123,8 @@ void DrainLoop() {
+   std::string path = std::string(RawDir()) + "/" + kLayer + "-" + pid + ".rec";
+   int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
++  g_report_fd.store(fd, std::memory_order_relaxed);
    if (fd >= 0) EmitHello(fd);
    static thread_local std::vector<uint8_t> buf;
    buf.resize(kMaxRecord);
 +  uint64_t reported_drops = 0;
++  uint64_t reported_werr = 0;
 +  uint64_t last_report_ns = 0;
    for (;;) {
      size_t len = 0;
      bool have = false;
-@@ -145,6 +166,17 @@ void DrainLoop() {
+@@ -139,15 +173,30 @@ void DrainLoop() {
+         if (g_write_err.load(std::memory_order_relaxed) != werr_before) {
+           ::close(fd);
+           fd = -1;
++          g_report_fd.store(-1, std::memory_order_relaxed);
+         }
+       }
+       if (fd < 0) {
+         fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
++        g_report_fd.store(fd, std::memory_order_relaxed);
+         if (fd >= 0) EmitHello(fd);
+       }
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds(500));
      }
 +    const uint64_t now_dropped = g_dropped.load(std::memory_order_relaxed);
-+    if (now_dropped != reported_drops) {
++    const uint64_t now_werr = g_write_err.load(std::memory_order_relaxed);
++    if (now_dropped != reported_drops || now_werr != reported_werr) {
 +      const uint64_t now_ns = MonoNs();
 +      if (now_ns - last_report_ns >= 100ull * 1000ull * 1000ull) {
-+        WriteDropReport(fd, now_dropped);
++        WriteDropReport(fd, now_dropped, now_werr);
 +        if (fd >= 0) {
 +          reported_drops = now_dropped;
++          reported_werr = now_werr;
 +          last_report_ns = now_ns;
 +        }
 +      }
@@ -55,68 +96,111 @@ index 84e4952..7e5ec4b 100644
    }
  }
  
-diff --git a/services/network/afeye_sink.h b/services/network/afeye_sink.h
-index b421479..6759098 100644
---- a/services/network/afeye_sink.h
-+++ b/services/network/afeye_sink.h
-@@ -14,6 +14,7 @@ enum EventKind : uint8_t {
-   kNetReq = 17,
-   kNetRespBody = 18,
-   kWebSocket = 19,
-+  kSinkDrop = 39,
- };
+@@ -167,6 +216,13 @@ void InitOnce() {
+   g_on.store(true, std::memory_order_release);
+   g_pid.store(::getpid(), std::memory_order_release);
+   std::thread(DrainLoop).detach();
++  struct sigaction sa;
++  std::memset(&sa, 0, sizeof(sa));
++  sa.sa_handler = AfeyeSignal;
++  sigemptyset(&sa.sa_mask);
++  sigaction(SIGTERM, &sa, nullptr);
++  sigaction(SIGINT, &sa, nullptr);
++  sigaction(SIGHUP, &sa, nullptr);
+   std::atexit([] { Flush(500); });
+ }
  
- bool Enabled();
 diff --git a/third_party/blink/renderer/platform/afeye/sink.cc b/third_party/blink/renderer/platform/afeye/sink.cc
-index 1e6d75f..6f02cd0 100644
+index 6da6634..4714800 100644
 --- a/third_party/blink/renderer/platform/afeye/sink.cc
 +++ b/third_party/blink/renderer/platform/afeye/sink.cc
-@@ -102,6 +102,25 @@ void EmitHello(int fd) {
+@@ -21,6 +21,7 @@ std::atomic<uint64_t> g_afeye_taint{0};
+ #include <vector>
+ 
+ #include <fcntl.h>
++#include <signal.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <time.h>
+@@ -82,6 +83,7 @@ const char* RawDir() {
+ }
+ 
+ std::atomic<uint64_t> g_write_err{0};
++std::atomic<int> g_report_fd{-1};
+ 
+ void WriteAll(int fd, const uint8_t* p, size_t n) {
+   size_t off = 0;
+@@ -136,14 +138,46 @@ void EmitHello(int fd) {
    WriteAll(fd, rec, total);
  }
  
-+void WriteDropReport(int fd, uint64_t dropped) {
++void WriteDropReport(int fd, uint64_t dropped, uint64_t write_err) {
 +  if (fd < 0) return;
-+  char msg[96];
-+  int n = std::snprintf(msg, sizeof(msg), "sink-drop layer=%s dropped=%llu",
-+                        kLayer, static_cast<unsigned long long>(dropped));
++  char msg[128];
++  int n = std::snprintf(msg, sizeof(msg),
++                        "sink-drop layer=%s dropped=%llu write_err=%llu",
++                        kLayer, static_cast<unsigned long long>(dropped),
++                        static_cast<unsigned long long>(write_err));
 +  if (n <= 0) return;
-+  uint8_t rec[16 + 96];
-+  uint32_t total = 16 + static_cast<uint32_t>(n);
++  uint8_t rec[24 + 128];
++  uint32_t total = 24 + static_cast<uint32_t>(n);
 +  std::memcpy(rec, &total, sizeof(total));
 +  rec[4] = kSinkDrop;
 +  rec[5] = 0;
-+  rec[6] = 0;
-+  rec[7] = 0;
++  std::memset(rec + 6, 0, 10);
 +  uint64_t ts = MonoNs();
-+  std::memcpy(rec + 8, &ts, sizeof(ts));
-+  std::memcpy(rec + 16, msg, static_cast<size_t>(n));
++  std::memcpy(rec + 16, &ts, sizeof(ts));
++  std::memcpy(rec + 24, msg, static_cast<size_t>(n));
 +  WriteAll(fd, rec, total);
++}
++
++void AfeyeSignal(int) {
++  Flush(500);
++  WriteDropReport(g_report_fd.load(std::memory_order_relaxed),
++                  g_dropped.load(std::memory_order_relaxed),
++                  g_write_err.load(std::memory_order_relaxed));
++  _exit(0);
 +}
 +
  void DrainLoop() {
    char pid[16];
    std::snprintf(pid, sizeof(pid), "%d", static_cast<int>(::getpid()));
-@@ -110,6 +129,8 @@ void DrainLoop() {
+   std::string path = std::string(RawDir()) + "/" + kLayer + "-" + pid + ".rec";
+   int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
++  g_report_fd.store(fd, std::memory_order_relaxed);
    if (fd >= 0) EmitHello(fd);
    static thread_local std::vector<uint8_t> buf;
    buf.resize(kMaxRecord);
 +  uint64_t reported_drops = 0;
++  uint64_t reported_werr = 0;
 +  uint64_t last_report_ns = 0;
    for (;;) {
      size_t len = 0;
      bool have = false;
-@@ -151,6 +172,17 @@ void DrainLoop() {
+@@ -176,15 +210,30 @@ void DrainLoop() {
+         if (g_write_err.load(std::memory_order_relaxed) != werr_before) {
+           ::close(fd);
+           fd = -1;
++          g_report_fd.store(-1, std::memory_order_relaxed);
+         }
+       }
+       if (fd < 0) {
+         fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
++        g_report_fd.store(fd, std::memory_order_relaxed);
+         if (fd >= 0) EmitHello(fd);
+       }
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds(500));
      }
 +    const uint64_t now_dropped = g_dropped.load(std::memory_order_relaxed);
-+    if (now_dropped != reported_drops) {
++    const uint64_t now_werr = g_write_err.load(std::memory_order_relaxed);
++    if (now_dropped != reported_drops || now_werr != reported_werr) {
 +      const uint64_t now_ns = MonoNs();
 +      if (now_ns - last_report_ns >= 100ull * 1000ull * 1000ull) {
-+        WriteDropReport(fd, now_dropped);
++        WriteDropReport(fd, now_dropped, now_werr);
 +        if (fd >= 0) {
 +          reported_drops = now_dropped;
++          reported_werr = now_werr;
 +          last_report_ns = now_ns;
 +        }
 +      }
@@ -124,68 +208,111 @@ index 1e6d75f..6f02cd0 100644
    }
  }
  
-diff --git a/third_party/blink/renderer/platform/afeye/sink.h b/third_party/blink/renderer/platform/afeye/sink.h
-index 00c61df..2e95bc3 100644
---- a/third_party/blink/renderer/platform/afeye/sink.h
-+++ b/third_party/blink/renderer/platform/afeye/sink.h
-@@ -33,6 +33,7 @@ enum EventKind : uint8_t {
-   kWorker = 35,
-   kNavStart = 36,
-   kTaintEdge = 37,
-+  kSinkDrop = 39,
- };
+@@ -195,6 +244,13 @@ void InitOnce() {
+   g_on.store(true, std::memory_order_release);
+   g_pid.store(::getpid(), std::memory_order_release);
+   std::thread(DrainLoop).detach();
++  struct sigaction sa;
++  std::memset(&sa, 0, sizeof(sa));
++  sa.sa_handler = AfeyeSignal;
++  sigemptyset(&sa.sa_mask);
++  sigaction(SIGTERM, &sa, nullptr);
++  sigaction(SIGINT, &sa, nullptr);
++  sigaction(SIGHUP, &sa, nullptr);
+   std::atexit([] { Flush(500); });
+ }
  
- bool Enabled();
 diff --git a/v8/src/afeye/sink.cc b/v8/src/afeye/sink.cc
-index 4c3278e..7073af3 100644
+index 22f2587..20af87d 100644
 --- a/v8/src/afeye/sink.cc
 +++ b/v8/src/afeye/sink.cc
-@@ -97,6 +97,25 @@ void EmitHello(int fd) {
+@@ -15,6 +15,7 @@
+ #include <vector>
+ 
+ #include <fcntl.h>
++#include <signal.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <time.h>
+@@ -80,6 +81,7 @@ const char* RawDir() {
+ }
+ 
+ std::atomic<uint64_t> g_write_err{0};
++std::atomic<int> g_report_fd{-1};
+ 
+ void WriteAll(int fd, const uint8_t* p, size_t n) {
+   size_t off = 0;
+@@ -137,14 +139,46 @@ void EmitHello(int fd) {
    WriteAll(fd, rec, total);
  }
  
-+void WriteDropReport(int fd, uint64_t dropped) {
++void WriteDropReport(int fd, uint64_t dropped, uint64_t write_err) {
 +  if (fd < 0) return;
-+  char msg[96];
-+  int n = std::snprintf(msg, sizeof(msg), "sink-drop layer=%s dropped=%llu",
-+                        kLayer, static_cast<unsigned long long>(dropped));
++  char msg[128];
++  int n = std::snprintf(msg, sizeof(msg),
++                        "sink-drop layer=%s dropped=%llu write_err=%llu",
++                        kLayer, static_cast<unsigned long long>(dropped),
++                        static_cast<unsigned long long>(write_err));
 +  if (n <= 0) return;
-+  uint8_t rec[16 + 96];
-+  uint32_t total = 16 + static_cast<uint32_t>(n);
++  uint8_t rec[24 + 128];
++  uint32_t total = 24 + static_cast<uint32_t>(n);
 +  std::memcpy(rec, &total, sizeof(total));
 +  rec[4] = kSinkDrop;
 +  rec[5] = 0;
-+  rec[6] = 0;
-+  rec[7] = 0;
++  std::memset(rec + 6, 0, 10);
 +  uint64_t ts = MonoNs();
-+  std::memcpy(rec + 8, &ts, sizeof(ts));
-+  std::memcpy(rec + 16, msg, static_cast<size_t>(n));
++  std::memcpy(rec + 16, &ts, sizeof(ts));
++  std::memcpy(rec + 24, msg, static_cast<size_t>(n));
 +  WriteAll(fd, rec, total);
++}
++
++void AfeyeSignal(int) {
++  Flush(500);
++  WriteDropReport(g_report_fd.load(std::memory_order_relaxed),
++                  g_dropped.load(std::memory_order_relaxed),
++                  g_write_err.load(std::memory_order_relaxed));
++  _exit(0);
 +}
 +
  void DrainLoop() {
    char pid[16];
    std::snprintf(pid, sizeof(pid), "%d", static_cast<int>(::getpid()));
-@@ -105,6 +124,8 @@ void DrainLoop() {
+   std::string path = std::string(RawDir()) + "/" + kLayer + "-" + pid + ".rec";
+   int fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
++  g_report_fd.store(fd, std::memory_order_relaxed);
    if (fd >= 0) EmitHello(fd);
    static thread_local std::vector<uint8_t> buf;
    buf.resize(kMaxRecord);
 +  uint64_t reported_drops = 0;
++  uint64_t reported_werr = 0;
 +  uint64_t last_report_ns = 0;
    for (;;) {
      size_t len = 0;
      bool have = false;
-@@ -146,6 +167,17 @@ void DrainLoop() {
+@@ -177,15 +211,30 @@ void DrainLoop() {
+         if (g_write_err.load(std::memory_order_relaxed) != werr_before) {
+           ::close(fd);
+           fd = -1;
++          g_report_fd.store(-1, std::memory_order_relaxed);
+         }
+       }
+       if (fd < 0) {
+         fd = ::open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0666);
++        g_report_fd.store(fd, std::memory_order_relaxed);
+         if (fd >= 0) EmitHello(fd);
+       }
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds(500));
      }
 +    const uint64_t now_dropped = g_dropped.load(std::memory_order_relaxed);
-+    if (now_dropped != reported_drops) {
++    const uint64_t now_werr = g_write_err.load(std::memory_order_relaxed);
++    if (now_dropped != reported_drops || now_werr != reported_werr) {
 +      const uint64_t now_ns = MonoNs();
 +      if (now_ns - last_report_ns >= 100ull * 1000ull * 1000ull) {
-+        WriteDropReport(fd, now_dropped);
++        WriteDropReport(fd, now_dropped, now_werr);
 +        if (fd >= 0) {
 +          reported_drops = now_dropped;
++          reported_werr = now_werr;
 +          last_report_ns = now_ns;
 +        }
 +      }
@@ -193,15 +320,17 @@ index 4c3278e..7073af3 100644
    }
  }
  
-diff --git a/v8/src/afeye/sink.h b/v8/src/afeye/sink.h
-index ca6d2bb..958beaf 100644
---- a/v8/src/afeye/sink.h
-+++ b/v8/src/afeye/sink.h
-@@ -28,6 +28,7 @@ enum EventKind : uint8_t {
-   kIsolateBirth = 34,
-   kFingerprint = 16,
-   kErrorStack = 38,
-+  kSinkDrop = 39,
- };
+@@ -205,6 +254,13 @@ void InitOnce() {
+   g_on.store(true, std::memory_order_release);
+   g_pid.store(::getpid(), std::memory_order_release);
+   std::thread(DrainLoop).detach();
++  struct sigaction sa;
++  std::memset(&sa, 0, sizeof(sa));
++  sa.sa_handler = AfeyeSignal;
++  sigemptyset(&sa.sa_mask);
++  sigaction(SIGTERM, &sa, nullptr);
++  sigaction(SIGINT, &sa, nullptr);
++  sigaction(SIGHUP, &sa, nullptr);
+   std::atexit([] { Flush(500); });
+ }
  
- bool Enabled();

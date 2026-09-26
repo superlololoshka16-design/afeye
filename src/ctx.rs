@@ -109,16 +109,6 @@ pub fn vendor_of_url(url: &str) -> Option<&'static str> {
     None
 }
 
-pub fn vendor_of_stack(s: &str) -> Option<&'static str> {
-    let head = &s[..char_floor(s, 600)];
-    for (suf, v) in VENDORS {
-        if head.contains(suf) {
-            return Some(v);
-        }
-    }
-    None
-}
-
 #[repr(C, align(64))]
 pub struct Cn {
     pub ev: AtomicU64,
@@ -126,12 +116,8 @@ pub struct Cn {
     pub resp: AtomicU64,
     pub body: AtomicU64,
     pub art: AtomicU64,
-    pub scripts: AtomicU64,
-    pub batch: AtomicU64,
     pub drop: AtomicU64,
-    pub bin: AtomicU64,
     pub bout: AtomicU64,
-    pub poke: AtomicU64,
     pub stop: AtomicBool,
     pub dead: AtomicBool,
 }
@@ -144,12 +130,8 @@ impl Cn {
             resp: AtomicU64::new(0),
             body: AtomicU64::new(0),
             art: AtomicU64::new(0),
-            scripts: AtomicU64::new(0),
-            batch: AtomicU64::new(0),
             drop: AtomicU64::new(0),
-            bin: AtomicU64::new(0),
             bout: AtomicU64::new(0),
-            poke: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             dead: AtomicBool::new(false),
         }
@@ -165,26 +147,6 @@ pub struct Target {
     pub host: String,
 }
 
-#[derive(Clone)]
-pub struct Tunnel {
-    pub i: u32,
-    pub name: String,
-    pub user: String,
-    pub ns: String,
-    pub wg_if: String,
-    pub h_if: String,
-    pub n_if: String,
-    pub host_ip: String,
-    pub ns_ip: String,
-    pub port: u16,
-    pub endpoint: String,
-    pub pubkey: String,
-    pub privkey: String,
-    pub addr: Vec<String>,
-    pub dns: Vec<String>,
-    pub egress: Option<String>,
-}
-
 pub struct Ctx {
     pub stage: PathBuf,
     pub slot: String,
@@ -196,13 +158,10 @@ pub struct Ctx {
     pub interner: Interner,
     pub cn: Cn,
     pub targets: Vec<Target>,
-    pub tunnels: Vec<Tunnel>,
-    pub binding: String,
-    pub gl_spoof: bool,
     pub budget: AtomicU64,
+    pub img_budget: AtomicU64,
     pub chrome: PathBuf,
     pub ua: String,
-    pub display: String,
     pub endpoints: DashMap<u32, u64>,
 }
 
@@ -225,14 +184,6 @@ mod tests {
         assert_eq!(vendor_of_url("https://t.fpjs.io/x"), Some("fpjs"));
         assert_eq!(vendor_of_url("https://ex.com/cdn-cgi/trace"), Some("cloudflare"));
         assert_eq!(vendor_of_url("https://ok.com/app.js"), None);
-    }
-
-    #[test]
-    fn stack_multibyte_no_panic() {
-        let s = "й".repeat(700);
-        assert!(vendor_of_stack(&s).is_none());
-        let s2 = format!("https://js.datadome.co/tags.js:1:1 {}", "д".repeat(700));
-        assert_eq!(vendor_of_stack(&s2), Some("datadome"));
     }
 
     #[test]

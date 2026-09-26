@@ -20,7 +20,7 @@ index 739b283..c417144 100644
  }
  
 diff --git a/third_party/blink/renderer/modules/webaudio/analyser_node.cc b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
-index 688a2fe..d89c3f9 100644
+index 688a2fe..c9c2891 100644
 --- a/third_party/blink/renderer/modules/webaudio/analyser_node.cc
 +++ b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
 @@ -25,6 +25,12 @@
@@ -75,8 +75,8 @@ index 688a2fe..d89c3f9 100644
                                               context()->currentTime());
 +#ifdef BLINK_AFEYE
 +  if (blink::afeye::Enabled() &&
-+      g_afeye_analyser.fetch_add(1, std::memory_order_relaxed) <
-+          kAfeyeAnalyserCap) {
++      blink::afeye::AfeyeCapConsume(&g_afeye_analyser, kAfeyeAnalyserCap,
++                                    "analyser")) {
 +    AfeyeEmitAnalyserSpanF32("audio/float-frequency", array.Get());
 +  }
 +#endif
@@ -87,8 +87,8 @@ index 688a2fe..d89c3f9 100644
                                              context()->currentTime());
 +#ifdef BLINK_AFEYE
 +  if (blink::afeye::Enabled() &&
-+      g_afeye_analyser.fetch_add(1, std::memory_order_relaxed) <
-+          kAfeyeAnalyserCap) {
++      blink::afeye::AfeyeCapConsume(&g_afeye_analyser, kAfeyeAnalyserCap,
++                                    "analyser")) {
 +    AfeyeEmitAnalyserSpan("audio/byte-frequency", array.Get());
 +  }
 +#endif
@@ -98,8 +98,8 @@ index 688a2fe..d89c3f9 100644
    GetAnalyserHandler().GetFloatTimeDomainData(array.Get());
 +#ifdef BLINK_AFEYE
 +  if (blink::afeye::Enabled() &&
-+      g_afeye_analyser.fetch_add(1, std::memory_order_relaxed) <
-+          kAfeyeAnalyserCap) {
++      blink::afeye::AfeyeCapConsume(&g_afeye_analyser, kAfeyeAnalyserCap,
++                                    "analyser")) {
 +    AfeyeEmitAnalyserSpanF32("audio/float-timedomain", array.Get());
 +  }
 +#endif
@@ -109,8 +109,8 @@ index 688a2fe..d89c3f9 100644
    GetAnalyserHandler().GetByteTimeDomainData(array.Get());
 +#ifdef BLINK_AFEYE
 +  if (blink::afeye::Enabled() &&
-+      g_afeye_analyser.fetch_add(1, std::memory_order_relaxed) <
-+          kAfeyeAnalyserCap) {
++      blink::afeye::AfeyeCapConsume(&g_afeye_analyser, kAfeyeAnalyserCap,
++                                    "analyser")) {
 +    AfeyeEmitAnalyserSpan("audio/byte-timedomain", array.Get());
 +  }
 +#endif
@@ -118,10 +118,10 @@ index 688a2fe..d89c3f9 100644
  
  void AnalyserNode::ReportDidCreate() {
 diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index 8804690..5606cf6 100644
+index e9b8f1d..3266077 100644
 --- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-@@ -5400,6 +5400,17 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
+@@ -5425,6 +5425,17 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
                                                   GLenum type,
                                                   DOMArrayBufferView* pixels,
                                                   int64_t offset) {
@@ -139,7 +139,7 @@ index 8804690..5606cf6 100644
    if (isContextLost())
      return;
    // Due to WebGL's same-origin restrictions, it is not possible to
-@@ -5466,6 +5477,15 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
+@@ -5491,6 +5502,15 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
        return;
      }
      ContextGL()->ReadPixels(x, y, width, height, format, type, data);

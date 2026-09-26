@@ -1,9 +1,9 @@
 diff --git a/v8/src/afeye/causality.cc b/v8/src/afeye/causality.cc
 new file mode 100644
-index 0000000..8cb6931
+index 0000000..32b3f3f
 --- /dev/null
 +++ b/v8/src/afeye/causality.cc
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,322 @@
 +#include "src/afeye/causality.h"
 +
 +#ifdef V8_AFEYE
@@ -40,6 +40,7 @@ index 0000000..8cb6931
 +struct TaskSlot {
 +  std::atomic<uint64_t> key{kTaskKeyEmpty};
 +  std::atomic<uint64_t> tid{0};
++  std::atomic<uint64_t> mint{0};
 +};
 +
 +TaskSlot g_tasks[kTaskSlots];
@@ -100,6 +101,8 @@ index 0000000..8cb6931
 +  if (s == nullptr) return false;
 +  s->key.store(key, std::memory_order_relaxed);
 +  s->tid.store(tid, std::memory_order_relaxed);
++  s->mint.store(g_minted.load(std::memory_order_relaxed),
++                std::memory_order_relaxed);
 +  return true;
 +}
 +
@@ -107,9 +110,20 @@ index 0000000..8cb6931
 +  TaskLock lock;
 +  TaskSlot* s = FindTaskSlot(key, false);
 +  if (s == nullptr) return 0;
-+  uint64_t tid = s->tid.load(std::memory_order_relaxed);
++  const uint64_t tid = s->tid.load(std::memory_order_relaxed);
++  // stale-guard: the key is a raw heap pointer of the microtask object.
++  // GC frees the object and a later allocation reuses the same address,
++  // so a slot left over from the OLD task would hand its tid to an
++  // unrelated new one - false kinship. If the global mint counter moved
++  // more than half the slot space since the slot was written, the entry
++  // is from a previous generation: treat as a miss (the existing witness
++  // reports misses), never as lineage.
++  const uint64_t mint = s->mint.load(std::memory_order_relaxed);
++  const uint64_t age =
++      g_minted.load(std::memory_order_relaxed) - mint;
 +  s->tid.store(0, std::memory_order_relaxed);
 +  s->key.store(kTaskKeyDead, std::memory_order_relaxed);
++  if (age > (1ull << 15)) return 0;
 +  return tid;
 +}
 +
@@ -165,6 +179,15 @@ index 0000000..8cb6931
 +bool CausalityEnabled() { return Enabled() && CausalityEnvOn(); }
 +
 +uint64_t CausalityCurrent() { return g_ambient; }
++
++// C ABI accessor for the ambient causality trace id. The blink-layer sink
++// (platform/afeye/sink.cc) cannot include v8-internal causality.h, but it
++// links into the SAME renderer binary, so it declares this symbol extern
++// and calls it to stamp tid into the wire-v3 header. g_ambient is
++// thread_local, so a plain read is race-free on the calling thread.
++// Default visibility (no V8_EXPORT/hidden attribute) so the blink TU
++// resolves it at static-link time.
++extern "C" uint64_t afeye_causality_ambient(void) { return g_ambient; }
 +
 +void CausalityEnter(uint64_t trace_id) { g_ambient = trace_id; }
 +
@@ -305,10 +328,10 @@ index 0000000..8cb6931
 +#endif
 diff --git a/v8/src/afeye/causality.h b/v8/src/afeye/causality.h
 new file mode 100644
-index 0000000..25f1bec
+index 0000000..51f4154
 --- /dev/null
 +++ b/v8/src/afeye/causality.h
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,56 @@
 +#ifndef V8_AFEYE_CAUSALITY_H_
 +#define V8_AFEYE_CAUSALITY_H_
 +
@@ -325,6 +348,10 @@ index 0000000..25f1bec
 +bool CausalityEnabled();
 +
 +uint64_t CausalityCurrent();
++
++// C ABI: ambient causality trace id (low 64 bits; wire carries low16).
++// Defined in causality.cc; the blink-layer sink declares it extern itself.
++extern "C" uint64_t afeye_causality_ambient(void);
 +
 +void CausalityEnter(uint64_t trace_id);
 +

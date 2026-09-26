@@ -1,4 +1,4 @@
-use crate::ctx::{Ctx, Tunnel};
+use crate::ctx::Ctx;
 use chromiumoxide::Browser;
 use futures::StreamExt;
 use std::net::TcpStream;
@@ -7,60 +7,25 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 
+fn jit_allowed() -> bool {
+    std::env::var("AF_ALLOW_JIT").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Headful only when the caller explicitly asks for it AND an X server is
+/// actually reachable. Chrome without a display fails to start, so the
+/// default must be headless on the full `chrome` binary.
+fn headful() -> bool {
+    std::env::var("AF_HEADFUL").map(|v| v == "1").unwrap_or(false)
+        && std::env::var("DISPLAY").map(|d| !d.is_empty()).unwrap_or(false)
+}
+
 pub struct Flags<'a> {
-    pub t: Option<&'a Tunnel>,
     pub port: u16,
     pub bind: &'a str,
     pub ua: &'a str,
-    pub headless_shell: bool,
 }
 
-pub struct Xvfb {
-    c: std::process::Child,
-    pub display: String,
-}
-
-impl Drop for Xvfb {
-    fn drop(&mut self) {
-        let _ = self.c.kill();
-        let _ = self.c.wait();
-    }
-}
-
-pub fn spawn_xvfb() -> Result<Xvfb, String> {
-    if std::env::var("DISPLAY").map(|d| !d.is_empty()).unwrap_or(false) {
-        return Ok(Xvfb {
-            c: std::process::Command::new("true").stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| e.to_string())?,
-            display: std::env::var("DISPLAY").unwrap(),
-        });
-    }
-    let _ = std::fs::remove_file("/tmp/.X11-unix/X99");
-    let c = std::process::Command::new("Xvfb")
-        .args([":99", "-screen", "0", "1920x1080x24", "-ac", "-nolisten", "tcp", "-noreset"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Xvfb: {e}"))?;
-    let x = Xvfb {
-        c,
-        display: ":99".into(),
-    };
-    let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(10) {
-        if PathBuf::from("/tmp/.X11-unix/X99").exists() {
-            return Ok(x);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Err("Xvfb did not start".into())
-}
-
-fn chrome_flags(f: &Flags) -> Vec<String> {
-    let profile = match f.t {
-        Some(t) => format!("/tmp/afeye/p{}", t.i),
-        None => "/tmp/afeye/local".to_owned(),
-    };
-    let idx = f.t.map(|t| t.i as usize).unwrap_or(0);
+pub fn chrome_flags(f: &Flags) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
@@ -75,99 +40,89 @@ fn chrome_flags(f: &Flags) -> Vec<String> {
         "--no-sandbox".into(),
         format!("--remote-debugging-address={}", f.bind),
         format!("--remote-debugging-port={}", f.port),
-        format!("--user-data-dir={}", profile),
+        "--user-data-dir=/tmp/afeye/local".into(),
         "--window-size=1280,832".into(),
-        format!("--window-position={},{}", (idx % 4) * 320, (idx / 4) * 250),
     ];
     if !f.ua.is_empty() {
         a.push(format!("--user-agent={}", f.ua));
     }
-    if std::env::var("AF_TEST_HEADLESS").is_ok() {
+    // ALWAYS headless, on the FULL `chrome` binary. Two separate traps here:
+    //   * `headless_shell` is the stripped test binary where antifraud
+    //     self-checks die silently - it must not be preferred.
+    //   * headful `chrome` needs an X server. This runs on CI/WSL with no
+    //     DISPLAY, so a headful launch fails before it starts. Xvfb is gone.
+    // `--enable-unsafe-swiftshader` above keeps WebGL/canvas working under
+    // software rasterisation, which is what the fingerprint capture needs.
+    if !headful() {
         a.push("--headless".into());
         a.push("--disable-gpu".into());
     }
-    if f.headless_shell {
-        a.push("--headless".into());
-        a.push("--disable-gpu".into());
-    }
-    if std::env::var("AF_JITLESS").map(|v| v == "1").unwrap_or(false) {
-        // afeye 0033: interpreter-only mode. Every JS instruction stays in
-        // Ignition forever - the bytecode trace sees the entire hot loop,
-        // nothing escapes to Sparkplug/Maglev/TurboFan machine code.
-        // Timing anomalies are covered by AFEYE_VIRTUAL_CLOCK (0034).
-        a.push("--jitless".into());
-        // --jitless (chrome flag) already forbids all code generation;
-        // pin the two v8 tiers explicitly too so the contract is literal:
-        // no optimizing tier, no baseline tier, interpreter-only forever.
-        a.push("--js-flags=--no-opt --no-sparkplug".into());
+    if !jit_allowed() {
+        // afeye 0033: keep JS in the interpreter forever (no Sparkplug
+        // baseline, no Maglev mid-tier, no TurboFan optimizing tier-up) so
+        // the bytecode trace sees every instruction of the hot loop.
+        // Deliberately NOT --jitless: that sets v8_flags.wasm_jitless and
+        // routes WebAssembly through the DrumbraKE interpreter only, which
+        // this build does not enable - wasm would not execute at all and
+        // WASM-based antifraud (kasada, datadome, perimeterx, shape) would
+        // never run. Pinning only the JS tiers leaves Liftoff (the wasm
+        // baseline compiler) alive, so wasm executes and the 0028 shadow
+        // hooks still fire.
+        a.push("--js-flags=--no-opt --no-sparkplug --no-maglev".into());
     }
     a.push("about:blank".into());
     a
 }
 
-pub fn is_headless_shell(chrome: &std::path::Path) -> bool {
-    chrome
-        .file_name()
-        .map(|x| x.to_string_lossy().contains("headless_shell"))
-        .unwrap_or(false)
-}
-
-pub async fn launch_chrome(ctx: &Ctx, t: &Tunnel) -> Result<Child, String> {
-    let flags = chrome_flags(&Flags {
-        t: Some(t),
-        port: t.port,
-        bind: &t.ns_ip,
-        ua: &ctx.ua,
-        headless_shell: is_headless_shell(&ctx.chrome),
-    });
-    let mut c = Command::new("ip");
-    c.args(["netns", "exec", &t.ns, "runuser", "-u", &t.user, "--"]);
-    c.arg("env")
-        .arg(format!("HOME=/tmp/afeye/h{}", t.i))
-        .arg(format!("USER={}", t.user))
-        .arg(format!("DISPLAY={}", ctx.display));
-    {
-        let raw_dir = std::env::var("AFEYE_RAW_DIR").unwrap_or_else(|_| {
-            std::env::var("AF_RAW_DIR").unwrap_or_else(|_| "/tmp/afeye-raw".into())
-        });
-        let sink = std::env::var("AFEYE_SINK").unwrap_or_else(|_| "1".into());
-        c.arg(format!("AFEYE_SINK={}", sink));
-        c.arg(format!("AFEYE_RAW_DIR={}", raw_dir));
-    }
-    c.arg(&ctx.chrome);
-    for f in &flags {
-        c.arg(f);
-    }
-    c.stdout(Stdio::null());
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(format!("/tmp/afeye/chrome-{}.log", t.i))
-        .ok();
-    if let Some(f) = log {
-        c.stderr(Stdio::from(f));
-    } else {
-        c.stderr(Stdio::null());
-    }
-    c.kill_on_drop(true);
-    let child = c.spawn().map_err(|e| e.to_string())?;
-    Ok(child)
+pub fn raw_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var("AFEYE_RAW_DIR")
+            .unwrap_or_else(|_| afeye::collect::DEFAULT_RAW_DIR.to_owned()),
+    )
 }
 
 pub async fn launch_chrome_local(ctx: &Ctx, port: u16) -> Result<Child, String> {
     let _ = std::fs::remove_dir_all("/tmp/afeye/local");
+    let _ = std::fs::create_dir_all("/tmp/afeye");
     let flags = chrome_flags(&Flags {
-        t: None,
         port,
         bind: "127.0.0.1",
         ua: &ctx.ua,
-        headless_shell: is_headless_shell(&ctx.chrome),
     });
     let mut c = Command::new(&ctx.chrome);
-    let raw_dir = std::env::var("AFEYE_RAW_DIR")
-        .unwrap_or_else(|_| std::env::var("AF_RAW_DIR").unwrap_or_else(|_| "/tmp/afeye-raw".into()));
     c.env("AFEYE_SINK", std::env::var("AFEYE_SINK").unwrap_or_else(|_| "1".into()));
-    c.env("AFEYE_RAW_DIR", raw_dir);
+    c.env("AFEYE_RAW_DIR", raw_dir());
+    // AFEYE_VIRTUAL_CLOCK is OFF by default, and that is deliberate.
+    //
+    // It makes performance.now()/Date.now() advance by executed instruction
+    // count: 10ns per instruction (AFEYE_VCLOCK_NS_PER_INSTR). Under the
+    // 0033 bytecode trace the interpreter runs at roughly 1-5M instr/s, so
+    // the page's clock advances 10-50ms per SECOND of wall time:
+    //
+    //     60s wall  -> page sees 0.6-3s      (57-59s behind)
+    //     38m wall  -> page sees 23-114s     (36-38 MINUTES behind)
+    //
+    // An antifraud token carries a timestamp the server compares against its
+    // own clock. Tens of minutes of skew means the token is rejected
+    // unconditionally - the crawl would collect a rejected token every time.
+    // It also desynchronises the two APIs it virtualises from the ones it
+    // does not: performance.timeOrigin, event.timeStamp, rAF timestamps and
+    // all network timings stay on the real clock, so
+    // timeOrigin + performance.now() != Date.now() - a contradiction far
+    // easier to detect than slow JS.
+    //
+    // Real wall clock is the right default: the token timestamp is then
+    // correct and the server accepts it. Tracing dilation shows up only in
+    // intra-token deltas, which is a much smaller risk than an invalid
+    // timestamp. Set AF_VCLOCK=1 to turn it on for experiments, and tune
+    // AFEYE_VCLOCK_NS_PER_INSTR so vclock tracks wall time.
+    if std::env::var("AF_VCLOCK").map(|v| v == "1").unwrap_or(false) {
+        c.env("AFEYE_VIRTUAL_CLOCK", "1");
+        if let Ok(step) = std::env::var("AFEYE_VCLOCK_NS_PER_INSTR") {
+            c.env("AFEYE_VCLOCK_NS_PER_INSTR", step);
+        }
+    }
+    c.env("AFEYE_TRACE_BYTECODE", "1");
     for f in &flags {
         c.arg(f);
     }
@@ -194,19 +149,13 @@ async fn http_json_version(ip: &str, port: u16) -> Result<String, String> {
         .parse::<std::net::SocketAddr>()
         .map_err(|e| e.to_string())?;
     let t0 = Instant::now();
-    let mut attempt = 0u32;
     loop {
-        attempt += 1;
         if let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
             let req = format!("GET /json/version HTTP/1.1\r\nHost: {ip}:{port}\r\nConnection: close\r\n\r\n");
             use std::io::{Read, Write};
-            let w = s.write_all(req.as_bytes());
-            if std::env::var("AF_DEBUG_HTTP").is_ok() {
-                eprintln!("[afeye] http attempt {attempt} write={w:?}");
-            }
-            if w.is_ok() {
+            if s.write_all(req.as_bytes()).is_ok() {
                 let mut buf = Vec::with_capacity(4096);
                 loop {
                     let mut chunk = [0u8; 4096];
@@ -218,9 +167,6 @@ async fn http_json_version(ip: &str, port: u16) -> Result<String, String> {
                     if buf.len() > 1 << 20 {
                         break;
                     }
-                }
-                if std::env::var("AF_DEBUG_HTTP").is_ok() {
-                    eprintln!("[afeye] http read {} bytes", buf.len());
                 }
                 if let Ok(body) = simdutf8::basic::from_utf8(&buf) {
                     if let Some(p) = body.find("\"webSocketDebuggerUrl\"") {
@@ -253,10 +199,4 @@ pub async fn connect(ctx: &Ctx, ip: &str, port: u16) -> Result<Browser, String> 
         }
     });
     Ok(browser)
-}
-
-pub async fn run_tunnel(ctx: &Ctx, t: &Tunnel) -> Result<(Child, Browser), String> {
-    let c = launch_chrome(ctx, t).await?;
-    let b = connect(ctx, &t.ns_ip, t.port).await?;
-    Ok((c, b))
 }

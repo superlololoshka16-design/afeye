@@ -1,8 +1,8 @@
 diff --git a/v8/src/afeye/sink.cc b/v8/src/afeye/sink.cc
-index 7073af3..2e62d70 100644
+index 20af87d..c2faa24 100644
 --- a/v8/src/afeye/sink.cc
 +++ b/v8/src/afeye/sink.cc
-@@ -328,6 +328,24 @@ void EmitWasmMemGrow(size_t old_pages, size_t new_pages) {
+@@ -390,6 +390,27 @@ void EmitWasmMemGrow(size_t old_pages, size_t new_pages) {
    EmitStr(kWasmInstance, NowNs(), afeye_buf);
  }
  
@@ -15,11 +15,14 @@ index 7073af3..2e62d70 100644
 +  }();
 +  if (g_afeye_wmdump_off) return;
 +  if (base == nullptr || byte_length == 0) return;
-+  if (g_afeye_wmdump.fetch_add(1, std::memory_order_relaxed) >= 512) return;
-+  char afeye_tag[96];
++  if (!AfeyeCapConsume(&g_afeye_wmdump, 512, "wasm-mem-dump")) return;
++  const uint32_t shown =
++      byte_length > kSpanCap ? kSpanCap : static_cast<uint32_t>(byte_length);
++  char afeye_tag[128];
 +  std::snprintf(afeye_tag, sizeof(afeye_tag),
-+                "wasm-mem-content id=%p len=%llu", mem_id,
-+                static_cast<unsigned long long>(byte_length));
++                "wasm-mem-content id=%p len=%llu shown=%u", mem_id,
++                static_cast<unsigned long long>(byte_length),
++                static_cast<unsigned>(shown));
 +  EmitSpan(kWasmMemory, NowNs(), afeye_tag, base,
 +           static_cast<uint32_t>(byte_length));
 +}
@@ -28,10 +31,10 @@ index 7073af3..2e62d70 100644
  uint64_t SinkDropped() {
    return g_dropped.load(std::memory_order_relaxed) +
 diff --git a/v8/src/afeye/sink.h b/v8/src/afeye/sink.h
-index 958beaf..9ab7d6e 100644
+index 4167882..ad49a2e 100644
 --- a/v8/src/afeye/sink.h
 +++ b/v8/src/afeye/sink.h
-@@ -39,6 +39,8 @@ void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
+@@ -42,6 +42,8 @@ void Emit(uint8_t kind, uint64_t ts_ns, const void* data, uint32_t len);
  void EmitStr(uint8_t kind, uint64_t ts_ns, const char* s);
  void EmitTwoStr(uint8_t kind, uint64_t ts_ns, const char* a, const char* b);
  void EmitWasmMemGrow(size_t old_pages, size_t new_pages);

@@ -1,8 +1,8 @@
 diff --git a/third_party/blink/renderer/core/dom/document.cc b/third_party/blink/renderer/core/dom/document.cc
-index 12e7366..a673980 100644
+index 6a9c029..17909dd 100644
 --- a/third_party/blink/renderer/core/dom/document.cc
 +++ b/third_party/blink/renderer/core/dom/document.cc
-@@ -6875,7 +6875,7 @@ String Document::cookie(ExceptionState& exception_state) const {
+@@ -6877,7 +6877,7 @@ String Document::cookie(ExceptionState& exception_state) const {
      std::snprintf(afeye_tag, sizeof(afeye_tag), "cookie-get len=%u",
                    afeye_cookies.length());
      std::string afeye_v = afeye_cookies.Utf8();
@@ -11,7 +11,7 @@ index 12e7366..a673980 100644
      blink::afeye::EmitSpan(blink::afeye::kFingerprint, blink::afeye::NowNs(),
                             afeye_tag,
                             reinterpret_cast<const uint8_t*>(afeye_v.data()),
-@@ -6914,7 +6914,7 @@ void Document::setCookie(const String& value, ExceptionState& exception_state) {
+@@ -6916,7 +6916,7 @@ void Document::setCookie(const String& value, ExceptionState& exception_state) {
      std::snprintf(afeye_tag, sizeof(afeye_tag), "cookie-set len=%u",
                    value.length());
      std::string afeye_v = value.Utf8();
@@ -21,10 +21,10 @@ index 12e7366..a673980 100644
                             afeye_tag,
                             reinterpret_cast<const uint8_t*>(afeye_v.data()),
 diff --git a/third_party/blink/renderer/modules/storage/storage_area.cc b/third_party/blink/renderer/modules/storage/storage_area.cc
-index ed849bc..b801d33 100644
+index 7e41375..1cd5567 100644
 --- a/third_party/blink/renderer/modules/storage/storage_area.cc
 +++ b/third_party/blink/renderer/modules/storage/storage_area.cc
-@@ -147,7 +147,7 @@ String StorageArea::getItem(const String& key,
+@@ -150,7 +150,7 @@ String StorageArea::getItem(const String& key,
                    "storage-get key=%.128s vlen=%u", key.Utf8().c_str(),
                    afeye_item.length());
      std::string afeye_v = afeye_item.Utf8();
@@ -33,7 +33,7 @@ index ed849bc..b801d33 100644
      blink::afeye::EmitSpan(blink::afeye::kFingerprint, blink::afeye::NowNs(),
                             afeye_tag,
                             reinterpret_cast<const uint8_t*>(afeye_v.data()),
-@@ -172,7 +172,7 @@ NamedPropertySetterResult StorageArea::setItem(
+@@ -176,7 +176,7 @@ NamedPropertySetterResult StorageArea::setItem(
                    "storage-set key=%.128s vlen=%u", key.Utf8().c_str(),
                    value.length());
      std::string afeye_v = value.Utf8();

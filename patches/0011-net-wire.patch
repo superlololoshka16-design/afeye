@@ -30,10 +30,10 @@ index 518ada2..9a0877f 100644
  if (is_linux || is_chromeos) {
 diff --git a/services/network/afeye_sink.cc b/services/network/afeye_sink.cc
 new file mode 100644
-index 0000000..84e4952
+index 0000000..ba980f1
 --- /dev/null
 +++ b/services/network/afeye_sink.cc
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,302 @@
 +#include "services/network/afeye_sink.h"
 +
 +#ifdef NET_AFEYE
@@ -114,21 +114,24 @@ index 0000000..84e4952
 +  }
 +}
 +
++void AfeyeFillAttrs(uint8_t* rec, uint8_t /*kind*/) {
++  std::memset(rec + 6, 0, 10);
++}
++
 +void EmitHello(int fd) {
 +  char msg[96];
 +  int n = std::snprintf(msg, sizeof(msg), "afeye-sink/%s v2 pid=%d", kLayer,
 +                        static_cast<int>(::getpid()));
 +  if (n <= 0) return;
-+  uint8_t rec[16 + 96];
-+  uint32_t total = 16 + static_cast<uint32_t>(n);
++  uint8_t rec[24 + 96];
++  uint32_t total = 24 + static_cast<uint32_t>(n);
 +  std::memcpy(rec, &total, sizeof(total));
 +  rec[4] = 0;
 +  rec[5] = 0;
-+  rec[6] = 0;
-+  rec[7] = 0;
++  std::memset(rec + 6, 0, 10);
 +  uint64_t ts = MonoNs();
-+  std::memcpy(rec + 8, &ts, sizeof(ts));
-+  std::memcpy(rec + 16, msg, static_cast<size_t>(n));
++  std::memcpy(rec + 16, &ts, sizeof(ts));
++  std::memcpy(rec + 24, msg, static_cast<size_t>(n));
 +  WriteAll(fd, rec, total);
 +}
 +
@@ -154,7 +157,7 @@ index 0000000..84e4952
 +      uint32_t len32;
 +      std::memcpy(&len32, g_ring.data + g_ring.tail, sizeof(len32));
 +      len = len32;
-+      if (len < 16 || len > kMaxRecord) {
++      if (len < 24 || len > kMaxRecord) {
 +        g_ring.tail = g_ring.head;
 +      } else {
 +        std::memcpy(buf.data(), g_ring.data + g_ring.tail, len);
@@ -223,11 +226,11 @@ index 0000000..84e4952
 +               uint32_t len) {
 +  if (!g_on.load(std::memory_order_acquire)) return;
 +  if (data == nullptr || len == 0) return;
-+  if (len > kMaxRecord - 16) {
-+    len = kMaxRecord - 16;
++  if (len > kMaxRecord - 24) {
++    len = kMaxRecord - 24;
 +    flags |= 1;
 +  }
-+  const size_t need = 16 + static_cast<size_t>(len);
++  const size_t need = 24 + static_cast<size_t>(len);
 +  while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
 +  }
 +  const size_t h = g_ring.head;
@@ -243,10 +246,9 @@ index 0000000..84e4952
 +  std::memcpy(rec, &total, sizeof(total));
 +  rec[4] = kind;
 +  rec[5] = flags;
-+  rec[6] = 0;
-+  rec[7] = 0;
-+  std::memcpy(rec + 8, &ts_ns, sizeof(ts_ns));
-+  std::memcpy(rec + 16, data, len);
++  AfeyeFillAttrs(rec, kind);
++  std::memcpy(rec + 16, &ts_ns, sizeof(ts_ns));
++  std::memcpy(rec + 24, data, len);
 +  size_t nh = h + need;
 +  if (nh >= kRingBytes) nh -= kRingBytes;
 +  g_ring.head = nh;
@@ -267,7 +269,7 @@ index 0000000..84e4952
 +  size_t la = std::strlen(a);
 +  size_t lb = std::strlen(b);
 +  bool trunc = false;
-+  const size_t kCap = kMaxRecord - 17;
++  const size_t kCap = kMaxRecord - 25;
 +  if (la > kCap) {
 +    la = kCap;
 +    trunc = true;
@@ -292,7 +294,7 @@ index 0000000..84e4952
 +  size_t lt = std::strlen(tag);
 +  if (lt > 64) lt = 64;
 +  bool trunc = false;
-+  if (n > kSpanCap) {
++  if (n >= kSpanCap) {
 +    n = kSpanCap;
 +    trunc = true;
 +  }
@@ -336,10 +338,10 @@ index 0000000..84e4952
 +
 diff --git a/services/network/afeye_sink.h b/services/network/afeye_sink.h
 new file mode 100644
-index 0000000..b421479
+index 0000000..309fe90
 --- /dev/null
 +++ b/services/network/afeye_sink.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,54 @@
 +#ifndef SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
 +#define SERVICES_NETWORK_PUBLIC_CPP_AFEYE_SINK_H_
 +
@@ -347,6 +349,9 @@ index 0000000..b421479
 +#include <stdint.h>
 +
 +#ifdef NET_AFEYE
++
++#include <atomic>
++#include <cstdio>
 +
 +namespace network {
 +namespace afeye {
@@ -356,6 +361,7 @@ index 0000000..b421479
 +  kNetReq = 17,
 +  kNetRespBody = 18,
 +  kWebSocket = 19,
++  kSinkDrop = 39,
 +};
 +
 +bool Enabled();
@@ -369,6 +375,18 @@ index 0000000..b421479
 +              const uint8_t* bytes, uint32_t n);
 +uint64_t SinkDropped();
 +bool Flush(uint32_t timeout_ms);
++
++inline bool AfeyeCapConsume(std::atomic<uint64_t>* ctr, uint64_t cap,
++                            const char* name) {
++  const uint64_t old = ctr->fetch_add(1, std::memory_order_relaxed);
++  if (old == cap) {
++    char msg[128];
++    std::snprintf(msg, sizeof(msg), "cap-exhausted name=%s limit=%llu", name,
++                  static_cast<unsigned long long>(cap));
++    EmitStr(kSinkDrop, NowNs(), msg);
++  }
++  return old < cap;
++}
 +
 +}
 +}

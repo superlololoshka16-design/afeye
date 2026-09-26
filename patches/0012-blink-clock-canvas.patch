@@ -1,13 +1,14 @@
 diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-index 40df4b3..2b75091 100644
+index 40df4b3..0a31d45 100644
 --- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 +++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-@@ -27,6 +27,12 @@
+@@ -27,6 +27,13 @@
  
  #include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
  
 +#ifdef BLINK_AFEYE
 +#include <cstdio>
++#include <string>
 +
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +#endif
@@ -15,7 +16,7 @@ index 40df4b3..2b75091 100644
  #include <math.h>
  
  #include <limits>
-@@ -1305,6 +1311,16 @@ String HTMLCanvasElement::ToDataURLInternal(
+@@ -1305,6 +1312,25 @@ String HTMLCanvasElement::ToDataURLInternal(
        return String("data:,");
  
      String data_url = data_buffer->ToDataURL(encoding_mime_type, quality);
@@ -27,12 +28,21 @@ index 40df4b3..2b75091 100644
 +                    mime_type.Utf8().c_str(), data_url.length());
 +      blink::afeye::EmitStr(blink::afeye::kFingerprint, blink::afeye::NowNs(),
 +                            afeye_buf);
++      char afeye_tag[96];
++      std::snprintf(afeye_tag, sizeof(afeye_tag),
++                    "canvas/to-data-url-data mime=%.40s",
++                    mime_type.Utf8().c_str());
++      std::string afeye_url = data_url.Utf8();
++      blink::afeye::EmitSpan(
++          blink::afeye::kFingerprint, blink::afeye::NowNs(), afeye_tag,
++          reinterpret_cast<const uint8_t*>(afeye_url.data()),
++          static_cast<uint32_t>(afeye_url.size()));
 +    }
 +#endif
      base::TimeDelta elapsed_time = base::TimeTicks::Now() - start_time;
      float sqrt_pixels =
          std::sqrt(image_bitmap->width()) * std::sqrt(image_bitmap->height());
-@@ -1364,6 +1380,16 @@ void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
+@@ -1364,6 +1390,16 @@ void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
                                 const String& mime_type,
                                 const ScriptValue& quality_argument,
                                 ExceptionState& exception_state) {
@@ -50,7 +60,7 @@ index 40df4b3..2b75091 100644
      exception_state.ThrowSecurityError("Tainted canvases may not be exported.");
      return;
 diff --git a/third_party/blink/renderer/core/timing/performance.cc b/third_party/blink/renderer/core/timing/performance.cc
-index 8bdad30..9d0a4ae 100644
+index 8bdad30..39d9e77 100644
 --- a/third_party/blink/renderer/core/timing/performance.cc
 +++ b/third_party/blink/renderer/core/timing/performance.cc
 @@ -31,6 +31,14 @@
@@ -68,7 +78,7 @@ index 8bdad30..9d0a4ae 100644
  #include <algorithm>
  #include <optional>
  
-@@ -1352,6 +1360,20 @@ DOMHighResTimeStamp Performance::MonotonicTimeToDOMHighResTimeStamp(
+@@ -1352,6 +1360,25 @@ DOMHighResTimeStamp Performance::MonotonicTimeToDOMHighResTimeStamp(
  }
  
  DOMHighResTimeStamp Performance::now() const {
@@ -80,9 +90,14 @@ index 8bdad30..9d0a4ae 100644
 +      return v != nullptr && *v != '\0' && v[0] == '0';
 +    }();
 +    if (!g_afeye_pnow_off &&
-+        g_afeye_pnow.fetch_add(1, std::memory_order_relaxed) < 2000000) {
++        blink::afeye::AfeyeCapConsume(&g_afeye_pnow, 2000000, "clock-now")) {
++      const double afeye_pnow_v =
++          MonotonicTimeToDOMHighResTimeStamp(base::TimeTicks::Now());
++      char afeye_buf[64];
++      std::snprintf(afeye_buf, sizeof(afeye_buf),
++                    "clock performance-now v=%.17g", afeye_pnow_v);
 +      blink::afeye::EmitStr(blink::afeye::kClock, blink::afeye::NowNs(),
-+                            "clock performance-now");
++                            afeye_buf);
 +    }
 +  }
 +#endif

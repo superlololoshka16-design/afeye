@@ -1,8 +1,8 @@
 diff --git a/third_party/blink/renderer/core/dom/document.cc b/third_party/blink/renderer/core/dom/document.cc
-index aeb4b0b..12e7366 100644
+index aeb4b0b..6a9c029 100644
 --- a/third_party/blink/renderer/core/dom/document.cc
 +++ b/third_party/blink/renderer/core/dom/document.cc
-@@ -29,6 +29,29 @@
+@@ -29,6 +29,31 @@
  
  #include "third_party/blink/renderer/core/dom/document.h"
  
@@ -15,16 +15,18 @@ index aeb4b0b..12e7366 100644
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +
 +namespace {
-+std::atomic<uint64_t> g_afeye_storage{0};
-+constexpr uint64_t kAfeyeStorageCap = 2ull << 20;
-+inline bool AfeyeStorageOn() {
++std::atomic<uint64_t> g_afeye_cookie_get{0};
++std::atomic<uint64_t> g_afeye_cookie_set{0};
++inline bool AfeyeStorageOff() {
 +  static const bool off = []() {
 +    const char* v = std::getenv("AFEYE_TRACE_STORAGE");
 +    return v && *v && v[0] == '0';
 +  }();
-+  return !off &&
-+         g_afeye_storage.fetch_add(1, std::memory_order_relaxed) <
-+             kAfeyeStorageCap;
++  return off;
++}
++inline bool AfeyeStorageOn(std::atomic<uint64_t>* ctr, const char* name) {
++  return !AfeyeStorageOff() &&
++         blink::afeye::AfeyeCapConsume(ctr, 2097152, name);
 +}
 +}
 +#endif
@@ -32,15 +34,15 @@ index aeb4b0b..12e7366 100644
  #include <algorithm>
  #include <memory>
  #include <optional>
-@@ -6844,7 +6867,22 @@ String Document::cookie(ExceptionState& exception_state) const {
+@@ -6844,7 +6869,22 @@ String Document::cookie(ExceptionState& exception_state) const {
      CountUse(WebFeature::kFileAccessedCookies);
    }
  
 -  return cookie_jar_->Cookies();
 +  String afeye_cookies = cookie_jar_->Cookies();
 +#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled() && AfeyeStorageOn() &&
-+      !afeye_cookies.empty()) {
++  if (blink::afeye::Enabled() && !afeye_cookies.empty() &&
++      AfeyeStorageOn(&g_afeye_cookie_get, "cookie-get")) {
 +    char afeye_tag[64];
 +    std::snprintf(afeye_tag, sizeof(afeye_tag), "cookie-get len=%u",
 +                  afeye_cookies.length());
@@ -56,13 +58,13 @@ index aeb4b0b..12e7366 100644
  }
  
  void Document::setCookie(const String& value, ExceptionState& exception_state) {
-@@ -6869,6 +6907,20 @@ void Document::setCookie(const String& value, ExceptionState& exception_state) {
+@@ -6869,6 +6909,20 @@ void Document::setCookie(const String& value, ExceptionState& exception_state) {
      UseCounter::Count(*this, WebFeature::kFileAccessedCookies);
    }
  
 +#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled() && AfeyeStorageOn() &&
-+      !value.empty()) {
++  if (blink::afeye::Enabled() && !value.empty() &&
++      AfeyeStorageOn(&g_afeye_cookie_set, "cookie-set")) {
 +    char afeye_tag[64];
 +    std::snprintf(afeye_tag, sizeof(afeye_tag), "cookie-set len=%u",
 +                  value.length());
@@ -78,10 +80,10 @@ index aeb4b0b..12e7366 100644
      IncrementCookieModificationCount();
    }
 diff --git a/third_party/blink/renderer/modules/storage/storage_area.cc b/third_party/blink/renderer/modules/storage/storage_area.cc
-index 131a62a..ed849bc 100644
+index 131a62a..7e41375 100644
 --- a/third_party/blink/renderer/modules/storage/storage_area.cc
 +++ b/third_party/blink/renderer/modules/storage/storage_area.cc
-@@ -25,6 +25,29 @@
+@@ -25,6 +25,31 @@
  
  #include "third_party/blink/renderer/modules/storage/storage_area.h"
  
@@ -94,16 +96,18 @@ index 131a62a..ed849bc 100644
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +
 +namespace {
-+std::atomic<uint64_t> g_afeye_storage{0};
-+constexpr uint64_t kAfeyeStorageCap = 2ull << 20;
-+inline bool AfeyeStorageOn() {
++std::atomic<uint64_t> g_afeye_storage_get{0};
++std::atomic<uint64_t> g_afeye_storage_set{0};
++inline bool AfeyeStorageOff() {
 +  static const bool off = []() {
 +    const char* v = std::getenv("AFEYE_TRACE_STORAGE");
 +    return v && *v && v[0] == '0';
 +  }();
-+  return !off &&
-+         g_afeye_storage.fetch_add(1, std::memory_order_relaxed) <
-+             kAfeyeStorageCap;
++  return off;
++}
++inline bool AfeyeStorageOn(std::atomic<uint64_t>* ctr, const char* name) {
++  return !AfeyeStorageOff() &&
++         blink::afeye::AfeyeCapConsume(ctr, 2097152, name);
 +}
 +}
 +#endif
@@ -111,14 +115,15 @@ index 131a62a..ed849bc 100644
  #include "base/feature_list.h"
  #include "base/memory/scoped_refptr.h"
  #include "base/trace_event/trace_event.h"
-@@ -116,7 +139,22 @@ String StorageArea::getItem(const String& key,
+@@ -116,7 +141,23 @@ String StorageArea::getItem(const String& key,
      exception_state.ThrowSecurityError(StorageArea::kAccessDeniedMessage);
      return String();
    }
 -  return cached_area_->GetItem(key);
 +  String afeye_item = cached_area_->GetItem(key);
 +#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled() && AfeyeStorageOn() && !key.empty()) {
++  if (blink::afeye::Enabled() && !key.empty() &&
++      AfeyeStorageOn(&g_afeye_storage_get, "storage-get")) {
 +    char afeye_tag[192];
 +    std::snprintf(afeye_tag, sizeof(afeye_tag),
 +                  "storage-get key=%.128s vlen=%u", key.Utf8().c_str(),
@@ -135,12 +140,13 @@ index 131a62a..ed849bc 100644
  }
  
  NamedPropertySetterResult StorageArea::setItem(
-@@ -127,6 +165,20 @@ NamedPropertySetterResult StorageArea::setItem(
+@@ -127,6 +168,21 @@ NamedPropertySetterResult StorageArea::setItem(
      exception_state.ThrowSecurityError(StorageArea::kAccessDeniedMessage);
      return NamedPropertySetterResult::kIntercepted;
    }
 +#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled() && AfeyeStorageOn() && !key.empty()) {
++  if (blink::afeye::Enabled() && !key.empty() &&
++      AfeyeStorageOn(&g_afeye_storage_set, "storage-set")) {
 +    char afeye_tag[192];
 +    std::snprintf(afeye_tag, sizeof(afeye_tag),
 +                  "storage-set key=%.128s vlen=%u", key.Utf8().c_str(),

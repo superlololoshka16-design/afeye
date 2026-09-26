@@ -1,31 +1,12 @@
 diff --git a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
-index b456ecc..448904d 100644
+index 8896206..d7e5b69 100644
 --- a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
 +++ b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
-@@ -29,6 +29,12 @@
-  */
- 
- #include "third_party/blink/renderer/modules/crypto/subtle_crypto.h"
-+#ifdef BLINK_AFEYE
-+#include <atomic>
-+#include <cstdio>
-+#include <cstdlib>
-+#include "third_party/blink/renderer/platform/afeye/sink.h"
-+#endif
- 
- #include "base/check_deref.h"
- #include "base/task/single_thread_task_runner.h"
-@@ -618,6 +624,31 @@ ScriptPromise<CryptoKey> SubtleCrypto::importKey(
+@@ -709,6 +709,27 @@ ScriptPromise<CryptoKey> SubtleCrypto::importKey(
  
    HistogramAlgorithm(ExecutionContext::From(script_state),
                       normalized_algorithm);
 +#ifdef BLINK_AFEYE
-+  // afeye 0036: importKey key material. The OUTPUT of every subtle op is
-+  // already captured by 0018 (CryptoResultImpl::CompleteWithBuffer); 0007
-+  // covers encrypt/decrypt/sign/digest/verify INPUT but not importKey/
-+  // deriveBits/deriveKey/wrapKey/unwrapKey (audit: deriveBits hunk dead).
-+  // key_data here is the exact std::vector<uint8_t> about to be moved into
-+  // the platform import - the real secret key bytes, byte-for-byte.
 +  if (blink::afeye::Enabled() && !key_data.empty()) {
 +    static std::atomic<uint64_t> g_afeye_keyin{0};
 +    static bool g_afeye_keyin_off = []() {
@@ -33,11 +14,13 @@ index b456ecc..448904d 100644
 +      return v != nullptr && *v != '\0' && v[0] == '0';
 +    }();
 +    if (!g_afeye_keyin_off &&
-+        g_afeye_keyin.fetch_add(1, std::memory_order_relaxed) < 200000) {
-+      char afeye_tag[96];
++        blink::afeye::AfeyeCapConsume(&g_afeye_keyin, 200000,
++                                      "crypto-keyin")) {
++      char afeye_tag[128];
 +      std::snprintf(afeye_tag, sizeof(afeye_tag),
-+                    "crypto-keyin importKey extractable=%d len=%zu",
-+                    extractable ? 1 : 0, key_data.size());
++                    "crypto-keyin importKey %s extractable=%d len=%zu",
++                    AfeyeAlgName(normalized_algorithm), extractable ? 1 : 0,
++                    key_data.size());
 +      blink::afeye::EmitSpan(
 +          blink::afeye::kCryptoOp, blink::afeye::NowNs(), afeye_tag,
 +          key_data.data(), static_cast<uint32_t>(key_data.size()));

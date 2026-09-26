@@ -344,6 +344,21 @@ pub fn first_stack_url(s: &str) -> Option<&str> {
     None
 }
 
+// CDP stack frames arrive as "fn@https://host/path.js:line[:col];..." -
+// one frame per ';' part, url after the LAST '@', :line[:col] stripped.
+fn parse_cdp_stack(s: &str) -> Vec<String> {
+    let mut stk = Vec::new();
+    for part in s.split(';') {
+        if let Some(at) = part.rfind('@') {
+            let u = strip_ln(&part[at + 1..]);
+            if u.len() > 10 {
+                stk.push(u.to_owned());
+            }
+        }
+    }
+    stk
+}
+
 fn blacklisted(host: &str) -> bool {
     BLACKLIST.iter().any(|s| host == *s || (host.len() > s.len() && host.ends_with(s) && host.as_bytes()[host.len() - s.len() - 1] == b'.'))
 }
@@ -496,14 +511,7 @@ fn collect_site(state: &mut SiteState, tl: &std::path::Path) {
                 let ty = d.get("ty").and_then(|x| x.as_str()).map(|s| s.to_owned());
                 let mut stk = Vec::new();
                 if let Some(s) = d.get("stk").and_then(|x| x.as_str()) {
-                    for part in s.split(';') {
-                        if let Some(at) = part.rfind('@') {
-                            let u = strip_ln(&part[at + 1..]);
-                            if u.len() > 10 {
-                                stk.push(u.to_owned());
-                            }
-                        }
-                    }
+                    stk = parse_cdp_stack(s);
                 }
                 if let Some(iu) = d.get("iniu").and_then(|x| x.as_str()) {
                     if iu.len() > 10 {
@@ -608,6 +616,52 @@ fn tainted_scripts(state: &SiteState) -> Vec<(String, Vec<String>)> {
     out
 }
 
+// Engine-fact bridge: the inject.rs JS harness that used to emit _th/stk:
+// tags is gone, so script_tags/body-taint can no longer be sourced from
+// CDP heuristics. The authoritative fact is the sinkfilter verdict: a
+// script whose chain is proven-causality / proven-value crossed a
+// boundary with antifraud data BY FACT (causality trace id or byte-exact
+// executed value). Load those script names from collect/filtered/report.json
+// and seed the taint set with them.
+fn proven_scripts(stage: &std::path::Path) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    let p = stage.join("collect").join("filtered").join("report.json");
+    let data = match std::fs::read(&p) {
+        Ok(d) => d,
+        Err(_) => return out,
+    };
+    let v: Value = match serde_json::from_slice(&data) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    let chains = match v.get("chains").and_then(|c| c.as_array()) {
+        Some(c) => c,
+        None => return out,
+    };
+    for ch in chains {
+        let verdict = ch.get("verdict").and_then(|x| x.as_str()).unwrap_or("");
+        if verdict != "proven-causality" && verdict != "proven-value" {
+            continue;
+        }
+        if let Some(name) = ch.get("name").and_then(|x| x.as_str()) {
+            if name.len() > 10 {
+                out.insert(strip_iso_prefix(name).to_owned());
+            }
+        }
+    }
+    out
+}
+
+fn strip_iso_prefix(name: &str) -> &str {
+    match name.strip_prefix("iso:") {
+        Some(rest) => match rest.find(' ') {
+            Some(sp) => &rest[sp + 1..],
+            None => rest,
+        },
+        None => name,
+    }
+}
+
 fn first_party(host: &str, site_host: &str) -> bool {
     host == site_host || (host.len() > site_host.len() && host.ends_with(site_host) && host.as_bytes()[host.len() - site_host.len() - 1] == b'.')
 }
@@ -621,7 +675,11 @@ fn push_once(ep: &mut HashMap<String, Ep>, k: &str, why: &str) {
 }
 
 fn verdict_site(state: &mut SiteState, stage: &std::path::Path, arts: &HashMap<String, std::path::PathBuf>, site_host: &str) {
-    let tainted: HashSet<String> = tainted_scripts(state).into_iter().map(|(u, _)| u).collect();
+    let mut tainted: HashSet<String> =
+        tainted_scripts(state).into_iter().map(|(u, _)| u).collect();
+    // engine-fact bridge: proven-causality/proven-value scripts from the
+    // sinkfilter report are antifraud BY FACT, not by kk-heuristic guess.
+    tainted.extend(proven_scripts(stage));
     let mut rid_art: HashMap<String, String> = HashMap::new();
     for (a, rid) in &state.art_bodies {
         rid_art.entry(rid.clone()).or_insert_with(|| a.clone());
@@ -1242,6 +1300,11 @@ fn run_mode(stage: &std::path::Path, mode: Mode) -> ClsOut {
                 continue;
             }
             let verdict = hash_verdict.get(&stem);
+            // Main prunes garbage/masked artifacts, Strict prunes everything
+            // that is not proven antifraud. The engine layer (collect/raw,
+            // bctrace, sinkfilter output) is never touched by this file - it
+            // only READS collect/filtered/report.json - so the full-fidelity
+            // telemetry stays intact either way.
             let remove = match verdict {
                 None => mode == Mode::Strict,
                 Some((2, true, _)) => true,
@@ -1371,7 +1434,7 @@ mod tests {
         assert!(entropy(json) < 5.0);
         let mut hi = Vec::new();
         for i in 0u32..4096 {
-            hi.push(((i.wrapping_mul(2654435761u32) >> 13) as u8));
+            hi.push((i.wrapping_mul(2654435761u32) >> 13) as u8);
         }
         assert!(entropy(&hi) > 6.5);
     }
@@ -1400,13 +1463,21 @@ mod tests {
     #[test]
     fn cdp_stack_parse() {
         let s = "collectFp@https://cdn.t.example/af.min.js:1;run@https://site.example/app.js:4";
-        let mut v = Vec::new();
-        for part in s.split(';') {
-            if let Some(at) = part.rfind('@') {
-                v.push(strip_ln(&part[at + 1..]).to_owned());
-            }
-        }
-        assert_eq!(v, vec!["https://cdn.t.example/af.min.js".to_owned(), "https://site.example/app.js".to_owned()]);
+        assert_eq!(
+            parse_cdp_stack(s),
+            vec![
+                "https://cdn.t.example/af.min.js".to_owned(),
+                "https://site.example/app.js".to_owned()
+            ]
+        );
+        // line:col both stripped; frames without '@' are not urls
+        assert_eq!(
+            parse_cdp_stack("f@https://a.example/x.js:3:17;native"),
+            vec!["https://a.example/x.js".to_owned()]
+        );
+        // short residue after stripping is rejected (>10 rule)
+        assert!(parse_cdp_stack("f@http://a.b:1:1").is_empty());
+        assert!(parse_cdp_stack("").is_empty());
     }
 
     #[test]

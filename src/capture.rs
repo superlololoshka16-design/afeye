@@ -1,12 +1,12 @@
 use crate::arena::fx64;
-use crate::ctx::{char_floor, vendor_of_stack, vendor_of_url, Cn, Ctx};
+use crate::ctx::{char_floor, vendor_of_url, Cn, Ctx};
 use crate::events::*;
-use crate::inject;
 use base64::Engine;
 use bytes::{BufMut, Bytes};
+use chromiumoxide::cdp::browser_protocol::dom::{GetDocumentParams, GetOuterHtmlParams};
+use chromiumoxide::cdp::browser_protocol::dom_storage::{GetDomStorageItemsParams, StorageId};
 use chromiumoxide::cdp::browser_protocol::network::*;
 use chromiumoxide::cdp::browser_protocol::page::*;
-use chromiumoxide::cdp::js_protocol::debugger::*;
 use chromiumoxide::cdp::js_protocol::runtime::*;
 use chromiumoxide::cdp::IntoEventKind;
 use chromiumoxide::Page;
@@ -15,14 +15,6 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 pub type Meta = Arc<DashMap<u64, (u8, bool)>>;
-
-#[derive(Clone)]
-pub struct Tab {
-    pub page: Page,
-    pub site: u32,
-    pub tun: u32,
-    pub tab: u32,
-}
 
 #[derive(Clone)]
 pub struct Tb {
@@ -108,12 +100,44 @@ fn storable(mime: &str, resource: &str) -> Option<u8> {
     if m.contains("text/plain") || m.contains("xml") || m.contains("svg") || m.contains("form-urlencoded") {
         return Some(E_TXT);
     }
+    // images: the crawler records every rendered/loaded image byte-for-byte
+    // and its hash. mime image/* or CDP resource type "Image" -> stored as
+    // E_BIN; on_fin's sniff() resolves the real format from magic bytes.
+    if m.starts_with("image/")
+        || m.contains("icon")
+        || resource == "Image"
+        || resource == "Media"
+        || resource == "Font"
+    {
+        return Some(E_BIN);
+    }
     None
 }
 
 fn sniff(b: &[u8]) -> u8 {
     if b.starts_with(&[0, b'a', b's', b'm']) {
         return E_WASM;
+    }
+    if b.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return E_PNG;
+    }
+    if b.starts_with(&[0xff, 0xd8, 0xff]) {
+        return E_JPG;
+    }
+    if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        return E_GIF;
+    }
+    if b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        return E_WEBP;
+    }
+    if b.starts_with(b"BM") {
+        return E_BMP;
+    }
+    if b.starts_with(&[0, 0, 1, 0]) {
+        return E_ICO;
+    }
+    if b.starts_with(&[0x77, 0x4f, 0x46]) || b.starts_with(&[0x4f, 0x54, 0x54, 0x4f]) {
+        return E_BIN;
     }
     let t = b
         .iter()
@@ -126,12 +150,25 @@ fn sniff(b: &[u8]) -> u8 {
     }
 }
 
+fn is_media(code: u8) -> bool {
+    // images + fonts + unknown binary draw from the separate media budget so
+    // a banner-heavy page can never starve the crown jewels (JS / POST
+    // bodies carrying tokens / JSON / WASM). critical = JS, WASM, JSON,
+    // HTML, CSS, TXT, POST.
+    matches!(code, E_BIN | E_PNG | E_JPG | E_GIF | E_WEBP | E_BMP | E_ICO)
+}
+
 fn post_art(ctx: &Ctx, code: u8, data: Vec<u8>) -> Option<([u8; 32], u64)> {
     let n = data.len() as u64;
     if n == 0 || n > 16_777_216 {
         return None;
     }
-    if ctx.budget.load(std::sync::atomic::Ordering::Relaxed) + n > ctx.budget_limit() {
+    let (counter, limit) = if is_media(code) {
+        (&ctx.img_budget, ctx.img_budget_limit())
+    } else {
+        (&ctx.budget, ctx.budget_limit())
+    };
+    if counter.load(std::sync::atomic::Ordering::Relaxed) + n > limit {
         let _ = Cn::inc(&ctx.cn.drop);
         return None;
     }
@@ -142,8 +179,7 @@ fn post_art(ctx: &Ctx, code: u8, data: Vec<u8>) -> Option<([u8; 32], u64)> {
         hash: hb,
         data: Bytes::from(data),
     });
-    ctx.budget.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-    let _ = Cn::inc(&ctx.cn.bin);
+    counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     Some((hb, n))
 }
 
@@ -177,28 +213,10 @@ fn hdrs(j: &mut J, k: &str, h: &Headers) {
 }
 
 pub async fn instrument(tb: Tb, url: &str) {
-    if let Err(e) = tb
-        .page
-        .execute(AddBindingParams::new(tb.ctx.binding.clone()))
-        .await
-    {
-        eprintln!("[afeye] addbinding: {e}");
-    }
-    if let Err(e) = tb
-        .page
-        .execute(AddScriptToEvaluateOnNewDocumentParams::new(inject::source(
-            &tb.ctx.binding,
-            tb.ctx.gl_spoof,
-        )))
-        .await
-    {
-        eprintln!("[afeye] addscript: {e}");
-    }
     {
         use chromiumoxide::cdp::browser_protocol::network::EnableParams as NEnable;
         use chromiumoxide::cdp::browser_protocol::page::EnableParams as PEnable;
         use chromiumoxide::cdp::browser_protocol::target::SetAutoAttachParams;
-        use chromiumoxide::cdp::js_protocol::debugger::EnableParams as DEnable;
         use chromiumoxide::cdp::js_protocol::runtime::EnableParams as REnable;
         if let Ok(p) = SetAutoAttachParams::builder()
             .flatten(true)
@@ -209,21 +227,13 @@ pub async fn instrument(tb: Tb, url: &str) {
             let _ = tb.page.execute(p).await;
         }
         let _ = tb.page.execute(NEnable::default()).await;
-        let _ = tb.page.execute(DEnable::default()).await;
         let _ = tb.page.execute(REnable::default()).await;
         let _ = tb.page.execute(PEnable::default()).await;
     }
     spawn_ev(&tb, on_req).await;
     spawn_ev(&tb, on_resp).await;
-    spawn_ev(&tb, on_rhdr).await;
-    spawn_ev(&tb, on_qhdr).await;
     spawn_ev(&tb, on_fin).await;
     spawn_ev(&tb, on_fail).await;
-    spawn_ev(&tb, on_wsc).await;
-    spawn_ev(&tb, on_wsf).await;
-    spawn_ev(&tb, on_wsr).await;
-    spawn_ev(&tb, on_script).await;
-    spawn_ev(&tb, on_bind).await;
     spawn_ev(&tb, on_console).await;
     spawn_ev(&tb, on_exc).await;
     spawn_ev(&tb, on_ctxt).await;
@@ -423,33 +433,11 @@ fn on_resp(tb: &Tb, e: Arc<EventResponseReceived>) {
     }
 }
 
-fn on_rhdr(tb: &Tb, e: Arc<EventResponseReceivedExtraInfo>) {
-    let mut j = J::new(256);
-    j.open();
-    j.fkey("rid");
-    j.s(e.request_id.as_ref());
-    j.key("ph");
-    j.s("resp_ex");
-    j.key("st");
-    j.i64v(e.status_code);
-    hdrs(&mut j, "h", &e.headers);
-    tb.emit(K_HDR, j.fin());
-}
-
-fn on_qhdr(tb: &Tb, e: Arc<EventRequestWillBeSentExtraInfo>) {
-    let mut j = J::new(256);
-    j.open();
-    j.fkey("rid");
-    j.s(e.request_id.as_ref());
-    j.key("ph");
-    j.s("req_ex");
-    hdrs(&mut j, "h", &e.headers);
-    tb.emit(K_HDR, j.fin());
-}
-
 fn on_fin(tb: &Tb, e: Arc<EventLoadingFinished>) {
-    let code = match tb.meta.get(&fx64(e.request_id.as_ref().as_bytes())) {
-        Some(g) => g.value().0,
+    // remove (not get): the meta entry is single-use, consumed here so the
+    // per-tab DashMap does not grow unbounded over a long crawl.
+    let code = match tb.meta.remove(&fx64(e.request_id.as_ref().as_bytes())) {
+        Some((_, (c, _))) => c,
         None => return,
     };
     let tb2 = tb.clone();
@@ -490,137 +478,10 @@ fn on_fin(tb: &Tb, e: Arc<EventLoadingFinished>) {
 }
 
 fn on_fail(tb: &Tb, e: Arc<EventLoadingFailed>) {
-    let mut j = J::new(160);
-    j.open();
-    j.fkey("rid");
-    j.s(e.request_id.as_ref());
-    j.key("err");
-    j.s(&e.error_text);
-    tb.emit(K_FAIL, j.fin());
-}
-
-fn on_wsc(tb: &Tb, e: Arc<EventWebSocketCreated>) {
-    let vendor = match vendor_of_url(&e.url) {
-        Some(v) => tb.ctx.interner.intern(v),
-        None => 0,
-    };
-    let mut j = J::new(256);
-    j.open();
-    j.fkey("rid");
-    j.s(e.request_id.as_ref());
-    j.key("f");
-    j.s("created");
-    j.key("u");
-    j.s(&e.url);
-    tb.emit_v(vendor, K_WS, j.fin());
-}
-
-fn on_wsf(tb: &Tb, e: Arc<EventWebSocketFrameSent>) {
-    ws_line(tb, &e.request_id, "sent", e.response.opcode, &e.response.payload_data);
-}
-
-fn on_wsr(tb: &Tb, e: Arc<EventWebSocketFrameReceived>) {
-    ws_line(tb, &e.request_id, "recv", e.response.opcode, &e.response.payload_data);
-}
-
-fn ws_line(tb: &Tb, rid: &RequestId, dir: &str, op: f64, payload: &str) {
-    let mut j = J::new(512);
-    j.open();
-    j.fkey("rid");
-    j.s(rid.as_ref());
-    j.key("f");
-    j.s(dir);
-    j.key("op");
-    j.f64v(op);
-    let n = payload.len();
-    j.key("n");
-    j.u64v(n as u64);
-    j.key("p");
-    j.s(&payload[..char_floor(payload, 2048)]);
-    tb.emit(K_WS, j.fin());
-}
-
-fn on_script(tb: &Tb, e: Arc<EventScriptParsed>) {
-    let _ = Cn::inc(&tb.ctx.cn.scripts);
-    let vendor = match vendor_of_url(&e.url) {
-        Some(v) => tb.ctx.interner.intern(v),
-        None => 0,
-    };
-    let mut j = J::new(256);
-    j.open();
-    j.fkey("sid");
-    j.s(e.script_id.as_ref());
-    j.key("u");
-    j.s(&e.url);
-    j.key("hl");
-    match e.length {
-        Some(l) => j.i64v(l),
-        None => j.b.put_slice(b"null"),
-    }
-    j.key("ch");
-    j.s(&e.hash);
-    tb.emit_v(vendor, K_SCRIPT, j.fin());
-    if e.url.starts_with("extensions://") {
-        return;
-    }
-    let tb2 = tb.clone();
-    let sid = e.script_id.clone();
-    let url = e.url[..char_floor(&e.url, 300)].to_owned();
-    tokio::spawn(async move {
-        let src = match tb2.page.execute(GetScriptSourceParams::new(sid.clone())).await {
-            Ok(x) => x.result.script_source,
-            Err(_) => return,
-        };
-        let wasm = url.starts_with("wasm://");
-        let code = if wasm { E_WASM } else { E_JS };
-        let raw: Vec<u8> = if wasm {
-            match base64::engine::general_purpose::STANDARD.decode(src) {
-                Ok(v) => v,
-                Err(_) => return,
-            }
-        } else {
-            src.into_bytes()
-        };
-        if raw.is_empty() {
-            return;
-        }
-        if let Some((h, n)) = post_art(&tb2.ctx, code, raw) {
-            let mut j = J::new(200);
-            j.open();
-            j.fkey("sid");
-            j.s(sid.as_ref());
-            j.key("u");
-            j.s(&url);
-            j.key("a");
-            j.hex(&h);
-            j.key("x");
-            j.s(code.ext());
-            j.key("n");
-            j.u64v(n);
-            tb2.emit_v(vendor, K_SRC, j.fin());
-        }
-    });
-}
-
-fn on_bind(tb: &Tb, e: Arc<EventBindingCalled>) {
-    if e.name != tb.ctx.binding {
-        return;
-    }
-    let _ = Cn::inc(&tb.ctx.cn.batch);
-    let pl = match Arc::try_unwrap(e) {
-        Ok(ev) => ev.payload,
-        Err(a) => a.payload.clone(),
-    };
-    let n = char_floor(&pl, 600);
-    let vendor = match vendor_of_stack(&pl[..n]) {
-        Some(v) => tb.ctx.interner.intern(v),
-        None => 0,
-    };
-    if vendor != 0 {
-        tb.emit_v(vendor, K_BATCH, Bytes::from(pl));
-    } else {
-        tb.emit(K_BATCH, Bytes::from(pl));
-    }
+    // A failed request never fires loadingFinished, so its meta entry (set in
+    // on_resp) would leak forever. Remove it here - the only job of this
+    // listener now; the K_FAIL timeline emission was dropped on purpose.
+    tb.meta.remove(&fx64(e.request_id.as_ref().as_bytes()));
 }
 
 fn on_console(tb: &Tb, e: Arc<EventConsoleApiCalled>) {
@@ -642,7 +503,8 @@ fn on_console(tb: &Tb, e: Arc<EventConsoleApiCalled>) {
                 s = v.to_string();
             }
         }
-        s.truncate(512);
+        let n = char_floor(&s, 512);
+        s.truncate(n);
         j.s(&s);
     }
     j.b.put_u8(b']');
@@ -725,48 +587,26 @@ fn on_load(tb: &Tb, _e: Arc<EventLoadEventFired>) {
     tb.emit(K_LIFE, j.fin());
 }
 
-async fn eval_str(page: &Page, expr: &str) -> Option<String> {
-    let r = page
-        .execute(
-            EvaluateParams::builder()
-                .expression(expr)
-                .return_by_value(true)
-                .build()
-                .ok()?,
-        )
-        .await
-        .ok()?;
-    match r.result.result.value {
-        Some(serde_json::Value::String(s)) => Some(s),
-        _ => None,
-    }
-}
-
-pub async fn eval_list(page: &Page) -> Vec<(f64, f64, String)> {
-    let expr = "(function(){try{var o=[],e=document.querySelectorAll('button:not([type=submit]),a[href],[role=button],[onclick],input:not([type=submit]):not([type=hidden]):not([type=checkbox]):not([type=radio]),select,textarea,[tabindex]:not([tabindex=-1])'),v=window.innerWidth||1280,h=window.innerHeight||800;for(var i=0;i<e.length&&o.length<40;i++){var r=e[i].getBoundingClientRect();if(r.width>4&&r.height>4&&r.bottom>0&&r.top<h&&r.right>0&&r.left<v){var s=document.defaultView.getComputedStyle(e[i]);if(s.visibility!=='hidden'&&s.display!=='none'&&!e[i].disabled){o.push([Math.round(r.x+r.width/2),Math.round(r.y+r.height/2),e[i].tagName])}}}return JSON.stringify(o)}catch(x){return '[]'}})()";
-    match tokio::time::timeout(std::time::Duration::from_secs(3), eval_str(page, expr)).await {
-        Ok(Some(s)) => serde_json::from_str(&s).unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
 pub async fn finalize(tb: &Tb) {
     let site_n = tb.ctx.interner.resolve(tb.site);
     let tun_n = tb.ctx.interner.resolve(tb.tun);
     let t_short = std::time::Duration::from_secs(5);
-    if let Ok(Some(html)) = tokio::time::timeout(
-        t_short,
-        eval_str(
-            &tb.page,
-            "(function(){try{return document.documentElement.outerHTML}catch(x){return ''}})()",
-        ),
-    )
-    .await
-    {
-        tb.file(
-            &format!("sites/{}/tunnels/{}/tabs/{}.final.html", site_n, tun_n, tb.tab),
-            html.into_bytes(),
-        );
+    let doc = GetDocumentParams::builder().depth(-1).pierce(false).build();
+    let root_id = match tokio::time::timeout(t_short, tb.page.execute(doc)).await {
+        Ok(Ok(r)) => Some(r.result.root.node_id),
+        _ => None,
+    };
+    if let Some(nid) = root_id {
+        let oh = GetOuterHtmlParams::builder().node_id(nid).build();
+        if let Ok(Ok(r)) = tokio::time::timeout(t_short, tb.page.execute(oh)).await {
+            let html = r.result.outer_html;
+            if !html.is_empty() {
+                tb.file(
+                    &format!("sites/{}/tunnels/{}/tabs/{}.final.html", site_n, tun_n, tb.tab),
+                    html.into_bytes(),
+                );
+            }
+        }
     }
     let p = CaptureScreenshotParams::builder()
         .format(CaptureScreenshotFormat::Png)
@@ -782,21 +622,55 @@ pub async fn finalize(tb: &Tb) {
     if let Ok(Ok(cookies)) = tokio::time::timeout(t_short, tb.page.get_cookies()).await {
         let mut buf = Vec::with_capacity(4096);
         if serde_json::to_writer_pretty(&mut buf, &cookies).is_ok() {
-            tb.file(&format!("sites/{}/tunnels/{}/cookies.json", site_n, tun_n), buf);
+            tb.file(
+                &format!("sites/{}/tunnels/{}/cookies.json", site_n, tun_n),
+                buf,
+            );
         }
     }
-    if let Ok(Some(st)) = tokio::time::timeout(
-        t_short,
-        eval_str(
-            &tb.page,
-            "(function(){try{return JSON.stringify([location.href,Array.from(Object.entries(localStorage)),Array.from(Object.entries(sessionStorage))])}catch(x){return '[]'}})()",
-        ),
-    )
-    .await
-    {
-        tb.file(
-            &format!("sites/{}/tunnels/{}/tabs/{}.storage.json", site_n, tun_n, tb.tab),
-            st.into_bytes(),
-        );
+    let origin = match tokio::time::timeout(t_short, tb.page.url()).await {
+        Ok(Ok(Some(u))) => u,
+        _ => return,
+    };
+    let scheme_end = origin.find("://").map(|i| i + 3).unwrap_or(0);
+    let security_origin = origin[scheme_end..]
+        .find('/')
+        .map(|i| &origin[..scheme_end + i])
+        .unwrap_or(&origin[..]);
+    let mut store = serde_json::Map::new();
+    for (name, local) in [("localStorage", true), ("sessionStorage", false)] {
+        let sid = StorageId::builder()
+            .security_origin(security_origin.to_owned())
+            .is_local_storage(local)
+            .build();
+        let sid = match sid {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if let Ok(Ok(r)) =
+            tokio::time::timeout(t_short, tb.page.execute(GetDomStorageItemsParams::new(sid))).await
+        {
+            let mut items = serde_json::Map::new();
+            for it in &r.result.entries {
+                let v = it.inner();
+                for kv in v.chunks(2) {
+                    if kv.len() == 2 {
+                        items.insert(kv[0].clone(), serde_json::Value::String(kv[1].clone()));
+                    }
+                }
+            }
+            store.insert(name.to_owned(), serde_json::Value::Object(items));
+        }
+    }
+    if !store.is_empty() {
+        let mut doc = serde_json::Map::new();
+        doc.insert("url".into(), serde_json::Value::String(origin));
+        doc.insert("storage".into(), serde_json::Value::Object(store));
+        if let Ok(b) = serde_json::to_vec_pretty(&doc) {
+            tb.file(
+                &format!("sites/{}/tunnels/{}/tabs/{}.storage.json", site_n, tun_n, tb.tab),
+                b,
+            );
+        }
     }
 }

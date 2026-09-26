@@ -35,10 +35,10 @@ index 9bfa956..8311aa5 100644
        "-mlsx",
 diff --git a/third_party/blink/renderer/platform/afeye/sink.cc b/third_party/blink/renderer/platform/afeye/sink.cc
 new file mode 100644
-index 0000000..1e6d75f
+index 0000000..6da6634
 --- /dev/null
 +++ b/third_party/blink/renderer/platform/afeye/sink.cc
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,356 @@
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +
 +#ifdef BLINK_AFEYE
@@ -66,6 +66,19 @@ index 0000000..1e6d75f
 +#include <sys/types.h>
 +#include <time.h>
 +#include <unistd.h>
++
++#if defined(__has_include)
++#if __has_include("v8/include/v8-isolate.h")
++#include "v8/include/v8-isolate.h"
++#include "v8/include/v8-local-handle.h"
++#include "v8/include/v8-stacktrace.h"
++#define AFEYE_HAVE_V8_PUBLIC 1
++#endif
++#endif
++
++#ifdef AFEYE_HAVE_V8_PUBLIC
++extern "C" uint64_t afeye_causality_ambient(void);
++#endif
 +
 +namespace blink {
 +namespace afeye {
@@ -125,21 +138,42 @@ index 0000000..1e6d75f
 +  }
 +}
 +
++void AfeyeFillAttrs(uint8_t* rec, uint8_t kind) {
++  std::memset(rec + 6, 0, 10);
++  if (kind == kSinkDrop || kind == 40) return;
++#ifdef AFEYE_HAVE_V8_PUBLIC
++  v8::Isolate* iso = v8::Isolate::GetCurrent();
++  if (iso == nullptr) return;
++  uint32_t sid = 0;
++  {
++    v8::HandleScope handle_scope(iso);
++    v8::Local<v8::StackTrace> stack = v8::StackTrace::CurrentStackTrace(
++        iso, 1, v8::StackTrace::kScriptId);
++    if (stack->GetFrameCount() > 0) {
++      sid = static_cast<uint32_t>(stack->GetFrame(iso, 0)->ScriptId());
++    }
++  }
++  const uint16_t tid =
++      static_cast<uint16_t>(afeye_causality_ambient() & 0xffff);
++  std::memcpy(rec + 6, &sid, sizeof(sid));
++  std::memcpy(rec + 10, &tid, sizeof(tid));
++#endif
++}
++
 +void EmitHello(int fd) {
 +  char msg[96];
 +  int n = std::snprintf(msg, sizeof(msg), "afeye-sink/%s v2 pid=%d", kLayer,
 +                        static_cast<int>(::getpid()));
 +  if (n <= 0) return;
-+  uint8_t rec[16 + 96];
-+  uint32_t total = 16 + static_cast<uint32_t>(n);
++  uint8_t rec[24 + 96];
++  uint32_t total = 24 + static_cast<uint32_t>(n);
 +  std::memcpy(rec, &total, sizeof(total));
 +  rec[4] = 0;
 +  rec[5] = 0;
-+  rec[6] = 0;
-+  rec[7] = 0;
++  std::memset(rec + 6, 0, 10);
 +  uint64_t ts = MonoNs();
-+  std::memcpy(rec + 8, &ts, sizeof(ts));
-+  std::memcpy(rec + 16, msg, static_cast<size_t>(n));
++  std::memcpy(rec + 16, &ts, sizeof(ts));
++  std::memcpy(rec + 24, msg, static_cast<size_t>(n));
 +  WriteAll(fd, rec, total);
 +}
 +
@@ -165,7 +199,7 @@ index 0000000..1e6d75f
 +      uint32_t len32;
 +      std::memcpy(&len32, g_ring.data + g_ring.tail, sizeof(len32));
 +      len = len32;
-+      if (len < 16 || len > kMaxRecord) {
++      if (len < 24 || len > kMaxRecord) {
 +        g_ring.tail = g_ring.head;
 +      } else {
 +        std::memcpy(buf.data(), g_ring.data + g_ring.tail, len);
@@ -238,11 +272,11 @@ index 0000000..1e6d75f
 +               uint32_t len) {
 +  if (!g_on.load(std::memory_order_acquire)) return;
 +  if (data == nullptr || len == 0) return;
-+  if (len > kMaxRecord - 16) {
-+    len = kMaxRecord - 16;
++  if (len > kMaxRecord - 24) {
++    len = kMaxRecord - 24;
 +    flags |= 1;
 +  }
-+  const size_t need = 16 + static_cast<size_t>(len);
++  const size_t need = 24 + static_cast<size_t>(len);
 +  while (g_ring.lock.test_and_set(std::memory_order_acquire)) {
 +  }
 +  const size_t h = g_ring.head;
@@ -258,10 +292,9 @@ index 0000000..1e6d75f
 +  std::memcpy(rec, &total, sizeof(total));
 +  rec[4] = kind;
 +  rec[5] = flags;
-+  rec[6] = 0;
-+  rec[7] = 0;
-+  std::memcpy(rec + 8, &ts_ns, sizeof(ts_ns));
-+  std::memcpy(rec + 16, data, len);
++  AfeyeFillAttrs(rec, kind);
++  std::memcpy(rec + 16, &ts_ns, sizeof(ts_ns));
++  std::memcpy(rec + 24, data, len);
 +  size_t nh = h + need;
 +  if (nh >= kRingBytes) nh -= kRingBytes;
 +  g_ring.head = nh;
@@ -282,7 +315,7 @@ index 0000000..1e6d75f
 +  size_t la = std::strlen(a);
 +  size_t lb = std::strlen(b);
 +  bool trunc = false;
-+  const size_t kCap = kMaxRecord - 17;
++  const size_t kCap = kMaxRecord - 25;
 +  if (la > kCap) {
 +    la = kCap;
 +    trunc = true;
@@ -307,7 +340,7 @@ index 0000000..1e6d75f
 +  size_t lt = std::strlen(tag);
 +  if (lt > 64) lt = 64;
 +  bool trunc = false;
-+  if (n > kSpanCap) {
++  if (n >= kSpanCap) {
 +    n = kSpanCap;
 +    trunc = true;
 +  }
@@ -364,10 +397,10 @@ index 0000000..1e6d75f
 +#endif
 diff --git a/third_party/blink/renderer/platform/afeye/sink.h b/third_party/blink/renderer/platform/afeye/sink.h
 new file mode 100644
-index 0000000..00c61df
+index 0000000..87779fe
 --- /dev/null
 +++ b/third_party/blink/renderer/platform/afeye/sink.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,72 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
 +#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_AFEYE_SINK_H_
 +
@@ -376,6 +409,7 @@ index 0000000..00c61df
 +
 +#ifdef BLINK_AFEYE
 +#include <atomic>
++#include <cstdio>
 +
 +namespace blink {
 +namespace afeye {
@@ -403,6 +437,7 @@ index 0000000..00c61df
 +  kWorker = 35,
 +  kNavStart = 36,
 +  kTaintEdge = 37,
++  kSinkDrop = 39,
 +};
 +
 +bool Enabled();
@@ -417,6 +452,18 @@ index 0000000..00c61df
 +uint64_t SinkDropped();
 +extern std::atomic<uint64_t> g_afeye_taint;
 +bool Flush(uint32_t timeout_ms);
++
++inline bool AfeyeCapConsume(std::atomic<uint64_t>* ctr, uint64_t cap,
++                            const char* name) {
++  const uint64_t old = ctr->fetch_add(1, std::memory_order_relaxed);
++  if (old == cap) {
++    char msg[128];
++    std::snprintf(msg, sizeof(msg), "cap-exhausted name=%s limit=%llu", name,
++                  static_cast<unsigned long long>(cap));
++    EmitStr(kSinkDrop, NowNs(), msg);
++  }
++  return old < cap;
++}
 +void SetTag(const char* s);
 +const char* Tag();
 +

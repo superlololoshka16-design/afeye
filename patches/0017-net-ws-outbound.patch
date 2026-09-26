@@ -1,8 +1,8 @@
 diff --git a/services/network/websocket.cc b/services/network/websocket.cc
-index 89673ec..697c6df 100644
+index 89673ec..1927bdd 100644
 --- a/services/network/websocket.cc
 +++ b/services/network/websocket.cc
-@@ -1001,6 +1001,17 @@ bool WebSocket::ReadAndSendFrameFromDataPipe(DataFrame* data_frame) {
+@@ -1001,6 +1001,15 @@ bool WebSocket::ReadAndSendFrameFromDataPipe(DataFrame* data_frame) {
        if (bytes_reassembled_ == data_frame->data_length) {
          bytes_reassembled_ = 0;
          blocked_on_websocket_channel_ = true;
@@ -12,15 +12,13 @@ index 89673ec..697c6df 100644
 +              network::afeye::kWebSocket, network::afeye::NowNs(),
 +              "ws-frame-out",
 +              message_under_reassembly_->bytes(),
-+              static_cast<uint32_t>(data_frame->data_length > 0x40000
-+                                        ? 0x40000
-+                                        : data_frame->data_length));
++              static_cast<uint32_t>(data_frame->data_length));
 +        }
 +#endif
          if (channel_->SendFrame(
                  /*fin=*/true, MessageTypeToOpCode(data_frame->type),
                  std::move(message_under_reassembly_),
-@@ -1020,6 +1031,15 @@ bool WebSocket::ReadAndSendFrameFromDataPipe(DataFrame* data_frame) {
+@@ -1020,6 +1029,14 @@ bool WebSocket::ReadAndSendFrameFromDataPipe(DataFrame* data_frame) {
      auto data_to_pass =
          base::MakeRefCounted<net::IOBufferWithSize>(size_to_send);
      data_to_pass->span().copy_prefix_from(buffer.first(size_to_send));
@@ -29,8 +27,7 @@ index 89673ec..697c6df 100644
 +      network::afeye::EmitSpan(
 +          network::afeye::kWebSocket, network::afeye::NowNs(), "ws-frame-out",
 +          data_to_pass->bytes(),
-+          static_cast<uint32_t>(size_to_send > 0x40000 ? 0x40000
-+                                                       : size_to_send));
++          static_cast<uint32_t>(size_to_send));
 +    }
 +#endif
  

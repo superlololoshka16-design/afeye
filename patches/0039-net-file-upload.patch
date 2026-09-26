@@ -1,8 +1,8 @@
 diff --git a/services/network/url_loader.cc b/services/network/url_loader.cc
-index 1720130..9364a3e 100644
+index e1d5bb7..5fef7c1 100644
 --- a/services/network/url_loader.cc
 +++ b/services/network/url_loader.cc
-@@ -683,6 +683,68 @@ void URLLoader::SetUpUpload(
+@@ -685,6 +685,68 @@ void URLLoader::SetUpUpload(
    url_request_->set_upload(url_loader_util::CreateUploadDataStream(
        request.request_body.get(), file_open_result.value(), task_runner.get()));
  

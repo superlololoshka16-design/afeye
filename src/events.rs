@@ -45,10 +45,17 @@ pub const E_HTML: u8 = 3;
 pub const E_CSS: u8 = 4;
 pub const E_TXT: u8 = 5;
 pub const E_BIN: u8 = 6;
+pub const E_PNG: u8 = 7;
 pub const E_POST: u8 = 8;
+pub const E_JPG: u8 = 9;
+pub const E_GIF: u8 = 10;
+pub const E_WEBP: u8 = 11;
+pub const E_BMP: u8 = 12;
+pub const E_ICO: u8 = 13;
 
-pub const EXT: [&str; 9] = [
-    "js", "wasm", "json", "html", "css", "txt", "bin", "png", "post",
+pub const EXT: [&str; 14] = [
+    "js", "wasm", "json", "html", "css", "txt", "bin", "png", "post", "jpg",
+    "gif", "webp", "bmp", "ico",
 ];
 
 #[repr(C, align(64))]
@@ -223,6 +230,10 @@ mod tests {
     fn ext_map() {
         assert_eq!(E_JS.ext(), "js");
         assert_eq!(E_WASM.ext(), "wasm");
-        assert_eq!(9u8.ext(), "post");
+        assert_eq!(E_POST.ext(), "post");
+        assert_eq!(E_PNG.ext(), "png");
+        assert_eq!(E_JPG.ext(), "jpg");
+        assert_eq!(E_WEBP.ext(), "webp");
+        assert_eq!(E_ICO.ext(), "ico");
     }
 }

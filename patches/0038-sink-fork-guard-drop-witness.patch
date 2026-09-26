@@ -1,78 +1,109 @@
 diff --git a/services/network/afeye_sink.cc b/services/network/afeye_sink.cc
-index 7e5ec4b..face50a 100644
+index 66c5ddb..91389bf 100644
 --- a/services/network/afeye_sink.cc
 +++ b/services/network/afeye_sink.cc
-@@ -166,7 +166,9 @@ void DrainLoop() {
-     } else {
-       std::this_thread::sleep_for(std::chrono::microseconds(500));
-     }
--    const uint64_t now_dropped = g_dropped.load(std::memory_order_relaxed);
-+    // witness must match SinkDropped() = g_dropped + g_write_err (see v8).
-+    const uint64_t now_dropped = g_dropped.load(std::memory_order_relaxed) +
-+                                 g_write_err.load(std::memory_order_relaxed);
-     if (now_dropped != reported_drops) {
-       const uint64_t now_ns = MonoNs();
-       if (now_ns - last_report_ns >= 100ull * 1000ull * 1000ull) {
-@@ -181,6 +183,14 @@ void DrainLoop() {
+@@ -201,10 +201,32 @@ void DrainLoop() {
  }
  
  void ReinitAfterFork() {
 +  if (!g_on.load(std::memory_order_acquire)) {
-+    // Sink disabled: adopt the new pid but do NOT spawn a drain thread
-+    // (guard parity with blink 0005; net lacked it - every fork with the
-+    // sink off spawned a DrainLoop that opened a .rec and emitted
-+    // sink-hello, poisoning the sink_alive capture-integrity check).
 +    g_pid.store(::getpid(), std::memory_order_release);
 +    return;
 +  }
    g_ring.lock.clear(std::memory_order_release);
++  const int parent_fd = g_report_fd.load(std::memory_order_relaxed);
++  if (parent_fd >= 0) {
++    const auto deadline = std::chrono::steady_clock::now() +
++                          std::chrono::milliseconds(100);
++    while (g_ring.tail != g_ring.head &&
++           std::chrono::steady_clock::now() < deadline) {
++      uint32_t len32;
++      std::memcpy(&len32, g_ring.data + g_ring.tail, sizeof(len32));
++      if (len32 < 24 || len32 > kMaxRecord) break;
++      WriteAll(parent_fd, g_ring.data + g_ring.tail, len32);
++      size_t nt = g_ring.tail + len32;
++      if (nt >= kRingBytes) nt -= kRingBytes;
++      g_ring.tail = nt;
++    }
++    WriteDropReport(parent_fd, g_dropped.load(std::memory_order_relaxed),
++                    g_write_err.load(std::memory_order_relaxed));
++    ::close(parent_fd);
++    g_report_fd.store(-1, std::memory_order_relaxed);
++  }
    g_ring.tail = 0;
    g_ring.head = 0;
+-  g_dropped.store(0, std::memory_order_relaxed);
+   g_pid.store(::getpid(), std::memory_order_release);
+   std::thread(DrainLoop).detach();
+ }
 diff --git a/third_party/blink/renderer/platform/afeye/sink.cc b/third_party/blink/renderer/platform/afeye/sink.cc
-index 6f02cd0..95bb5e5 100644
+index 4714800..f472ad4 100644
 --- a/third_party/blink/renderer/platform/afeye/sink.cc
 +++ b/third_party/blink/renderer/platform/afeye/sink.cc
-@@ -172,7 +172,9 @@ void DrainLoop() {
-     } else {
-       std::this_thread::sleep_for(std::chrono::microseconds(500));
-     }
--    const uint64_t now_dropped = g_dropped.load(std::memory_order_relaxed);
-+    // witness must match SinkDropped() = g_dropped + g_write_err (see v8).
-+    const uint64_t now_dropped = g_dropped.load(std::memory_order_relaxed) +
-+                                 g_write_err.load(std::memory_order_relaxed);
-     if (now_dropped != reported_drops) {
-       const uint64_t now_ns = MonoNs();
-       if (now_ns - last_report_ns >= 100ull * 1000ull * 1000ull) {
+@@ -260,9 +260,27 @@ void ReinitAfterFork() {
+     return;
+   }
+   g_ring.lock.clear(std::memory_order_release);
++  const int parent_fd = g_report_fd.load(std::memory_order_relaxed);
++  if (parent_fd >= 0) {
++    const auto deadline = std::chrono::steady_clock::now() +
++                          std::chrono::milliseconds(100);
++    while (g_ring.tail != g_ring.head &&
++           std::chrono::steady_clock::now() < deadline) {
++      uint32_t len32;
++      std::memcpy(&len32, g_ring.data + g_ring.tail, sizeof(len32));
++      if (len32 < 24 || len32 > kMaxRecord) break;
++      WriteAll(parent_fd, g_ring.data + g_ring.tail, len32);
++      size_t nt = g_ring.tail + len32;
++      if (nt >= kRingBytes) nt -= kRingBytes;
++      g_ring.tail = nt;
++    }
++    WriteDropReport(parent_fd, g_dropped.load(std::memory_order_relaxed),
++                    g_write_err.load(std::memory_order_relaxed));
++    ::close(parent_fd);
++    g_report_fd.store(-1, std::memory_order_relaxed);
++  }
+   g_ring.tail = 0;
+   g_ring.head = 0;
+-  g_dropped.store(0, std::memory_order_relaxed);
+   g_pid.store(::getpid(), std::memory_order_release);
+   std::thread(DrainLoop).detach();
+ }
 diff --git a/v8/src/afeye/sink.cc b/v8/src/afeye/sink.cc
-index b1b5c68..9456473 100644
+index 20af87d..ee40e58 100644
 --- a/v8/src/afeye/sink.cc
 +++ b/v8/src/afeye/sink.cc
-@@ -167,7 +167,11 @@ void DrainLoop() {
-     } else {
-       std::this_thread::sleep_for(std::chrono::microseconds(500));
-     }
--    const uint64_t now_dropped = g_dropped.load(std::memory_order_relaxed);
-+    // witness must match SinkDropped() = g_dropped + g_write_err; counting
-+    // only g_dropped under-reported fd-write failures, so dead_end_proven
-+    // (sinkfilter) trusted an incomplete completeness witness.
-+    const uint64_t now_dropped = g_dropped.load(std::memory_order_relaxed) +
-+                                 g_write_err.load(std::memory_order_relaxed);
-     if (now_dropped != reported_drops) {
-       const uint64_t now_ns = MonoNs();
-       if (now_ns - last_report_ns >= 100ull * 1000ull * 1000ull) {
-@@ -182,6 +186,15 @@ void DrainLoop() {
+@@ -239,10 +239,32 @@ void DrainLoop() {
  }
  
  void ReinitAfterFork() {
 +  if (!g_on.load(std::memory_order_acquire)) {
-+    // Sink disabled: adopt the new pid but do NOT spawn a drain thread.
-+    // Without this guard every fork re-armed DrainLoop, which opens a
-+    // .rec and emits sink-hello even with AFEYE_SINK unset - poisoning
-+    // the sink_alive capture-integrity check (false "afeye-patched").
-+    // Mirrors the blink sink guard (0005).
 +    g_pid.store(::getpid(), std::memory_order_release);
 +    return;
 +  }
    g_ring.lock.clear(std::memory_order_release);
++  const int parent_fd = g_report_fd.load(std::memory_order_relaxed);
++  if (parent_fd >= 0) {
++    const auto deadline = std::chrono::steady_clock::now() +
++                          std::chrono::milliseconds(100);
++    while (g_ring.tail != g_ring.head &&
++           std::chrono::steady_clock::now() < deadline) {
++      uint32_t len32;
++      std::memcpy(&len32, g_ring.data + g_ring.tail, sizeof(len32));
++      if (len32 < 24 || len32 > kMaxRecord) break;
++      WriteAll(parent_fd, g_ring.data + g_ring.tail, len32);
++      size_t nt = g_ring.tail + len32;
++      if (nt >= kRingBytes) nt -= kRingBytes;
++      g_ring.tail = nt;
++    }
++    WriteDropReport(parent_fd, g_dropped.load(std::memory_order_relaxed),
++                    g_write_err.load(std::memory_order_relaxed));
++    ::close(parent_fd);
++    g_report_fd.store(-1, std::memory_order_relaxed);
++  }
    g_ring.tail = 0;
    g_ring.head = 0;
+-  g_dropped.store(0, std::memory_order_relaxed);
+   g_pid.store(::getpid(), std::memory_order_release);
+   std::thread(DrainLoop).detach();
+ }

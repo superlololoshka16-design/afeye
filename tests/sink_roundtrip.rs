@@ -162,6 +162,61 @@ fn sink_patch_roundtrip_is_byte_exact() {
         );
     }
 
+    // 2b. WIRE v3 raw bytes: every .rec is a stream of 24-byte-header
+    // records - [u32 total][u8 kind][u8 flags][u32 sid][u16 tid]
+    // [u32 rsv][u64 ts_ns][payload] - and the first record of each layer
+    // is its sink-hello carrying "afeye-sink/<layer> v2 pid=".
+    for name in ["v8", "blink", "net"] {
+        let mut recs: Vec<std::path::PathBuf> = std::fs::read_dir(&raw)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(&format!("{name}-")) && n.ends_with(".rec"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(recs.len(), 1, "exactly one {name}-<pid>.rec");
+        let buf = std::fs::read(recs.pop().unwrap()).unwrap();
+        let mut off = 0usize;
+        let mut n_recs = 0usize;
+        let mut saw_hello = false;
+        while off + 24 <= buf.len() {
+            let total = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+            let kind = buf[off + 4];
+            let flags = buf[off + 5];
+            let _sid = u32::from_le_bytes([buf[off + 6], buf[off + 7], buf[off + 8], buf[off + 9]]);
+            let _tid = u16::from_le_bytes([buf[off + 10], buf[off + 11]]);
+            let rsv = u32::from_le_bytes([buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15]]);
+            let ts = u64::from_le_bytes([
+                buf[off + 16], buf[off + 17], buf[off + 18], buf[off + 19],
+                buf[off + 20], buf[off + 21], buf[off + 22], buf[off + 23],
+            ]);
+            assert!(total >= 24, "{name}: total {total} < 24 at {off}");
+            assert!(total <= 24 + (1 << 20), "{name}: total {total} over cap");
+            assert!(kind <= 40, "{name}: kind {kind} > 40");
+            assert!(flags <= 1, "{name}: flags {flags} > 1");
+            assert_eq!(rsv, 0, "{name}: reserved nonzero at {off}");
+            assert!(ts > 0, "{name}: zero ts at {off}");
+            assert!(off + total <= buf.len(), "{name}: record overruns file");
+            if n_recs == 0 {
+                let payload = &buf[off + 24..off + total];
+                assert_eq!(kind, 0, "{name}: first record is not sink-hello");
+                assert!(
+                    payload.starts_with(format!("afeye-sink/{name} v2 pid=").as_bytes()),
+                    "{name}: hello payload {payload:?} at wire offset 24"
+                );
+                saw_hello = true;
+            }
+            off += total;
+            n_recs += 1;
+        }
+        assert!(saw_hello, "{name}: no sink-hello");
+        assert_eq!(off, buf.len(), "{name}: {off} of {} bytes consumed", buf.len());
+        assert!(n_recs >= 2, "{name}: only {n_recs} records");
+    }
+
     // 3. drain: poll until BATTERY-END shows up through the collector.
     let mut state = ScanState::new();
     let mut stats = Stats::default();
@@ -224,14 +279,14 @@ fn sink_patch_roundtrip_is_byte_exact() {
     assert_eq!(read_bin("\"k\":\"wasm-module\""), expected_wasm);
     assert_eq!(read_bin("BATTERY-END"), b"BATTERY-END");
 
-    // truncated record: 2 MiB input capped to kMaxRecord-16 with flag 1.
+    // truncated record: 2 MiB input capped to kMaxRecord-24 with flag 1.
     let trunc_line = lines
         .iter()
         .find(|l| l.contains("\"k\":\"script-source\"") && l.contains("\"f\":1"))
         .expect("truncated script-source record");
     let p = trunc_line.split("\"p\":\"").nth(1).unwrap().split('"').next().unwrap();
     let trunc_bin = std::fs::read(collect_out.join(p)).unwrap();
-    assert_eq!(trunc_bin.len(), (1 << 20) - 16);
+    assert_eq!(trunc_bin.len(), (1 << 20) - 24);
     assert!(trunc_bin.iter().all(|&b| b == b'B'));
 
     // storm integrity: every (tid,i) tuple survived the ring + file drain.

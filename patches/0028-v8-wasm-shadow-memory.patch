@@ -1,16 +1,15 @@
 diff --git a/v8/BUILD.gn b/v8/BUILD.gn
-index 6f63a62..ad1e764 100644
+index 6f63a62..8f64ee1 100644
 --- a/v8/BUILD.gn
 +++ b/v8/BUILD.gn
-@@ -7075,6 +7075,13 @@ v8_cluster_source_set("v8_base_without_compiler") {
+@@ -7075,6 +7075,12 @@ v8_cluster_source_set("v8_base_without_compiler") {
        # 0032 (SocketSinkGC): GC-collected-without-sink dead-end witness.
        "src/afeye/gc_witness.cc",
        "src/afeye/gc_witness.h",
-+      # 0028 (WasmShadow): 1:1 taint SHADOW MEMORY for every wasm linear
-+      # memory - one tag byte per memory byte, propagated by emitted code at
-+      # every Load/Store/atomic/bulk-op site so a fingerprint byte that entered
-+      # linear memory is still identified when it leaves, across pure-wasm
-+      # transforms the boundary sieve never sees.
++      # 0028 (WasmShadow): per-byte MOTION shadow for every wasm linear
++      # memory - one marker byte per memory byte, set by emitted code at
++      # every Load/Store/atomic/bulk-op site. Records the FACT that bytes
++      # moved (write/read-after-write/copy/fill/init), not a taint label.
 +      "src/afeye/wasm_shadow.cc",
 +      "src/afeye/wasm_shadow.h",
      ]
@@ -18,10 +17,10 @@ index 6f63a62..ad1e764 100644
    }
 diff --git a/v8/src/afeye/wasm_shadow.cc b/v8/src/afeye/wasm_shadow.cc
 new file mode 100644
-index 0000000..b54978b
+index 0000000..a09a648
 --- /dev/null
 +++ b/v8/src/afeye/wasm_shadow.cc
-@@ -0,0 +1,605 @@
+@@ -0,0 +1,517 @@
 +#include "src/afeye/wasm_shadow.h"
 +
 +#ifdef V8_AFEYE
@@ -36,12 +35,20 @@ index 0000000..b54978b
 +#include <unistd.h>
 +
 +#include "src/afeye/sink.h"
-+#include "src/afeye/taint.h"
 +
 +namespace v8 {
 +namespace afeye {
 +namespace {
 +
++// Shadow memory records the MOVEMENT of bytes inside a wasm linear memory:
++// one marker byte per memory byte, set when wasm writes it. It is NOT a
++// taint tracker - the old tag-propagation half (PushStoreTaint /
++// ConsumeLoadTaint / t_store_taint) was runtime-dead: nothing ever pushed
++// a store tag, so t_store_taint was permanently 0 and every "taint" record
++// was a lie. What the shadow CAN honestly prove is that bytes at a given
++// offset were written, overwritten, copied, filled or read - a fact about
++// data motion the boundary sieve never observes. Records carry off/len/was
++// only; there is no taint field because there is no taint.
 +
 +constexpr size_t kMaxTracked = 64;
 +constexpr size_t kTrackedMask = kMaxTracked - 1;
@@ -52,7 +59,10 @@ index 0000000..b54978b
 +
 +constexpr size_t kMigrateCapBytes = 32u << 20;
 +
++// Emission and structural-drop caps, both witnessed once via the shared
++// sink helper (kind 39 cap-exhausted name=wasm-shadow).
 +constexpr uint64_t kEmitCap = 100000;
++constexpr uint64_t kDropCap = 100000;
 +
 +constexpr uint32_t kEmitBodyCap = 64u * 1024u;
 +
@@ -69,11 +79,6 @@ index 0000000..b54978b
 +std::atomic<uint64_t> g_shadow_dropped{0};
 +std::atomic<uint64_t> g_shadow_emitted{0};
 +std::atomic<uint64_t> g_shadow_live{0};
-+
-+thread_local uint32_t t_store_taint = 0;
-+thread_local uint32_t t_load_taint = 0;
-+
-+thread_local uint64_t t_last_sig = 0;
 +
 +struct StagedBulk {
 +  uint32_t op = 0;
@@ -111,8 +116,11 @@ index 0000000..b54978b
 +  return !off;
 +}
 +
++// Structural drop (slot table full, oversized region). The shared helper
++// increments the counter and emits the cap-exhausted witness exactly once
++// when kDropCap is reached.
 +inline void CountDrop() {
-+  g_shadow_dropped.fetch_add(1, std::memory_order_relaxed);
++  AfeyeCapConsume(&g_shadow_dropped, kDropCap, "wasm-shadow");
 +}
 +
 +inline size_t HashId(const void* mem_id) {
@@ -192,24 +200,6 @@ index 0000000..b54978b
 +  e->len.store(len, std::memory_order_release);
 +}
 +
-+constexpr uint32_t kNarrowNamedMask = 0x7Fu;
-+constexpr uint8_t kNarrowWasmBit = 0x80u;
-+
-+inline uint8_t NarrowTag(uint32_t tag) {
-+  uint8_t b = static_cast<uint8_t>(tag & kNarrowNamedMask);
-+  if ((tag & (static_cast<uint32_t>(kSrcWasm) |
-+              static_cast<uint32_t>(kSrcOther))) != 0) {
-+    b |= kNarrowWasmBit;
-+  }
-+  return b;
-+}
-+
-+inline uint32_t WidenTag(uint8_t b) {
-+  uint32_t tag = static_cast<uint32_t>(b & kNarrowNamedMask);
-+  if ((b & kNarrowWasmBit) != 0) tag |= static_cast<uint32_t>(kSrcWasm);
-+  return tag;
-+}
-+
 +inline uint8_t* Resolve(void* mem_id, size_t* offset, size_t* size,
 +                        size_t* len_out) {
 +  ShadowEntry* e = FindEntry(mem_id);
@@ -228,32 +218,20 @@ index 0000000..b54978b
 +  if (e != nullptr) e->dirty.store(true, std::memory_order_relaxed);
 +}
 +
++// OR-reduce the shadow markers over a range: non-zero iff at least one byte
++// in [p, p+n) was previously written by wasm. This is the {was} fact.
 +inline uint32_t ReduceRange(const uint8_t* p, size_t n) {
 +  uint8_t acc = 0;
 +  for (size_t i = 0; i < n; ++i) acc = static_cast<uint8_t>(acc | p[i]);
-+  return WidenTag(acc);
++  return acc;
 +}
 +
-+
-+inline uint64_t Sig(uint64_t op, uint64_t a, uint64_t b, uint64_t c) {
-+  uint64_t h = 1469598103934665603ull;
-+  const uint64_t f[4] = {op, a, b, c};
-+  for (int i = 0; i < 4; ++i) {
-+    for (int j = 0; j < 8; ++j) {
-+      h ^= (f[i] >> (j * 8)) & 0xff;
-+      h *= 1099511628211ull;
-+    }
-+  }
-+  return h == 0 ? 1 : h;
-+}
-+
-+void EmitShadow(const char* tag, const void* base, size_t off, size_t n,
-+                uint64_t sig) {
++void EmitShadow(const char* tag, const void* base, size_t off, size_t n) {
 +  if (!EmitOn()) return;
-+  if (g_shadow_emitted.load(std::memory_order_relaxed) >= kEmitCap) return;
-+  if (sig == t_last_sig) return;
-+  t_last_sig = sig;
-+  g_shadow_emitted.fetch_add(1, std::memory_order_relaxed);
++  // No signature dedup: the old t_last_sig comparison swallowed repeated
++  // load/store cycles - exactly the loop pattern a VM-unpacker probe uses.
++  // Every distinct motion is recorded, bounded only by the emit cap.
++  if (!AfeyeCapConsume(&g_shadow_emitted, kEmitCap, "wasm-shadow")) return;
 +
 +  uint32_t body = 0;
 +  if (base != nullptr) {
@@ -268,36 +246,25 @@ index 0000000..b54978b
 +  EmitSpan(kWasmMemory, NowNs(), tag, p, body);
 +}
 +
-+void ApplyStoreTag(void* base, uint8_t* p, size_t n, bool augment,
-+                   uint32_t tag, uint32_t before, uint64_t op_id, size_t off) {
-+  const uint8_t b = NarrowTag(tag);
-+  if (augment) {
-+    for (size_t i = 0; i < n; ++i) p[i] = static_cast<uint8_t>(p[i] | b);
-+  } else {
-+    std::memset(p, static_cast<int>(b), n);
-+  }
-+  if (b != 0) MarkDirty(base);
++// Mark a stored range as written and record the motion fact.
++void ApplyStoreWritten(void* base, uint8_t* p, size_t n, uint32_t before,
++                       uint64_t op_id, size_t off) {
++  std::memset(p, 1, n);
++  MarkDirty(base);
 +
-+  if (tag == 0 && before == 0) return;
-+  char text[192];
++  char text[160];
 +  if (op_id == kOpFill) {
-+    std::snprintf(text, sizeof(text),
-+                  "wasm-shadow-fill off=%llu len=%llu taint=0x%x was=0x%x"
-+                  " erase=%d",
++    std::snprintf(text, sizeof(text), "wasm-shadow-fill off=%llu len=%llu"
++                                      " was=0x%x",
 +                  static_cast<unsigned long long>(off),
-+                  static_cast<unsigned long long>(n), tag, before,
-+                  (tag == 0 && before != 0) ? 1 : 0);
++                  static_cast<unsigned long long>(n), before);
 +  } else {
-+    std::snprintf(text, sizeof(text),
-+                  "wasm-shadow-store off=%llu len=%llu taint=0x%x was=0x%x"
-+                  " erase=%d atomic=%d",
++    std::snprintf(text, sizeof(text), "wasm-shadow-store off=%llu len=%llu"
++                                      " was=0x%x",
 +                  static_cast<unsigned long long>(off),
-+                  static_cast<unsigned long long>(n), tag, before,
-+                  (tag == 0 && before != 0) ? 1 : 0, augment ? 1 : 0);
++                  static_cast<unsigned long long>(n), before);
 +  }
-+  EmitShadow(text, base, off, n, Sig(op_id, off, n, (static_cast<uint64_t>(tag)
-+                                                          << 32) |
-+                                                         before));
++  EmitShadow(text, base, off, n);
 +}
 +
 +}
@@ -409,51 +376,7 @@ index 0000000..b54978b
 +                    reinterpret_cast<uintptr_t>(new_mem_id)),
 +                static_cast<unsigned long long>(new_byte_length),
 +                static_cast<unsigned long long>(migrated), truncated ? 1 : 0);
-+  EmitShadow(tag, nullptr, 0, 0,
-+             Sig(kOpReKey, reinterpret_cast<uintptr_t>(new_mem_id),
-+                 new_byte_length, migrated));
-+}
-+
-+void ShadowFree(void* mem_id) {
-+  if (mem_id == nullptr) return;
-+  ShadowEntry* e = FindEntry(mem_id);
-+  if (e == nullptr) return;
-+  uint8_t* region = e->shadow.load(std::memory_order_acquire);
-+  size_t len = e->len.load(std::memory_order_relaxed);
-+  if (region != nullptr && len > 0) std::memset(region, 0, len);
-+  e->len.store(0, std::memory_order_relaxed);
-+  e->dirty.store(false, std::memory_order_relaxed);
-+  e->mem_id.store(kTombstone, std::memory_order_release);
-+  g_shadow_live.fetch_sub(1, std::memory_order_relaxed);
-+}
-+
-+uint8_t* ShadowGet(void* mem_id) {
-+  if (mem_id == nullptr) return nullptr;
-+  ShadowEntry* e = FindEntry(mem_id);
-+  if (e == nullptr) return nullptr;
-+  return e->shadow.load(std::memory_order_acquire);
-+}
-+
-+void ShadowSetRange(void* mem_id, size_t offset, size_t len, uint32_t tag) {
-+  if (!WasmShadowEnabled() || len == 0) return;
-+  size_t size = len;
-+  size_t tracked = 0;
-+  uint8_t* region = Resolve(mem_id, &offset, &size, &tracked);
-+  if (region == nullptr) return;
-+  const uint8_t b = NarrowTag(tag);
-+  if (b == 0) return;
-+  uint8_t* p = region + offset;
-+  for (size_t i = 0; i < size; ++i) p[i] = static_cast<uint8_t>(p[i] | b);
-+  MarkDirty(mem_id);
-+}
-+
-+uint32_t ShadowGetRange(void* mem_id, size_t offset, size_t len) {
-+  if (len == 0) return 0;
-+  size_t size = len;
-+  size_t tracked = 0;
-+  const uint8_t* region = Resolve(mem_id, &offset, &size, &tracked);
-+  if (region == nullptr) return 0;
-+  return ReduceRange(region + offset, size);
++  EmitShadow(tag, nullptr, 0, 0);
 +}
 +
 +void WasmShadowOnLoad(uintptr_t mem_id, uintptr_t offset, uintptr_t size) {
@@ -464,19 +387,20 @@ index 0000000..b54978b
 +  const uint8_t* region = Resolve(base, &off, &n, &tracked);
 +  if (region == nullptr) return;
 +
-+  const uint32_t t = ReduceRange(region + off, n);
-+  t_load_taint = t;
-+  if (t == 0) return;
++  // {was} = whether the bytes just read had been written by wasm. A read of
++  // never-written memory is not a motion fact and is not recorded.
++  const uint32_t was = ReduceRange(region + off, n);
++  if (was == 0) return;
 +
 +  char tag[160];
-+  std::snprintf(tag, sizeof(tag), "wasm-shadow-load off=%llu len=%llu taint=0x%x",
++  std::snprintf(tag, sizeof(tag), "wasm-shadow-load off=%llu len=%llu was=0x%x",
 +                static_cast<unsigned long long>(off),
-+                static_cast<unsigned long long>(n), t);
-+  EmitShadow(tag, base, off, n, Sig(kOpLoad, off, n, t));
++                static_cast<unsigned long long>(n), was);
++  EmitShadow(tag, base, off, n);
 +}
 +
 +void WasmShadowOnStore(uintptr_t mem_id, uintptr_t offset, uintptr_t size,
-+                       uintptr_t augment) {
++                       uintptr_t /*augment*/) {
 +  void* base = reinterpret_cast<void*>(mem_id);
 +  size_t off = static_cast<size_t>(offset);
 +  size_t n = static_cast<size_t>(size);
@@ -485,9 +409,7 @@ index 0000000..b54978b
 +  if (region == nullptr) return;
 +
 +  const uint32_t before = ReduceRange(region + off, n);
-+  const uint32_t t = t_store_taint;
-+  t_store_taint = 0;
-+  ApplyStoreTag(base, region + off, n, augment != 0, t, before, kOpStore, off);
++  ApplyStoreWritten(base, region + off, n, before, kOpStore, off);
 +}
 +
 +void WasmShadowStageCopy(uintptr_t dst_mem_id, uintptr_t dst_off,
@@ -558,14 +480,15 @@ index 0000000..b54978b
 +    uint8_t* region = Resolve(s.dst_base, &off, &n, &tracked);
 +    if (region == nullptr) return;
 +    const uint32_t before = ReduceRange(region + off, n);
-+    std::memset(region + off, 0, n);
-+    if (before == 0) return;
++    // memory.init writes segment bytes into memory: they become written.
++    std::memset(region + off, 1, n);
++    MarkDirty(s.dst_base);
 +    char tag[160];
 +    std::snprintf(tag, sizeof(tag),
-+                  "wasm-shadow-init off=%llu len=%llu was=0x%x erase=1",
++                  "wasm-shadow-init off=%llu len=%llu was=0x%x",
 +                  static_cast<unsigned long long>(off),
 +                  static_cast<unsigned long long>(n), before);
-+    EmitShadow(tag, s.dst_base, off, n, Sig(kOpInit, off, n, before));
++    EmitShadow(tag, s.dst_base, off, n);
 +    return;
 +  }
 +
@@ -576,9 +499,7 @@ index 0000000..b54978b
 +    uint8_t* region = Resolve(s.dst_base, &off, &n, &tracked);
 +    if (region == nullptr) return;
 +    const uint32_t before = ReduceRange(region + off, n);
-+    const uint32_t t = t_store_taint;
-+    t_store_taint = 0;
-+    ApplyStoreTag(s.dst_base, region + off, n, false, t, before, kOpFill, off);
++    ApplyStoreWritten(s.dst_base, region + off, n, before, kOpFill, off);
 +    return;
 +  }
 +
@@ -594,29 +515,19 @@ index 0000000..b54978b
 +  if (src_region == nullptr) {
 +    return;
 +  }
-+  const uint32_t src_tag = ReduceRange(src_region + s_off, s_n);
++  const uint32_t src_was = ReduceRange(src_region + s_off, s_n);
 +  size_t m = d_n < s_n ? d_n : s_n;
 +  if (m == 0) return;
++  // memory.copy moves the written-markers along with the bytes.
 +  std::memmove(dst_region + d_off, src_region + s_off, m);
 +  MarkDirty(s.dst_base);
-+  if (src_tag == 0) return;
 +  char tag[192];
 +  std::snprintf(tag, sizeof(tag),
-+                "wasm-shadow-copy dst_off=%llu src_off=%llu len=%llu taint=0x%x",
++                "wasm-shadow-copy dst_off=%llu src_off=%llu len=%llu was=0x%x",
 +                static_cast<unsigned long long>(d_off),
 +                static_cast<unsigned long long>(s_off),
-+                static_cast<unsigned long long>(m), src_tag);
-+  EmitShadow(tag, s.dst_base, d_off, m,
-+             Sig(kOpCopy, d_off, s_off,
-+                 (static_cast<uint64_t>(m) << 32) | src_tag));
-+}
-+
-+void WasmShadowPushStoreTaint(uint32_t tag) { t_store_taint = tag; }
-+
-+uint32_t WasmShadowConsumeLoadTaint() {
-+  uint32_t t = t_load_taint;
-+  t_load_taint = 0;
-+  return t;
++                static_cast<unsigned long long>(m), src_was);
++  EmitShadow(tag, s.dst_base, d_off, m);
 +}
 +
 +uint64_t WasmShadowDropped() {
@@ -629,10 +540,10 @@ index 0000000..b54978b
 +#endif
 diff --git a/v8/src/afeye/wasm_shadow.h b/v8/src/afeye/wasm_shadow.h
 new file mode 100644
-index 0000000..c4ce06c
+index 0000000..f2269bd
 --- /dev/null
 +++ b/v8/src/afeye/wasm_shadow.h
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,47 @@
 +#ifndef V8_AFEYE_WASM_SHADOW_H_
 +#define V8_AFEYE_WASM_SHADOW_H_
 +
@@ -644,7 +555,12 @@ index 0000000..c4ce06c
 +namespace v8 {
 +namespace afeye {
 +
-+
++// Shadow memory records byte MOTION inside a wasm linear memory: which
++// offsets wasm has written, read-after-write, copied, filled or init'd.
++// It is a motion FACT recorder, not a taint tracker - the dead tag-
++// propagation API (PushStoreTaint / ConsumeLoadTaint / ShadowGet /
++// ShadowSetRange / ShadowGetRange / ShadowFree) was removed: nothing ever
++// drove it, so it reported a taint flow that never existed.
 +
 +void WasmShadowOnLoad(uintptr_t mem_id, uintptr_t offset, uintptr_t size);
 +
@@ -659,28 +575,13 @@ index 0000000..c4ce06c
 +
 +void WasmShadowCommit();
 +
-+
 +bool ShadowAlloc(void* mem_id, size_t byte_length);
 +
 +void ShadowGrow(void* mem_id, size_t new_byte_length);
 +
 +void ShadowReKey(void* old_mem_id, void* new_mem_id, size_t new_byte_length);
 +
-+void ShadowFree(void* mem_id);
-+
-+
-+uint8_t* ShadowGet(void* mem_id);
-+
-+void ShadowSetRange(void* mem_id, size_t offset, size_t len, uint32_t tag);
-+
-+uint32_t ShadowGetRange(void* mem_id, size_t offset, size_t len);
-+
 +bool WasmShadowEnabled();
-+
-+
-+void WasmShadowPushStoreTaint(uint32_t tag);
-+
-+uint32_t WasmShadowConsumeLoadTaint();
 +
 +uint64_t WasmShadowDropped();
 +
@@ -840,10 +741,10 @@ index 7a5aba2..0c500b1 100644
                             decoder->position());
      }
 +    if (afeye_shadow_active_) {
-+      // LOAD: OR-reduce the shadow range (that is the taint of the value just
-+      // read), publish it to this thread's load slot for the JS boundary seam,
-+      // and record it. {index}/{offset} are the post-BoundsCheckMem values -
-+      // the same ones TraceMemoryOperation is handed just above.
++      // LOAD: record the read of this range when at least one of its
++      // bytes was previously written by wasm (a read-after-write motion
++      // fact). {index}/{offset} are the post-BoundsCheckMem values - the
++      // same ones TraceMemoryOperation is handed just above.
 +      AfeyeShadowAccess(imm.mem_index, index, offset, type.size(), false,
 +                        false);
 +    }
@@ -880,8 +781,8 @@ index 7a5aba2..0c500b1 100644
                             decoder->position());
      }
 +    if (afeye_shadow_active_) {
-+      // STORE, non-atomic: the destination bytes are REPLACED, so the tag is
-+      // overwritten rather than augmented (augment=false).
++      // STORE: the destination range is marked written and the motion is
++      // recorded with the previous marker state as {was}.
 +      AfeyeShadowAccess(imm.mem_index, index, offset, type.size(), true, false);
 +    }
    }
@@ -897,13 +798,12 @@ index 7a5aba2..0c500b1 100644
    }
  
    void CurrentMemoryPages(FullDecoder* /* decoder */,
-@@ -6400,6 +6554,11 @@ class LiftoffCompiler {
+@@ -6400,6 +6554,10 @@ class LiftoffCompiler {
        TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), index, offset,
                             decoder->position());
      }
 +    if (afeye_shadow_active_) {
-+      // atomic.store is a plain store of a value, not a read-modify-write, so
-+      // it REPLACES the tag (augment=false).
++      // atomic.store is a plain store: mark written, record the motion.
 +      AfeyeShadowAccess(imm.mem_index, index, offset, type.size(), true, false);
 +    }
    }
@@ -920,28 +820,26 @@ index 7a5aba2..0c500b1 100644
    }
  
    void AtomicBinop(
-@@ -6487,6 +6650,12 @@ class LiftoffCompiler {
+@@ -6487,6 +6650,11 @@ class LiftoffCompiler {
      (asm_.*emit_fn)(addr, index, offset, value, result, type, nullptr,
                      i64_offset, LiftoffAssembler::kLittle);
      __ PushRegister(result_kind, result);
 +    if (afeye_shadow_active_) {
-+      // atomic RMW: the result COMBINES the old memory value with the operand,
-+      // so the existing tag must be ORed in (augment=true). Overwriting here
-+      // would drop a real source that the operation actually consumed.
++      // atomic RMW: the destination range is written, so it is marked
++      // written and the motion recorded; {was} carries the prior state.
 +      AfeyeShadowAccess(imm.mem_index, index, offset, type.size(), true, true);
 +    }
    }
  
    void AtomicCompareExchange(FullDecoder* decoder, StoreType type,
-@@ -6565,6 +6734,15 @@ class LiftoffCompiler {
+@@ -6565,6 +6734,14 @@ class LiftoffCompiler {
      __ AtomicCompareExchange(addr, index, offset, expected, new_value, result,
                               type, nullptr, i64_offset);
      __ PushRegister(result_kind, result);
 +    if (afeye_shadow_active_) {
-+      // atomic.cmpxchg is also a read-modify-write: on success memory takes
-+      // {new_value}, on failure it is unchanged. Augmenting is conservative and
-+      // correct in both cases - a failed exchange keeps the old tag, which the
-+      // OR preserves; a successful one adds the operand's tag.
++      // atomic.cmpxchg: memory either takes {new_value} or is unchanged;
++      // marking the range written is conservative and correct in both
++      // cases, and {was} records the prior marker state.
 +      // Only this (non-IA32) branch is hooked: the IA32 branch is 32-bit, where
 +      // every afeye callout compiles to nothing (kSystemPointerSize != 8).
 +      AfeyeShadowAccess(imm.mem_index, index, offset, type.size(), true, true);
@@ -979,9 +877,9 @@ index 7a5aba2..0c500b1 100644
                        trap.frozen());
 +    // COMMIT, after the out-of-bounds trap jump: reached only when memory.init
 +    // actually succeeded, so a trapping (deliberately induced) probe records no
-+    // taint flow that never happened. DO NOT move this earlier - see the STAGE
-+    // comment in wasm_shadow.h. Takes no arguments, so it is safe to emit while
-+    // {trap}'s FreezeCacheState is still alive.
++    // motion that never happened. DO NOT move this earlier - see the STAGE
++    // comment in MemoryInit above. Takes no arguments, so it is safe to emit
++    // while {trap}'s FreezeCacheState is still alive.
 +    if (afeye_shadow_active_) AfeyeShadowCommit();
    }
  
@@ -1017,9 +915,9 @@ index 7a5aba2..0c500b1 100644
      VarState dst = PopIndexToVarState(&mem_offsets_high_word, &pinned);
  
 +    if (afeye_shadow_active_) {
-+      // STAGE, before {instance_data} is obtained below. {value} is pinned even
-+      // though the shadow takes the fill tag from the thread-local handoff: the
-+      // real memory.fill call below still consumes it, and the STAGE callout
++      // STAGE, before {instance_data} is obtained below. {value} is pinned
++      // even though the shadow does not read the fill value: the real
++      // memory.fill call below still consumes it, and the STAGE callout
 +      // would otherwise clobber its register.
 +      size = AfeyePinToFrame(size);
 +      value = AfeyePinToFrame(value);
@@ -1058,7 +956,7 @@ index 7a5aba2..0c500b1 100644
  
    const compiler::NullCheckStrategy null_check_strategy_ =
 diff --git a/v8/src/wasm/wasm-objects.cc b/v8/src/wasm/wasm-objects.cc
-index 5c1be85..bf5ab45 100644
+index 5c1be85..dc4f6a5 100644
 --- a/v8/src/wasm/wasm-objects.cc
 +++ b/v8/src/wasm/wasm-objects.cc
 @@ -9,6 +9,7 @@
@@ -1088,8 +986,8 @@ index 5c1be85..bf5ab45 100644
            memory_object->backing_store()->byte_length());
 +      // afeye (0028): INPLACE grow. buffer_start() did not move (GrowWasmMemoryInPlace
 +      // extends the existing reservation), so the shadow key is UNCHANGED and the
-+      // region merely extends - no re-key, no tag copy. Shared memories always take
-+      // this path (upstream :1076-1078 must_grow_in_place).
++      // region merely extends - no re-key, no marker migration. Shared memories
++      // always take this path (upstream :1076-1078 must_grow_in_place).
 +      v8::afeye::ShadowGrow(memory_object->backing_store()->buffer_start(),
 +                            memory_object->backing_store()->byte_length());
      }

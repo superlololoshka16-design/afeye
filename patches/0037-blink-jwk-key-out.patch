@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/modules/crypto/crypto_result_impl.cc b/third_party/blink/renderer/modules/crypto/crypto_result_impl.cc
-index 10141d8..8931f3d 100644
+index 10141d8..4007896 100644
 --- a/third_party/blink/renderer/modules/crypto/crypto_result_impl.cc
 +++ b/third_party/blink/renderer/modules/crypto/crypto_result_impl.cc
 @@ -32,6 +32,7 @@
@@ -28,7 +28,7 @@ index 10141d8..8931f3d 100644
 +      return v != nullptr && *v != '\0' && v[0] == '0';
 +    }();
 +    if (!g_afeye_jwkout_off &&
-+        g_afeye_jwkout.fetch_add(1, std::memory_order_relaxed) < 200000) {
++        blink::afeye::AfeyeCapConsume(&g_afeye_jwkout, 200000, "crypto-jwk")) {
 +      blink::afeye::EmitSpan(
 +          blink::afeye::kCryptoOp, blink::afeye::NowNs(), "crypto-jwk-out",
 +          reinterpret_cast<const uint8_t*>(utf8_data.data()),

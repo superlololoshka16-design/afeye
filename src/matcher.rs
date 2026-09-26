@@ -1,24 +1,31 @@
 // afeye low-level value provenance: Aho-Corasick multi-pattern matcher.
 //
-// Replaces the guessing layer (32-byte blake3 windows + time windows +
-// BFS hop caps) with exact matching: values that an executed bytecode
-// instruction really carried (accumulator / register strings from the
-// 0033 trace, constant-pool literals from func-def blobs) are patterns;
-// sink payloads (crypto raw_data, req-body, ws-frame-out, webtransport /
-// RTC / WebGPU egress tags) are the text. A pattern occurrence inside a
-// payload is a byte-exact fact: this value crossed the C++ boundary here.
+// Values that an executed bytecode instruction really carried (accumulator /
+// register strings from the 0033 trace, constant-pool literals from func-def
+// blobs, streamed out of filtered/valuebook.bin) are patterns; sink payloads
+// (crypto raw_data, req-body, ws-frame-out, webtransport / RTC / WebGPU
+// egress tags) are the text. A pattern occurrence inside a payload is a
+// byte-exact fact: this value crossed the C++ boundary here.
 //
 // One pass over the payload, O(n + m + z). No windows, no strides, no
-// hash collisions, no monotone-region skipping, no 50ms/250ms/5s time
-// windows, no fanout caps. A shift of any length still matches, because
-// the match is content-positioned, not window-aligned.
+// hash collisions, no monotone-region skipping, no time windows, no fanout
+// caps. A shift of any length still matches, because the match is
+// content-positioned, not window-aligned.
+//
+// Transitions are sorted Vec<(u8,u32)> probed by binary search; output sets
+// are per-node self_out plus a single out_link to the nearest output node on
+// the fail chain - overlapping matches are reported by walking that chain,
+// with no merged/cloned output vectors.
 
 use std::collections::VecDeque;
 
+const NO_OUT: u32 = u32::MAX;
+
 struct Node {
-    next: Vec<(u8, u32)>,
+    next: Vec<(u8, u32)>, // sorted by byte
     fail: u32,
-    out: Vec<u32>, // pattern ids ending at this node (incl. via fail links)
+    self_out: Vec<u32>, // pattern ids ending exactly at this node
+    out_link: u32,      // nearest output node via fail chain, NO_OUT if none
     depth: u32,
 }
 
@@ -27,13 +34,24 @@ pub struct AhoCorasick {
     patterns: Vec<Vec<u8>>,
 }
 
+fn child_of(nodes: &[Node], u: u32, c: u8) -> Option<u32> {
+    let nx = &nodes[u as usize].next;
+    let pos = nx.partition_point(|(b, _)| *b < c);
+    if pos < nx.len() && nx[pos].0 == c {
+        Some(nx[pos].1)
+    } else {
+        None
+    }
+}
+
 impl AhoCorasick {
     pub fn new() -> Self {
         AhoCorasick {
             nodes: vec![Node {
                 next: Vec::new(),
                 fail: 0,
-                out: Vec::new(),
+                self_out: Vec::new(),
+                out_link: NO_OUT,
                 depth: 0,
             }],
             patterns: Vec::new(),
@@ -62,49 +80,53 @@ impl AhoCorasick {
         }
         let mut cur = 0u32;
         for &b in p {
-            let nxt = self.nodes[cur as usize]
-                .next
-                .iter()
-                .find(|(c, _)| *c == b)
-                .map(|(_, n)| *n);
-            cur = match nxt {
-                Some(n) => n,
-                None => {
-                    let n = self.nodes.len() as u32;
-                    self.nodes.push(Node {
-                        next: Vec::new(),
-                        fail: 0,
-                        out: Vec::new(),
-                        depth: self.nodes[cur as usize].depth + 1,
-                    });
-                    self.nodes[cur as usize].next.push((b, n));
-                    n
-                }
+            // resolve the child for byte b, creating it if absent. The
+            // mutable borrow of self.nodes[cur] must not overlap the
+            // self.nodes.len()/push() below, so read what is needed first.
+            let ci = cur as usize;
+            let pos = self.nodes[ci].next.partition_point(|(c, _)| *c < b);
+            let n = if pos < self.nodes[ci].next.len()
+                && self.nodes[ci].next[pos].0 == b
+            {
+                self.nodes[ci].next[pos].1
+            } else {
+                let depth = self.nodes[ci].depth + 1;
+                let n = self.nodes.len() as u32;
+                self.nodes.push(Node {
+                    next: Vec::new(),
+                    fail: 0,
+                    self_out: Vec::new(),
+                    out_link: NO_OUT,
+                    depth,
+                });
+                self.nodes[ci].next.insert(pos, (b, n));
+                n
             };
+            cur = n;
         }
-        self.nodes[cur as usize].out.push(id);
+        self.nodes[cur as usize].self_out.push(id);
         id
     }
 
-    /// Build failure links + merge output sets. Must be called once after
-    /// all inserts and before any find().
+    /// Build failure links + output links. Must be called once after all
+    /// inserts and before any find().
     pub fn build(&mut self) {
         let mut q: VecDeque<u32> = VecDeque::new();
-        for &(_, n) in self.nodes[0].next.clone().iter() {
+        for i in 0..self.nodes[0].next.len() {
+            let n = self.nodes[0].next[i].1;
             self.nodes[n as usize].fail = 0;
+            self.nodes[n as usize].out_link = NO_OUT;
             q.push_back(n);
         }
         while let Some(u) = q.pop_front() {
-            let children: Vec<(u8, u32)> = self.nodes[u as usize].next.clone();
-            for (c, v) in children {
+            // fail(u) is a proper suffix: strictly smaller depth, so the
+            // fail walk below never touches u and every node it probes was
+            // already restored by an earlier BFS pop.
+            let children = std::mem::take(&mut self.nodes[u as usize].next);
+            for &(c, v) in &children {
                 let mut f = self.nodes[u as usize].fail;
                 loop {
-                    let hit = self.nodes[f as usize]
-                        .next
-                        .iter()
-                        .find(|(cc, _)| *cc == c)
-                        .map(|(_, n)| *n);
-                    if let Some(n) = hit {
+                    if let Some(n) = child_of(&self.nodes, f, c) {
                         if n != v {
                             self.nodes[v as usize].fail = n;
                             break;
@@ -117,14 +139,14 @@ impl AhoCorasick {
                     f = self.nodes[f as usize].fail;
                 }
                 let fl = self.nodes[v as usize].fail as usize;
-                let merged = self.nodes[fl].out.clone();
-                for id in merged {
-                    if !self.nodes[v as usize].out.contains(&id) {
-                        self.nodes[v as usize].out.push(id);
-                    }
-                }
+                self.nodes[v as usize].out_link = if self.nodes[fl].self_out.is_empty() {
+                    self.nodes[fl].out_link
+                } else {
+                    fl as u32
+                };
                 q.push_back(v);
             }
+            self.nodes[u as usize].next = children;
         }
     }
 
@@ -137,12 +159,7 @@ impl AhoCorasick {
         let mut cur = 0u32;
         for (i, &b) in text.iter().enumerate() {
             loop {
-                let hit = self.nodes[cur as usize]
-                    .next
-                    .iter()
-                    .find(|(c, _)| *c == b)
-                    .map(|(_, n)| *n);
-                if let Some(n) = hit {
+                if let Some(n) = child_of(&self.nodes, cur, b) {
                     cur = n;
                     break;
                 }
@@ -151,11 +168,19 @@ impl AhoCorasick {
                 }
                 cur = self.nodes[cur as usize].fail;
             }
-            for &pid in &self.nodes[cur as usize].out {
-                let plen = self.patterns[pid as usize].len();
-                if plen > 0 {
+            let node = &self.nodes[cur as usize];
+            let mut o = if node.self_out.is_empty() {
+                node.out_link
+            } else {
+                cur
+            };
+            while o != NO_OUT {
+                let n = &self.nodes[o as usize];
+                for &pid in &n.self_out {
+                    let plen = self.patterns[pid as usize].len();
                     f(pid, i + 1 - plen);
                 }
+                o = n.out_link;
             }
         }
     }
@@ -262,5 +287,18 @@ mod tests {
         ac.insert(b"zz");
         ac.build();
         assert_eq!(collect(&ac, b"zz"), vec![(0, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn out_link_chain_reports_deep_suffix_matches() {
+        // "abcd", "cd", "d": at the final byte all three end - "cd" and
+        // "d" are reachable only through the out_link chain of the "abcd"
+        // terminal node (no merged output vectors).
+        let mut ac = AhoCorasick::new();
+        ac.insert(b"abcd");
+        ac.insert(b"cd");
+        ac.insert(b"d");
+        ac.build();
+        assert_eq!(collect(&ac, b"abcd"), vec![(0, 0), (1, 2), (2, 3)]);
     }
 }

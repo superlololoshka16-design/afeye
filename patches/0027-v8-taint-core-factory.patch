@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
-index cdec501..d228b45 100644
+index 99f8525..6a035e0 100644
 --- a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
 +++ b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
 @@ -11,6 +11,8 @@
@@ -52,10 +52,10 @@ index 2d4799e..6f63a62 100644
    }
 diff --git a/v8/src/afeye/taint.cc b/v8/src/afeye/taint.cc
 new file mode 100644
-index 0000000..d0b3c51
+index 0000000..ccdbd0e
 --- /dev/null
 +++ b/v8/src/afeye/taint.cc
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,213 @@
 +#include "src/afeye/taint.h"
 +
 +#ifdef V8_AFEYE
@@ -74,16 +74,22 @@ index 0000000..d0b3c51
 +
 +constexpr size_t kTaintSlots = 1u << 20;
 +constexpr uint64_t kTaintKeyMask = kTaintSlots - 1;
++constexpr uint64_t kTaintDropCap = 100000;
 +
 +struct TaintSlot {
 +  std::atomic<uint64_t> key{0};
 +  std::atomic<uint32_t> tag{0};
++  std::atomic<uint64_t> epoch{0};
 +};
 +
 +TaintSlot g_taint[kTaintSlots];
 +std::atomic<uint64_t> g_taint_dropped{0};
-+std::atomic<uint64_t> g_taint_live{0};
 +std::atomic<uint32_t> g_sunk_union{0};
++// GC generation counter. A compacting GC invalidates every heap-keyed slot
++// AT ONCE by advancing the epoch - no table wipe, so the pre-GC tag union
++// (the 0032 gc witness) can still be snapshotted, and stale slots are
++// reclaimed lazily by the open-addressing probe on the next write.
++std::atomic<uint64_t> g_taint_epoch{1};
 +
 +bool TaintEnvOn() {
 +  static const bool off = []() {
@@ -106,36 +112,70 @@ index 0000000..d0b3c51
 +  return h & kTaintKeyMask;
 +}
 +
++// A heap-keyed slot is stale when a compacting GC advanced the epoch
++// after the slot was written: the object either moved or was freed and
++// its address reused. Stale slots never match a lookup and are reclaimed
++// lazily by the insert probe. Wasm-keyed slots (raw buffer addresses,
++// not GC-movable) survive epoch bumps.
++inline bool TaintSlotStale(uint64_t ck, uint64_t slot_epoch) {
++  const uint8_t space = static_cast<uint8_t>((ck >> 61) - 1);
++  if (space == kKeyWasm) return false;
++  return slot_epoch != g_taint_epoch.load(std::memory_order_relaxed);
++}
++
 +inline TaintSlot* FindSlot(uint64_t ck, bool for_insert) {
 +  uint64_t idx = HashKey(ck);
-+  TaintSlot* first_empty = nullptr;
++  TaintSlot* reusable = nullptr;
 +  const uint64_t max_probe = kTaintSlots >> 6;
 +  for (uint64_t p = 0; p < max_probe; ++p) {
 +    TaintSlot* s = &g_taint[idx & kTaintKeyMask];
 +    uint64_t k = s->key.load(std::memory_order_acquire);
-+    if (k == ck) return s;
++    if (k == ck) {
++      if (!TaintSlotStale(ck, s->epoch.load(std::memory_order_relaxed))) {
++        return s;
++      }
++      // stale hit: the key is dead. A lookup stops here (no further probe
++      // may resurrect it); an insert may reuse this very slot.
++      if (!for_insert) return nullptr;
++      return s;
++    }
 +    if (k == 0) {
 +      if (!for_insert) return nullptr;
-+      if (first_empty == nullptr) first_empty = s;
-+      return first_empty;
++      if (reusable == nullptr) reusable = s;
++    } else if (for_insert && reusable == nullptr &&
++               TaintSlotStale(k, s->epoch.load(std::memory_order_relaxed))) {
++      reusable = s;
 +    }
 +    ++idx;
 +  }
-+  return nullptr;
++  return reusable;
 +}
 +
 +inline TaintSlot* AcquireSlot(uint64_t ck) {
 +  TaintSlot* s = FindSlot(ck, true);
 +  if (s == nullptr) return nullptr;
-+  uint64_t expected = 0;
-+  if (s->key.load(std::memory_order_relaxed) == ck) return s;
-+  if (s->key.compare_exchange_strong(expected, ck,
-+                                     std::memory_order_acq_rel,
-+                                     std::memory_order_relaxed)) {
-+    g_taint_live.fetch_add(1, std::memory_order_relaxed);
-+    return s;
++  uint64_t expected = s->key.load(std::memory_order_relaxed);
++  if (expected == ck) {
++    // A fresh hit just returns. A STALE same-key hit (slot survived a GC
++    // epoch bump) is reclaimed: clear the old tag and re-stamp below so
++    // the address is tracked again under the current epoch.
++    if (!TaintSlotStale(ck, s->epoch.load(std::memory_order_relaxed))) {
++      return s;
++    }
++    s->tag.store(0, std::memory_order_relaxed);
++  } else if (s->key.compare_exchange_strong(expected, ck,
++                                            std::memory_order_acq_rel,
++                                            std::memory_order_relaxed)) {
++    // claimed an empty or stale slot: start the tag clean.
++    s->tag.store(0, std::memory_order_relaxed);
++  } else {
++    // lost the race: another thread owns this key now.
++    s = FindSlot(ck, false);
++    if (s == nullptr) return nullptr;
 +  }
-+  return FindSlot(ck, false);
++  s->epoch.store(g_taint_epoch.load(std::memory_order_relaxed),
++                 std::memory_order_relaxed);
++  return s;
 +}
 +
 +}
@@ -146,7 +186,9 @@ index 0000000..d0b3c51
 +  if (tag == kSrcNone || !TaintEnabled()) return;
 +  TaintSlot* s = AcquireSlot(CompositeKey(space, key));
 +  if (s == nullptr) {
-+    g_taint_dropped.fetch_add(1, std::memory_order_relaxed);
++    // table full: count the drop and witness the cap exactly once when
++    // the limit is hit (kind 39 cap-exhausted name=taint).
++    AfeyeCapConsume(&g_taint_dropped, kTaintDropCap, "taint");
 +    return;
 +  }
 +  uint32_t cur = s->tag.load(std::memory_order_relaxed);
@@ -178,16 +220,11 @@ index 0000000..d0b3c51
 +
 +void TaintOnGCEpilogue(bool compacting) {
 +  if (!compacting) return;
-+  for (size_t i = 0; i < kTaintSlots; ++i) {
-+    TaintSlot* s = &g_taint[i];
-+    uint64_t k = s->key.load(std::memory_order_relaxed);
-+    if (k == 0) continue;
-+    uint8_t space = static_cast<uint8_t>((k >> 61) - 1);
-+    if (space == kKeyWasm) continue;
-+    s->key.store(0, std::memory_order_relaxed);
-+    s->tag.store(0, std::memory_order_relaxed);
-+    g_taint_live.fetch_sub(1, std::memory_order_relaxed);
-+  }
++  // No table wipe: every heap-keyed slot is invalidated AT ONCE by the
++  // epoch bump. Stale slots stop matching lookups immediately and are
++  // reclaimed lazily by the insert probe, so taint set after the GC is
++  // tracked against the new addresses instead of being erased wholesale.
++  g_taint_epoch.fetch_add(1, std::memory_order_relaxed);
 +}
 +
 +void TaintEmitSink(const char* sink, uint8_t space, uint64_t key,
@@ -203,6 +240,10 @@ index 0000000..d0b3c51
 +}
 +
 +TaintTag TaintLiveHeapTagUnion() {
++  // only slots stamped with the CURRENT epoch are live: the 0032 gc
++  // witness snapshots this union immediately before the epoch bump, so
++  // it sees exactly the taint set since the previous compacting GC.
++  const uint64_t epoch = g_taint_epoch.load(std::memory_order_relaxed);
 +  TaintTag u = kSrcNone;
 +  for (size_t i = 0; i < kTaintSlots; ++i) {
 +    const TaintSlot* s = &g_taint[i];
@@ -210,6 +251,7 @@ index 0000000..d0b3c51
 +    if (k == 0) continue;
 +    const uint8_t space = static_cast<uint8_t>((k >> 61) - 1);
 +    if (space == kKeyWasm) continue;
++    if (s->epoch.load(std::memory_order_relaxed) != epoch) continue;
 +    u |= s->tag.load(std::memory_order_relaxed);
 +  }
 +  return u;
@@ -229,10 +271,10 @@ index 0000000..d0b3c51
 +#endif
 diff --git a/v8/src/afeye/taint.h b/v8/src/afeye/taint.h
 new file mode 100644
-index 0000000..142e189
+index 0000000..479f76b
 --- /dev/null
 +++ b/v8/src/afeye/taint.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,58 @@
 +#ifndef V8_AFEYE_TAINT_H_
 +#define V8_AFEYE_TAINT_H_
 +
@@ -246,17 +288,14 @@ index 0000000..142e189
 +
 +typedef uint32_t TaintTag;
 +
++// Only kSrcFingerprint is a real source: it is the single bit that
++// capture sites actually tag (idl_member_installer, JsonStringify, the
++// Factory concat/slice seams). The former kSrcClock..kSrcOther bits were
++// never set by any emitter, so keeping them in the enum only created the
++// illusion of provenance the tracker did not have. They are removed.
 +enum TaintSource : uint32_t {
 +  kSrcNone = 0u,
 +  kSrcFingerprint = 1u << 0,
-+  kSrcClock = 1u << 1,
-+  kSrcInput = 1u << 2,
-+  kSrcRandom = 1u << 3,
-+  kSrcStorage = 1u << 4,
-+  kSrcNetwork = 1u << 5,
-+  kSrcStack = 1u << 6,
-+  kSrcWasm = 1u << 7,
-+  kSrcOther = 1u << 31,
 +};
 +
 +enum TaintKeySpace : uint8_t {
@@ -265,8 +304,6 @@ index 0000000..142e189
 +  kKeyStack = 2,
 +  kKeyContext = 3,
 +};
-+
-+constexpr int kTaintSourceBits = 32;
 +
 +bool TaintEnabled();
 +

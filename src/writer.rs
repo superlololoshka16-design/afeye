@@ -183,6 +183,7 @@ struct Wc<'a> {
     vd: Vec<Sink>,
     vix: HashMap<(u32, u32), usize>,
     dig: HashMap<u32, Agg>,
+    meta: Option<Sink>,
 }
 
 impl<'a> Wc<'a> {
@@ -383,10 +384,8 @@ impl<'a> Wc<'a> {
             b2.put_slice(b",\"d\":");
             b2.put_slice(&ev.d);
             b2.put_u8(b'}');
-            let p = self.ctx.stage.join("meta.jsonl");
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
-                let _ = f.write_all(&b2);
-                let _ = f.write_all(b"\n");
+            if let Some(s) = &mut self.meta {
+                s.line(&b2);
             }
             return;
         }
@@ -452,6 +451,7 @@ fn run(rx: Receiver<FxEvent>, art: Receiver<Art>, ctx: Arc<Ctx>) {
         vd: Vec::new(),
         vix: HashMap::new(),
         dig: HashMap::new(),
+        meta: Sink::open(&ctx.stage.join("meta.jsonl")).ok(),
     };
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
     let art_root = ctx.stage.join("artifacts");
@@ -497,6 +497,9 @@ fn run(rx: Receiver<FxEvent>, art: Receiver<Art>, ctx: Arc<Ctx>) {
         let _ = s.w.flush();
     }
     for s in wc.vd.iter_mut() {
+        let _ = s.w.flush();
+    }
+    if let Some(s) = wc.meta.as_mut() {
         let _ = s.w.flush();
     }
     ctx.cn.art.store(art_n, Ordering::Release);

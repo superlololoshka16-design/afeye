@@ -1,6 +1,6 @@
 diff --git a/v8/src/afeye/bcrec.h b/v8/src/afeye/bcrec.h
 new file mode 100644
-index 0000000..4d0d53d
+index 0000000..6ea7213
 --- /dev/null
 +++ b/v8/src/afeye/bcrec.h
 @@ -0,0 +1,380 @@
@@ -89,8 +89,8 @@ index 0000000..4d0d53d
 +constexpr uint32_t kBlockPrefixSize = 5;  // tag(1) + len(4)
 +
 +// One sink record carries at most this payload; larger records split.
-+// sink kMaxRecord is 1MiB, wire header is 16 bytes.
-+constexpr uint32_t kSinkRecordCap = (1u << 20) - 16;
++// sink kMaxRecord is 1MiB, wire v3 header is 24 bytes.
++constexpr uint32_t kSinkRecordCap = (1u << 20) - 24;
 +
 +inline void PutU16(uint8_t* p, uint16_t v) { memcpy(p, &v, 2); }
 +inline void PutU32(uint8_t* p, uint32_t v) { memcpy(p, &v, 4); }
@@ -385,7 +385,7 @@ index 0000000..4d0d53d
 +
 +#endif  // V8_AFEYE_BCREC_H_
 diff --git a/v8/src/afeye/sink.cc b/v8/src/afeye/sink.cc
-index 84145fd..21b6d27 100644
+index c2faa24..a910d96 100644
 --- a/v8/src/afeye/sink.cc
 +++ b/v8/src/afeye/sink.cc
 @@ -219,6 +219,16 @@ bool Enabled() {
@@ -406,7 +406,7 @@ index 84145fd..21b6d27 100644
                 uint32_t len) {
    if (!g_on.load(std::memory_order_acquire)) return;
 diff --git a/v8/src/afeye/sink.h b/v8/src/afeye/sink.h
-index f1b2b2b..69ffeff 100644
+index ad49a2e..0d04c3c 100644
 --- a/v8/src/afeye/sink.h
 +++ b/v8/src/afeye/sink.h
 @@ -25,6 +25,7 @@ enum EventKind : uint8_t {
@@ -417,7 +417,7 @@ index f1b2b2b..69ffeff 100644
    kFingerprint = 16,
    kErrorStack = 38,
    kSinkDrop = 39,
-@@ -43,6 +44,14 @@ void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
+@@ -49,4 +50,12 @@ void EmitSpan(uint8_t kind, uint64_t ts_ns, const char* tag,
  uint64_t SinkDropped();
  bool Flush(uint32_t timeout_ms);
  
@@ -429,9 +429,7 @@ index f1b2b2b..69ffeff 100644
 +extern "C" uint64_t afeye_vclock_ns(void);
 +void VclockTick(uint64_t ns);
 +
- }
- }
- 
+ inline bool AfeyeCapConsume(std::atomic<uint64_t>* ctr, uint64_t cap,
 diff --git a/v8/src/interpreter/interpreter-assembler.cc b/v8/src/interpreter/interpreter-assembler.cc
 index 074f827..d7df67e 100644
 --- a/v8/src/interpreter/interpreter-assembler.cc
@@ -476,12 +474,13 @@ diff --git a/v8/src/runtime/runtime-trace.cc b/v8/src/runtime/runtime-trace.cc
 index 1e3f6ed..688fd1f 100644
 --- a/v8/src/runtime/runtime-trace.cc
 +++ b/v8/src/runtime/runtime-trace.cc
-@@ -20,6 +20,24 @@
+@@ -20,6 +20,25 @@
  #include "src/dumpling/dumpling-manager.h"
  #endif
  #include "src/utils/ostreams.h"
 +#ifdef V8_AFEYE
 +#include <atomic>
++#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
 +#include <unordered_set>
@@ -501,7 +500,7 @@ index 1e3f6ed..688fd1f 100644
  
  namespace v8 {
  namespace internal {
-@@ -114,6 +132,433 @@ void PrintRegisters(UnoptimizedJSFrame* frame, std::ostream& os, bool is_input,
+@@ -114,6 +132,550 @@ void PrintRegisters(UnoptimizedJSFrame* frame, std::ostream& os, bool is_input,
  
  }  // namespace
  
@@ -569,29 +568,127 @@ index 1e3f6ed..688fd1f 100644
 +    g_afeye_seen;
 +
 +// Raw string bytes, FULL length, no cap. Returns byte count; sets utf16
-+// when the flat content is two-byte (bytes are UTF-16LE).
++// when the content is two-byte (bytes are UTF-16LE). ZERO allocation and
++// ZERO Flatten(isolate): stays valid under DisallowGarbageCollection.
++//
++// A ConsString (the result of `a + b`, i.e. the exact moment a token is
++// assembled) is NOT flat, so the old `if (!fc.IsFlat()) return 0;` threw
++// away the highest-value payloads. Walk it instead: by V8 invariant a
++// ConsString's parts are flat (Seq/External), so GetFlatContent on each
++// part yields the bytes with no allocation. ThinString indirection is
++// followed to actual(); SlicedString resolves through its flat parent.
++// Recursion is bounded (depth <= 32).
++//
++// Two passes, both allocation-free. Pass 1 decides the encoding: a mixed
++// ConsString (one-byte part + two-byte part) must come out as UTF-16LE
++// with the one-byte parts widened, exactly like V8's own flatten would.
++// Pass 2 appends with that decision. A part that is still not flat
++// (pathological depth, unresolvable external) is counted in
++// g_afeye_str_nonflat and reported as a kind-16 fingerprint witness -
++// throttled by counter modulo, NEVER by a timer.
++std::atomic<uint64_t> g_afeye_str_nonflat{0};
++std::atomic<uint64_t> g_afeye_str_nonflat_wit{0};
++
++enum AfeyeStrEnc : int { kEncOneByte = 0, kEncTwoByte = 1, kEncNonFlat = 2 };
++
++void AfeyeStrNonflatDrop() {
++  const uint64_t n =
++      g_afeye_str_nonflat.fetch_add(1, std::memory_order_relaxed) + 1;
++  if (n % 10000u != 0) return;
++  if (n == g_afeye_str_nonflat_wit.load(std::memory_order_relaxed)) return;
++  g_afeye_str_nonflat_wit.store(n, std::memory_order_relaxed);
++  char buf[64];
++  std::snprintf(buf, sizeof(buf), "str-nonflat dropped=%llu",
++                static_cast<unsigned long long>(n));
++  v8::afeye::EmitStr(v8::afeye::kFingerprint, v8::afeye::NowNs(), buf);
++}
++
++// Pass 1: encoding probe. Writes nothing, allocates nothing.
++AfeyeStrEnc AfeyeStrEncoding(Tagged<String> str,
++                             const DisallowGarbageCollection& no_gc,
++                             int depth) {
++  if (depth > 32) return kEncNonFlat;
++  if (IsConsString(str)) {
++    Tagged<ConsString> cons = Cast<ConsString>(str);
++    const AfeyeStrEnc a = AfeyeStrEncoding(cons->first(), no_gc, depth + 1);
++    if (a == kEncNonFlat) return a;
++    const AfeyeStrEnc b = AfeyeStrEncoding(cons->second(), no_gc, depth + 1);
++    if (b == kEncNonFlat) return b;
++    return (a == kEncTwoByte || b == kEncTwoByte) ? kEncTwoByte : kEncOneByte;
++  }
++  if (IsThinString(str)) {
++    return AfeyeStrEncoding(Cast<ThinString>(str)->actual(), no_gc, depth + 1);
++  }
++  String::FlatContent fc = str->GetFlatContent(no_gc);
++  if (!fc.IsFlat()) return kEncNonFlat;
++  return fc.IsOneByte() ? kEncOneByte : kEncTwoByte;
++}
++
++// Pass 2: append one flat part in the encoding pass 1 decided. A one-byte
++// part under want_utf16 is widened to UTF-16LE so a mixed ConsString comes
++// out byte-exact the way V8 would flatten it.
++bool AfeyeAppendFlatPart(Tagged<String> str, std::vector<uint8_t>* out,
++                         bool want_utf16,
++                         const DisallowGarbageCollection& no_gc) {
++  String::FlatContent fc = str->GetFlatContent(no_gc);
++  if (!fc.IsFlat()) return false;
++  const size_t at = out->size();
++  if (fc.IsOneByte()) {
++    base::Vector<const uint8_t> v = fc.ToOneByteVector();
++    if (!want_utf16) {
++      out->resize(at + v.length());
++      if (v.length() != 0) memcpy(out->data() + at, v.begin(), v.length());
++      return true;
++    }
++    out->resize(at + v.length() * 2);
++    for (int i = 0; i < v.length(); ++i) {
++      v8::afeye::bcrec::PutU16(out->data() + at + static_cast<size_t>(i) * 2,
++                               v[i]);
++    }
++    return true;
++  }
++  base::Vector<const base::uc16> v = fc.ToUC16Vector();
++  out->resize(at + v.length() * 2);
++  for (int i = 0; i < v.length(); ++i) {
++    v8::afeye::bcrec::PutU16(out->data() + at + static_cast<size_t>(i) * 2,
++                             v[i]);
++  }
++  return true;
++}
++
++void AfeyeStrAppend(Tagged<String> str, std::vector<uint8_t>* out,
++                    bool want_utf16, const DisallowGarbageCollection& no_gc,
++                    int depth) {
++  if (depth > 32) return;  // pass 1 already rejected this string
++  if (IsConsString(str)) {
++    Tagged<ConsString> cons = Cast<ConsString>(str);
++    AfeyeStrAppend(cons->first(), out, want_utf16, no_gc, depth + 1);
++    AfeyeStrAppend(cons->second(), out, want_utf16, no_gc, depth + 1);
++    return;
++  }
++  if (IsThinString(str)) {
++    AfeyeStrAppend(Cast<ThinString>(str)->actual(), out, want_utf16, no_gc,
++                   depth + 1);
++    return;
++  }
++  AfeyeAppendFlatPart(str, out, want_utf16, no_gc);
++}
++
 +uint32_t AfeyeStringBytes(Tagged<Object> obj, std::vector<uint8_t>* out,
 +                          bool* utf16,
 +                          const DisallowGarbageCollection& no_gc) {
 +  *utf16 = false;
 +  if (!IsString(obj)) return 0;
 +  Tagged<String> str = Cast<String>(obj);
-+  String::FlatContent fc = str->GetFlatContent(no_gc);
-+  if (!fc.IsFlat()) return 0;
-+  size_t at = out->size();
-+  if (fc.IsOneByte()) {
-+    base::Vector<const uint8_t> v = fc.ToOneByteVector();
-+    out->resize(at + v.length());
-+    memcpy(out->data() + at, v.begin(), v.length());
-+    return static_cast<uint32_t>(v.length());
++  const AfeyeStrEnc enc = AfeyeStrEncoding(str, no_gc, 0);
++  if (enc == kEncNonFlat) {
++    AfeyeStrNonflatDrop();
++    return 0;
 +  }
-+  base::Vector<const base::uc16> v = fc.ToUC16Vector();
-+  *utf16 = true;
-+  out->resize(at + v.length() * 2);
-+  for (uint32_t i = 0; i < static_cast<uint32_t>(v.length()); ++i) {
-+    v8::afeye::bcrec::PutU16(out->data() + at + i * 2, v[i]);
-+  }
-+  return static_cast<uint32_t>(v.length() * 2);
++  *utf16 = (enc == kEncTwoByte);
++  const size_t at = out->size();
++  AfeyeStrAppend(str, out, *utf16, no_gc, 0);
++  return static_cast<uint32_t>(out->size() - at);
 +}
 +
 +void AfeyeEmit(Isolate* isolate, const Hdr& hdr, const uint8_t* payload,
@@ -775,6 +872,24 @@ index 1e3f6ed..688fd1f 100644
 +      });
 +}
 +
++// Mirrors BytecodeDecoder::DecodeUnsignedOperand's own dispatch: these
++// operand types carry an UNSIGNED engine-decoded value and must go out as
++// u64. The old code decoded both views and emitted only the signed one,
++// so every unsigned operand with the high bit set (large kIdx, kU16Imm,
++// kUnsigned, backward kJumpDistance) went out as sign-extended garbage.
++bool AfeyeOperandIsUnsigned(interpreter::OperandType ot) {
++  if (interpreter::Bytecodes::IsUnsignedType(ot)) return true;
++  switch (ot) {
++    case interpreter::OperandType::kRegCount:
++    case interpreter::OperandType::kRuntimeId:
++    case interpreter::OperandType::kNativeContextIndex:
++    case interpreter::OperandType::kJumpDistance:
++      return true;
++    default:
++      return false;
++  }
++}
++
 +}  // namespace
 +
 +RUNTIME_FUNCTION(Runtime_AfeyeTraceBytecodeEntry) {
@@ -890,14 +1005,15 @@ index 1e3f6ed..688fd1f 100644
 +      // the decoded operand value itself (register index, signed)
 +      ib.Operand(static_cast<uint8_t>(i),
 +                 static_cast<uint64_t>(static_cast<int64_t>(first.index())));
-+    } else {
-+      uint32_t uv = interpreter::BytecodeDecoder::DecodeUnsignedOperand(
++    } else if (AfeyeOperandIsUnsigned(ot)) {
++      const uint32_t uv = interpreter::BytecodeDecoder::DecodeUnsignedOperand(
 +          operand_start, ot, scale);
-+      int32_t sv = interpreter::BytecodeDecoder::DecodeSignedOperand(
++      ib.Operand(static_cast<uint8_t>(i), static_cast<uint64_t>(uv));
++    } else {
++      const int32_t sv = interpreter::BytecodeDecoder::DecodeSignedOperand(
 +          operand_start, ot, scale);
 +      ib.Operand(static_cast<uint8_t>(i),
 +                 static_cast<uint64_t>(static_cast<int64_t>(sv)));
-+      (void)uv;
 +    }
 +  }
 +
@@ -936,7 +1052,7 @@ index 1e3f6ed..688fd1f 100644
  
  RUNTIME_FUNCTION(Runtime_TraceUnoptimizedBytecodeEntry) {
 diff --git a/v8/src/runtime/runtime.h b/v8/src/runtime/runtime.h
-index b99a90b..5d0e04e 100644
+index bf56c8d..1bf9edf 100644
 --- a/v8/src/runtime/runtime.h
 +++ b/v8/src/runtime/runtime.h
 @@ -199,6 +199,14 @@ constexpr bool CanTriggerGC(T... properties) {

@@ -1,8 +1,8 @@
 diff --git a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
-index cdec501..21c1921 100644
+index 6a035e0..ab9fbc0 100644
 --- a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
 +++ b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
-@@ -38,6 +38,10 @@ bool g_afeye_api_values_off = []() {
+@@ -41,6 +41,10 @@ bool g_afeye_api_values_off = []() {
    const char* v = ::getenv("AFEYE_TRACE_DOM_VALUES");
    return v != nullptr && *v != '\0' && v[0] == '0';
  }();
@@ -13,7 +13,7 @@ index cdec501..21c1921 100644
  
  void AfeyeCaptureValue(v8::Isolate* isolate,
                         v8::Local<v8::Value> rv,
-@@ -74,6 +78,20 @@ void AfeyeCaptureValue(v8::Isolate* isolate,
+@@ -83,6 +87,20 @@ void AfeyeCaptureValue(v8::Isolate* isolate,
    }
  }
  
@@ -34,7 +34,7 @@ index cdec501..21c1921 100644
  void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
    AfeyeApiCell* cell = nullptr;
    v8::Local<v8::Value> data = info.Data();
-@@ -91,12 +109,45 @@ void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
+@@ -100,12 +118,45 @@ void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
          blink::afeye::EmitStr(blink::afeye::kDomApi, blink::afeye::NowNs(),
                                cell->what);
        } else {
@@ -85,19 +85,3 @@ index cdec501..21c1921 100644
          blink::afeye::EmitStr(blink::afeye::kDomApi, blink::afeye::NowNs(),
                                afeye_buf);
        }
-@@ -274,6 +325,15 @@ v8::Local<v8::FunctionTemplate> CreateFunctionTemplate(
-                                   afeye_access, config.property_name);
-     if (!afeye_data.IsEmpty()) {
-       callback = &AfeyeDomApiThunk;
-+      // CRITICAL: drop the CFunction fast-path table. V8's
-+      // NoAllocDirectCall dispatches straight to the ORIGINAL callback,
-+      // bypassing the thunk entirely - those calls would never be
-+      // logged, breaking "capture every DOM access". With the table
-+      // nulled, every call takes the slow path through the thunk.
-+      // Cost: fast-API DOM calls lose their no-alloc path while tracing
-+      // is active. Acceptable and required for total coverage.
-+      v8_cfunction_table_data = nullptr;
-+      v8_cfunction_table_size = 0;
-     }
-   }
- #endif

@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
-index cdad5fe..cdec501 100644
+index 2673245..99f8525 100644
 --- a/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
 +++ b/third_party/blink/renderer/platform/bindings/idl_member_installer.cc
 @@ -6,8 +6,10 @@
@@ -13,10 +13,10 @@ index cdad5fe..cdec501 100644
  #include "third_party/blink/renderer/platform/afeye/sink.h"
  #endif
  
-@@ -32,6 +34,45 @@ constexpr size_t kAfeyeApiCells = 1u << 16;
- AfeyeApiCell g_afeye_api_cells[kAfeyeApiCells] = {};
+@@ -33,6 +35,45 @@ AfeyeApiCell g_afeye_api_cells[kAfeyeApiCells] = {};
  std::mutex g_afeye_api_mu;
  std::atomic<uint64_t> g_afeye_api_calls{0};
+ std::atomic<uint64_t> g_afeye_cells{0};
 +bool g_afeye_api_values_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_DOM_VALUES");
 +  return v != nullptr && *v != '\0' && v[0] == '0';
@@ -59,17 +59,17 @@ index cdad5fe..cdec501 100644
  
  void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
    AfeyeApiCell* cell = nullptr;
-@@ -40,14 +81,26 @@ void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
+@@ -41,14 +82,26 @@ void AfeyeDomApiThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
      cell = static_cast<AfeyeApiCell*>(data.As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault));
    }
    if (cell) {
--    if (g_afeye_api_calls.fetch_add(1, std::memory_order_relaxed) <
--        8000000) {
+-    if (blink::afeye::AfeyeCapConsume(&g_afeye_api_calls, 8000000,
+-                                      "dom-api")) {
 -      blink::afeye::EmitStr(blink::afeye::kDomApi,
 -                            blink::afeye::NowNs(), cell->what);
 -    }
 +    const bool afeye_record =
-+        g_afeye_api_calls.fetch_add(1, std::memory_order_relaxed) < 8000000;
++        blink::afeye::AfeyeCapConsume(&g_afeye_api_calls, 8000000, "dom-api");
      if (cell->orig) {
        cell->orig(info);
      }
@@ -91,3 +91,19 @@ index cdad5fe..cdec501 100644
    }
  }
  
+@@ -223,6 +276,15 @@ v8::Local<v8::FunctionTemplate> CreateFunctionTemplate(
+                                   afeye_access, config.property_name);
+     if (!afeye_data.IsEmpty()) {
+       callback = &AfeyeDomApiThunk;
++      // CRITICAL: drop the CFunction fast-path table. V8's
++      // NoAllocDirectCall dispatches straight to the ORIGINAL callback,
++      // bypassing the thunk entirely - those calls would never be
++      // logged, breaking "capture every DOM access". With the table
++      // nulled, every call takes the slow path through the thunk.
++      // Cost: fast-API DOM calls lose their no-alloc path while tracing
++      // is active. Acceptable and required for total coverage.
++      v8_cfunction_table_data = nullptr;
++      v8_cfunction_table_size = 0;
+     }
+   }
+ #endif

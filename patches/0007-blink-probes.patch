@@ -398,101 +398,200 @@ index 5cd2723..8354e24 100644
  }
  
 diff --git a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
-index b456ecc..40d1755 100644
+index b456ecc..8896206 100644
 --- a/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
 +++ b/third_party/blink/renderer/modules/crypto/subtle_crypto.cc
-@@ -29,6 +29,10 @@
+@@ -29,6 +29,13 @@
   */
  
  #include "third_party/blink/renderer/modules/crypto/subtle_crypto.h"
 +#ifdef BLINK_AFEYE
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
 +#include <string>
 +#include "third_party/blink/renderer/platform/afeye/sink.h"
 +#endif
  
  #include "base/check_deref.h"
  #include "base/task/single_thread_task_runner.h"
-@@ -234,6 +238,35 @@ bool supportsInternal(ScriptState* script_state,
+@@ -234,6 +241,64 @@ bool supportsInternal(ScriptState* script_state,
  
  }  // namespace
  
 +#ifdef BLINK_AFEYE
++static const char* AfeyeAlgName(const WebCryptoAlgorithm& alg) {
++  if (alg.IsNull()) return "?";
++  const WebCryptoAlgorithmInfo* info =
++      WebCryptoAlgorithm::LookupAlgorithmInfo(alg.Id());
++  return info ? info->name : "?";
++}
++
++static const char* AfeyeAlgName(const WebCryptoKeyAlgorithm& alg) {
++  if (alg.IsNull()) return "?";
++  const WebCryptoAlgorithmInfo* info =
++      WebCryptoAlgorithm::LookupAlgorithmInfo(alg.Id());
++  return info ? info->name : "?";
++}
++
 +static void AfeyeDumpSubtleOp(const char* op,
-+                              const V8BufferSource* raw_data) {
-+  if (!blink::afeye::Enabled() || !raw_data) return;
-+  const uint8_t* p = nullptr;
-+  size_t n = 0;
-+  if (raw_data->IsArrayBuffer()) {
-+    const DOMArrayBuffer* b = raw_data->GetAsArrayBuffer();
-+    if (b) {
-+      p = reinterpret_cast<const uint8_t*>(b->Data());
-+      n = b->ByteLength();
-+    }
-+  } else if (raw_data->IsArrayBufferView()) {
-+    NotShared<DOMArrayBufferView> v = raw_data->GetAsArrayBufferView();
-+    if (v) {
-+      const DOMArrayBufferView* view = v.Get();
-+      auto s = view->ByteSpan();
-+      p = reinterpret_cast<const uint8_t*>(s.data());
-+      n = s.size();
-+    }
-+  }
++                              const WebCryptoAlgorithm& alg,
++                              const uint8_t* p,
++                              size_t n) {
++  if (!blink::afeye::Enabled()) return;
++  char afeye_tag[96];
++  std::snprintf(afeye_tag, sizeof(afeye_tag), "crypto-in %s %s", op,
++                AfeyeAlgName(alg));
 +  if (p && n) {
 +    blink::afeye::EmitSpan(blink::afeye::kCryptoOp,
-+                           blink::afeye::NowNs(), op,
++                           blink::afeye::NowNs(), afeye_tag,
 +                           p, static_cast<uint32_t>(n));
++  } else {
++    blink::afeye::EmitStr(blink::afeye::kCryptoOp,
++                          blink::afeye::NowNs(), afeye_tag);
 +  }
++}
++
++static void AfeyeSubtleFact(const char* op,
++                            const WebCryptoAlgorithm& alg,
++                            const char* extra) {
++  if (!blink::afeye::Enabled()) return;
++  char afeye_tag[160];
++  std::snprintf(afeye_tag, sizeof(afeye_tag), "crypto-in %s %s%s%s", op,
++                AfeyeAlgName(alg), extra && *extra ? " " : "",
++                extra ? extra : "");
++  blink::afeye::EmitStr(blink::afeye::kCryptoOp,
++                        blink::afeye::NowNs(), afeye_tag);
++}
++
++static void AfeyeSubtleFact(const char* op,
++                            const WebCryptoKeyAlgorithm& alg,
++                            const char* extra) {
++  if (!blink::afeye::Enabled()) return;
++  char afeye_tag[160];
++  std::snprintf(afeye_tag, sizeof(afeye_tag), "crypto-in %s %s%s%s", op,
++                AfeyeAlgName(alg), extra && *extra ? " " : "",
++                extra ? extra : "");
++  blink::afeye::EmitStr(blink::afeye::kCryptoOp,
++                        blink::afeye::NowNs(), afeye_tag);
 +}
 +#endif
 +
  SubtleCrypto::SubtleCrypto() = default;
  
  ScriptPromise<DOMArrayBuffer> SubtleCrypto::encrypt(
-@@ -242,6 +275,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::encrypt(
-     CryptoKey* key,
-     const V8BufferSource* raw_data,
-     ExceptionState& exception_state) {
+@@ -259,6 +324,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::encrypt(
+   //           happen after normalizing the algorithm, since normalization can
+   //           run author getters that mutate or detach the data buffer.
+   std::vector<uint8_t> data = CopyBytes(raw_data);
 +#ifdef BLINK_AFEYE
-+  AfeyeDumpSubtleOp("encrypt", raw_data);
++  AfeyeDumpSubtleOp("encrypt", normalized_algorithm,
++                    data.data(), data.size());
 +#endif
-+
-   // Method described by:
-   // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-encrypt
  
-@@ -292,6 +329,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::decrypt(
-     CryptoKey* key,
-     const V8BufferSource* raw_data,
-     ExceptionState& exception_state) {
+   auto* resolver =
+       MakeGarbageCollected<ScriptPromiseResolver<DOMArrayBuffer>>(script_state);
+@@ -309,6 +378,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::decrypt(
+   //           happen after normalizing the algorithm, since normalization can
+   //           run author getters that mutate or detach the data buffer.
+   std::vector<uint8_t> data = CopyBytes(raw_data);
 +#ifdef BLINK_AFEYE
-+  AfeyeDumpSubtleOp("decrypt", raw_data);
++  AfeyeDumpSubtleOp("decrypt", normalized_algorithm,
++                    data.data(), data.size());
 +#endif
-+
-   // Method described by:
-   // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-decrypt
  
-@@ -342,6 +383,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::sign(
-     CryptoKey* key,
-     const V8BufferSource* raw_data,
-     ExceptionState& exception_state) {
+   auto* resolver =
+       MakeGarbageCollected<ScriptPromiseResolver<DOMArrayBuffer>>(script_state);
+@@ -359,6 +432,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::sign(
+   //           after normalizing the algorithm, since normalization can run
+   //           author getters that mutate or detach the data buffer.
+   std::vector<uint8_t> data = CopyBytes(raw_data);
 +#ifdef BLINK_AFEYE
-+  AfeyeDumpSubtleOp("sign", raw_data);
++  AfeyeDumpSubtleOp("sign", normalized_algorithm,
++                    data.data(), data.size());
 +#endif
-+
-   // Method described by:
-   // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-sign
  
-@@ -447,6 +492,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::digest(
-     const V8AlgorithmIdentifier* raw_algorithm,
-     const V8BufferSource* raw_data,
-     ExceptionState& exception_state) {
+   auto* resolver =
+       MakeGarbageCollected<ScriptPromiseResolver<DOMArrayBuffer>>(script_state);
+@@ -415,6 +492,9 @@ ScriptPromise<IDLBoolean> SubtleCrypto::verifySignature(
+   // normalization can run author getters that mutate or detach these buffers.
+   std::vector<uint8_t> signature = CopyBytes(raw_signature);
+   std::vector<uint8_t> data = CopyBytes(raw_data);
 +#ifdef BLINK_AFEYE
-+  AfeyeDumpSubtleOp("digest", raw_data);
++  AfeyeDumpSubtleOp("verify", normalized_algorithm, data.data(), data.size());
 +#endif
-+
-   // Method described by:
-   // https://w3c.github.io/webcrypto/Overview.html#SubtleCrypto-method-digest
  
-@@ -823,6 +872,7 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::deriveBits(
+   auto* resolver =
+       MakeGarbageCollected<ScriptPromiseResolver<IDLBoolean>>(script_state);
+@@ -464,6 +544,10 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::digest(
+   //           happen after normalizing the algorithm, since normalization can
+   //           run author getters that mutate or detach the data buffer.
+   std::vector<uint8_t> data = CopyBytes(raw_data);
++#ifdef BLINK_AFEYE
++  AfeyeDumpSubtleOp("digest", normalized_algorithm,
++                    data.data(), data.size());
++#endif
+ 
+   auto* resolver =
+       MakeGarbageCollected<ScriptPromiseResolver<DOMArrayBuffer>>(script_state);
+@@ -503,6 +587,13 @@ ScriptPromise<V8UnionCryptoKeyOrCryptoKeyPair> SubtleCrypto::generateKey(
+                           exception_state)) {
+     return EmptyPromise();
+   }
++#ifdef BLINK_AFEYE
++  {
++    char afeye_x[64];
++    std::snprintf(afeye_x, sizeof(afeye_x), "extractable=%d", extractable ? 1 : 0);
++    AfeyeSubtleFact("generateKey", normalized_algorithm, afeye_x);
++  }
++#endif
+ 
+   auto* resolver = MakeGarbageCollected<
+       ScriptPromiseResolver<V8UnionCryptoKeyOrCryptoKeyPair>>(script_state);
+@@ -654,6 +745,15 @@ ScriptPromise<V8UnionArrayBufferOrJsonWebKey> SubtleCrypto::exportKey(
+   auto promise = resolver->Promise();
+ 
+   HistogramKey(ExecutionContext::From(script_state), key->Key());
++#ifdef BLINK_AFEYE
++  {
++    char afeye_x[128];
++    std::snprintf(afeye_x, sizeof(afeye_x), "key=%p format=%s",
++                  static_cast<const void*>(key->Key().Handle()),
++                  raw_format.Utf8().c_str());
++    AfeyeSubtleFact("exportKey", key->Key().Algorithm(), afeye_x);
++  }
++#endif
+   scoped_refptr<base::SingleThreadTaskRunner> task_runner =
+       ExecutionContext::From(script_state)
+           ->GetTaskRunner(blink::TaskType::kInternalWebCrypto);
+@@ -689,6 +789,15 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::wrapKey(
+                           exception_state)) {
+     return EmptyPromise();
+   }
++#ifdef BLINK_AFEYE
++  {
++    char afeye_x[128];
++    std::snprintf(afeye_x, sizeof(afeye_x), "format=%s keyalg=%s",
++                  raw_format.Utf8().c_str(),
++                  AfeyeAlgName(key->Key().Algorithm()));
++    AfeyeSubtleFact("wrapKey", normalized_algorithm, afeye_x);
++  }
++#endif
+ 
+   auto* resolver =
+       MakeGarbageCollected<ScriptPromiseResolver<DOMArrayBuffer>>(script_state);
+@@ -787,6 +896,10 @@ ScriptPromise<CryptoKey> SubtleCrypto::unwrapKey(
+   //            held by the wrappedKey parameter passed to the unwrapKey
+   //            method.
+   std::vector<uint8_t> wrapped_key = CopyBytes(raw_wrapped_key);
++#ifdef BLINK_AFEYE
++  AfeyeDumpSubtleOp("unwrapKey", normalized_algorithm,
++                    wrapped_key.data(), wrapped_key.size());
++#endif
+ 
+   // 14.3.12.11: If the name member of normalizedAlgorithm is not equal to
+   //             the name attribute of the [[algorithm]] internal slot of
+@@ -823,6 +936,7 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::deriveBits(
      CryptoKey* base_key,
      std::optional<unsigned> length_bits,
      ExceptionState& exception_state) {
@@ -500,6 +599,32 @@ index b456ecc..40d1755 100644
    // Method described by:
    // https://w3c.github.io/webcrypto/Overview.html#dfn-SubtleCrypto-method-deriveBits
  
+@@ -835,6 +949,9 @@ ScriptPromise<DOMArrayBuffer> SubtleCrypto::deriveBits(
+                           exception_state)) {
+     return EmptyPromise();
+   }
++#ifdef BLINK_AFEYE
++  AfeyeSubtleFact("deriveBits", normalized_algorithm, nullptr);
++#endif
+ 
+   // 14.3.8.7: If the name member of normalizedAlgorithm is not equal to the
+   //           name attribute of the [[algorithm]] internal slot of baseKey
+@@ -897,6 +1014,15 @@ ScriptPromise<CryptoKey> SubtleCrypto::deriveKey(
+                           normalized_derived_key_algorithm, exception_state)) {
+     return EmptyPromise();
+   }
++#ifdef BLINK_AFEYE
++  {
++    char afeye_x[96];
++    std::snprintf(afeye_x, sizeof(afeye_x), "derived=%s extractable=%d",
++                  AfeyeAlgName(normalized_derived_key_algorithm),
++                  extractable ? 1 : 0);
++    AfeyeSubtleFact("deriveKey", normalized_algorithm, afeye_x);
++  }
++#endif
+ 
+   // TODO(eroman): The description in the spec needs to be updated as
+   // it doesn't describe algorithm normalization for the Get Key
 diff --git a/third_party/blink/renderer/modules/mediastream/media_device_info.cc b/third_party/blink/renderer/modules/mediastream/media_device_info.cc
 index 39c9356..83c80fc 100644
 --- a/third_party/blink/renderer/modules/mediastream/media_device_info.cc
@@ -602,7 +727,7 @@ index eb3a939..0a483cb 100644
  
  #include <algorithm>
  
-@@ -226,6 +229,19 @@ void OfflineAudioDestinationHandler::SuspendOfflineRendering() {
+@@ -226,6 +229,22 @@ void OfflineAudioDestinationHandler::SuspendOfflineRendering() {
  
  void OfflineAudioDestinationHandler::FinishOfflineRendering() {
    DCHECK(!IsMainThread());
@@ -613,8 +738,11 @@ index eb3a939..0a483cb 100644
 +    uint32_t afeye_n = static_cast<uint32_t>(
 +        afeye_span.size() > 16384 ? 16384 : afeye_span.size());
 +    if (afeye_n > 0) {
++      char afeye_tag[64];
++      std::snprintf(afeye_tag, sizeof(afeye_tag),
++                    "audio/offline-ch0 len=%zu", afeye_span.size());
 +      blink::afeye::EmitSpan(blink::afeye::kAudio, blink::afeye::NowNs(),
-+                             "audio/offline-ch0",
++                             afeye_tag,
 +                             afeye_span.data(), afeye_n);
 +    }
 +  }
@@ -623,7 +751,7 @@ index eb3a939..0a483cb 100644
    // The actual rendering has been completed. Notify the context.
    PostCrossThreadTask(
 diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index 403e1b3..8804690 100644
+index 403e1b3..e9b8f1d 100644
 --- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 @@ -24,6 +24,11 @@
@@ -654,7 +782,24 @@ index 403e1b3..8804690 100644
    ExecutionContext* context = ExecutionContext::From(script_state);
  
    if (name == WebGLDebugRendererInfo::ExtensionName()) {
-@@ -3989,6 +4003,76 @@ void WebGLRenderingContextBase::RecordANGLEImplementation() {
+@@ -3881,6 +3895,16 @@ ScriptObject WebGLRenderingContextBase::getExtension(ScriptState* script_state,
+   }
+ 
+   WebGLExtension* extension = EnableExtensionIfSupported(name, context);
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[160];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "webgl/get-extension-r name=%.64s present=%d",
++                  name.Utf8().c_str(), extension ? 1 : 0);
++    blink::afeye::EmitStr(blink::afeye::kFingerprint,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
+   return ScriptObject(
+       script_state->GetIsolate(),
+       ToV8Traits<IDLNullable<WebGLExtension>>::ToV8(script_state, extension));
+@@ -3989,6 +4013,76 @@ void WebGLRenderingContextBase::RecordANGLEImplementation() {
  
  ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
                                                      GLenum pname) {
@@ -731,7 +876,7 @@ index 403e1b3..8804690 100644
    if (isContextLost())
      return ScriptValue::CreateNull(script_state->GetIsolate());
    const int kIntZero = 0;
-@@ -4487,6 +4571,17 @@ String WebGLRenderingContextBase::getShaderInfoLog(WebGLShader* shader) {
+@@ -4487,6 +4581,17 @@ String WebGLRenderingContextBase::getShaderInfoLog(WebGLShader* shader) {
  WebGLShaderPrecisionFormat* WebGLRenderingContextBase::getShaderPrecisionFormat(
      GLenum shader_type,
      GLenum precision_type) {
@@ -749,7 +894,33 @@ index 403e1b3..8804690 100644
    if (isContextLost())
      return nullptr;
    if (!ValidateShaderType("getShaderPrecisionFormat", shader_type)) {
-@@ -4533,6 +4628,22 @@ WebGLRenderingContextBase::getSupportedExtensions() {
+@@ -4510,8 +4615,23 @@ WebGLShaderPrecisionFormat* WebGLRenderingContextBase::getShaderPrecisionFormat(
+   GLint precision = 0;
+   ContextGL()->GetShaderPrecisionFormat(shader_type, precision_type, range,
+                                         &precision);
+-  return MakeGarbageCollected<WebGLShaderPrecisionFormat>(range[0], range[1],
+-                                                          precision);
++  WebGLShaderPrecisionFormat* afeye_fmt =
++      MakeGarbageCollected<WebGLShaderPrecisionFormat>(range[0], range[1],
++                                                       precision);
++#ifdef BLINK_AFEYE
++  if (blink::afeye::Enabled()) {
++    char afeye_buf[160];
++    std::snprintf(afeye_buf, sizeof(afeye_buf),
++                  "webgl/shader-precision-r sh=%u pr=%u rmin=%d rmax=%d "
++                  "prec=%d",
++                  static_cast<unsigned>(shader_type),
++                  static_cast<unsigned>(precision_type), range[0], range[1],
++                  precision);
++    blink::afeye::EmitStr(blink::afeye::kFingerprint,
++                          blink::afeye::NowNs(), afeye_buf);
++  }
++#endif
++  return afeye_fmt;
+ }
+ 
+ String WebGLRenderingContextBase::getShaderSource(WebGLShader* shader) {
+@@ -4533,6 +4653,22 @@ WebGLRenderingContextBase::getSupportedExtensions() {
      }
    }
  

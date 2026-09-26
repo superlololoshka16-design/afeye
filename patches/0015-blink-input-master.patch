@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/core/input/widget_event_handler.cc b/third_party/blink/renderer/core/input/widget_event_handler.cc
-index 9fcfd9f..189d13e 100644
+index 9fcfd9f..edc6951 100644
 --- a/third_party/blink/renderer/core/input/widget_event_handler.cc
 +++ b/third_party/blink/renderer/core/input/widget_event_handler.cc
 @@ -4,6 +4,19 @@
@@ -36,7 +36,7 @@ index 9fcfd9f..189d13e 100644
 +    return v != nullptr && *v != '\0' && v[0] == '0';
 +  }();
 +  if (g_afeye_rawin_off) return;
-+  if (g_afeye_rawin.fetch_add(1, std::memory_order_relaxed) >= 4000000) {
++  if (!blink::afeye::AfeyeCapConsume(&g_afeye_rawin, 4000000, "input-raw")) {
 +    return;
 +  }
 +  const int afeye_mods = static_cast<int>(event.GetModifiers());

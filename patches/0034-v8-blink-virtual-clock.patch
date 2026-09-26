@@ -1,8 +1,8 @@
 diff --git a/third_party/blink/renderer/core/timing/performance.cc b/third_party/blink/renderer/core/timing/performance.cc
-index 9d0a4ae..9f3b64c 100755
+index 39d9e77..2da1326 100644
 --- a/third_party/blink/renderer/core/timing/performance.cc
 +++ b/third_party/blink/renderer/core/timing/performance.cc
-@@ -37,6 +37,13 @@
+@@ -37,6 +37,40 @@
  #include <cstdlib>
  
  #include "third_party/blink/renderer/platform/afeye/sink.h"
@@ -13,51 +13,72 @@ index 9d0a4ae..9f3b64c 100755
 +// instructions, not wall time - tracing slowdown stays invisible to
 +// timing-based bot detectors.
 +extern "C" uint64_t afeye_vclock_ns(void);
++
++namespace {
++
++bool AfeyeVclockOn() {
++  static bool on = []() {
++    const char* v = ::getenv("AFEYE_VIRTUAL_CLOCK");
++    return v != nullptr && *v != '\0' && v[0] != '0';
++  }();
++  return on;
++}
++
++// Single virtual-clock base shared by Performance::now() and
++// Performance::timeOrigin(): the real wall-clock epoch captured once at
++// first read. timeOrigin() reports it and now() reports instruction time
++// since that capture, so the page-side cross-checks stay coherent under
++// the virtual clock: new Date(timeOrigin) is a plausible current date and
++// Date.now() - timeOrigin - now() stays at the millisecond capture skew
++// the stock pair also has (0034's Date hook returns the same shape:
++// epoch captured once + vclock). A monotonic-uptime base here would make
++// timeOrigin read as 1970 and now() as hours - trivially detectable.
++double AfeyeVclockOriginMs() {
++  static double origin =
++      (base::Time::Now() - base::Time::UnixEpoch()).InMillisecondsF();
++  return origin;
++}
++
++}  // namespace
  #endif
  
  #include <algorithm>
-@@ -1373,6 +1380,25 @@ DOMHighResTimeStamp Performance::now() const {
-                             "clock performance-now");
-     }
-   }
+@@ -358,7 +392,17 @@ DOMHighResTimeStamp Performance::timeOrigin() const {
+ DOMHighResTimeStamp Performance::timeOrigin() const {
++#ifdef BLINK_AFEYE
++  // afeye 0034: under the virtual clock timeOrigin reports the wall-clock
++  // epoch base captured once, while now() returns instruction time since
++  // that capture - the stock timeOrigin+now() relationship holds, so the
++  // page's cross-checks (Date.now vs timeOrigin+now, new Date(timeOrigin))
++  // stay coherent. Document event timeStamp values are NOT virtualized.
++  if (blink::afeye::Enabled() && AfeyeVclockOn()) {
++    return AfeyeVclockOriginMs();
++  }
 +#endif
+   DCHECK(!time_origin_.is_null());
+   base::TimeDelta time_origin_from_zero_monotonic =
+       time_origin_ - base::TimeTicks();
+   return ClampTimeResolution(
+       unix_at_zero_monotonic_ + time_origin_from_zero_monotonic,
+       cross_origin_isolated_capability_);
+@@ -1381,3 +1425,12 @@ DOMHighResTimeStamp Performance::now() const {
+ #endif
 +#ifdef BLINK_AFEYE
 +  // afeye 0034: when the virtual clock is on, performance.now() returns
-+  // epoch-origin + executed-instruction time. Monotone per instruction
-+  // tick, smooth regardless of host speed. Off by default; the 0012
++  // executed-instruction time (ms), the same small delta shape the stock
++  // path returns - no epoch, no uptime base. Off by default; the 0012
 +  // trace above still logs real now() calls for telemetry.
-+  if (blink::afeye::Enabled()) {
-+    static bool g_afeye_vclock = []() {
-+      const char* v = ::getenv("AFEYE_VIRTUAL_CLOCK");
-+      return v != nullptr && *v != '\0' && v[0] != '0';
-+    }();
-+    if (g_afeye_vclock) {
-+      static double g_afeye_origin_ms = []() {
-+        return base::TimeTicks::Now().since_origin().InMillisecondsF();
-+      }();
-+      return g_afeye_origin_ms +
-+             static_cast<double>(afeye_vclock_ns()) / 1000000.0;
-+    }
++  if (blink::afeye::Enabled() && AfeyeVclockOn()) {
++    return static_cast<double>(afeye_vclock_ns()) / 1000000.0;
 +  }
- #endif
++#endif
    return MonotonicTimeToDOMHighResTimeStamp(base::TimeTicks::Now());
  }
 diff --git a/v8/src/objects/js-objects.cc b/v8/src/objects/js-objects.cc
-index 90dfb8d..29a036a 100644
+index 247ba54..20afc19 100644
 --- a/v8/src/objects/js-objects.cc
 +++ b/v8/src/objects/js-objects.cc
-@@ -3,6 +3,10 @@
- // found in the LICENSE file.
- 
- #include "src/objects/js-objects.h"
-+#ifdef V8_AFEYE
-+#include <cstdlib>
-+#include "src/afeye/sink.h"
-+#endif
- 
- #include <limits>
- #include <optional>
-@@ -5914,6 +5918,25 @@ MaybeDirectHandle<JSDate> JSDate::New(Isolate* isolate,
+@@ -5978,6 +5978,25 @@ int64_t JSDate::CurrentTimeValue(Isolate* isolate) {
  int64_t JSDate::CurrentTimeValue(Isolate* isolate) {
    if (v8_flags.log_timer_events) LOG(isolate, CurrentTimeEvent());
    if (v8_flags.correctness_fuzzer_suppressions) return 4;

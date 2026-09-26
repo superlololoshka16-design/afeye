@@ -4,38 +4,24 @@ mod browser;
 mod capture;
 mod classify;
 mod ctx;
+mod drive;
 mod events;
-mod human;
-mod inject;
-mod relay;
-mod tg;
+mod motor;
 mod timefmt;
-mod wg;
 mod writer;
 mod zipper;
 
+use crate::ctx::{Ctx, Target};
+use crate::events::{FxEvent, K_META};
 use afeye::collect;
 use afeye::sinkfilter;
-use crate::ctx::{Ctx, Cn, Target, Tunnel};
-use crate::events::{FxEvent, K_META};
 use bytes::Bytes;
 use futures::future::join_all;
-use futures::StreamExt;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-#[derive(Serialize)]
-struct MTun {
-    name: String,
-    endpoint: String,
-    ns: String,
-    user: String,
-    egress: Option<String>,
-    ok: bool,
-}
 
 #[derive(Serialize)]
 struct MRun {
@@ -43,24 +29,24 @@ struct MRun {
     slot: String,
     browse_secs: u64,
     chrome: String,
-    binding: String,
     targets: Vec<String>,
-    runner_ip: String,
-    tunnels: Vec<MTun>,
     events: u64,
     requests: u64,
     responses: u64,
     bodies: u64,
-    scripts: u64,
-    batches: u64,
-    pokes: u64,
     endpoints: u64,
     artifacts: u64,
     art_bytes: u64,
     dropped: u64,
     budget_used: u64,
-    relay: u64,
-    tg_sent: u64,
+    img_budget_used: u64,
+    bc_instructions: u64,
+    bc_funcs: u64,
+    bc_live_blocks: u64,
+    bc_dead_blocks: u64,
+    valuebook_entries: u64,
+    valuebook_bytes: u64,
+    offset_mismatch: u64,
     cls_af: u64,
     cls_garbage: u64,
     cls_neutral: u64,
@@ -69,29 +55,45 @@ struct MRun {
     cls_dup: u64,
     cls_art_rm: u64,
     cls_bytes_rm: u64,
-    zip: String,
-    zip_bytes: u64,
-    filtered: String,
-    filtered_bytes: u64,
     collect_records: u64,
     collect_bytes: u64,
     collect_truncated: u64,
     collect_corrupt: u64,
-    sink_alive: bool,
     sink_chains: u64,
-    sink_hot: u64,
-    sink_cold: u64,
     sink_wasm: u64,
+    proven_chains: u64,
+    dead_end_proven: u64,
+    unresolved_chains: u64,
+    value_proven_values: u64,
+    graceful_shutdown: bool,
+    term_waited_ms: u64,
+    gate_passed: bool,
+    zip: String,
+    zip_bytes: u64,
+    filtered: String,
+    filtered_bytes: u64,
     test: bool,
 }
 
 fn env_u64(k: &str, d: u64) -> u64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    match std::env::var(k) {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("[afeye] WARN {k}={v} is not a u64, falling back to {d}");
+                d
+            }
+        },
+        Err(_) => d,
+    }
 }
 
 impl Ctx {
     pub fn budget_limit(&self) -> u64 {
         env_u64("AF_BUDGET_MB", 350) * 1024 * 1024
+    }
+    pub fn img_budget_limit(&self) -> u64 {
+        env_u64("AF_IMG_BUDGET_MB", 150) * 1024 * 1024
     }
 }
 
@@ -104,43 +106,8 @@ fn now_ms() -> u64 {
 
 const TAB_UP: Duration = Duration::from_secs(90);
 
-fn meta_ev(ctx: &Ctx, tun: u32, d: Bytes) {
-    let _ = ctx.tx.send(FxEvent {
-        t: now_ms(),
-        site: 0,
-        tun,
-        tab: 0,
-        vendor: 0,
-        name: 0,
-        kind: K_META,
-        _pad: 0,
-        d,
-    });
-}
-
-fn dummy_tunnel() -> Tunnel {
-    Tunnel {
-        i: 0,
-        name: "local".into(),
-        user: "local".into(),
-        ns: "local".into(),
-        wg_if: "local".into(),
-        h_if: "local".into(),
-        n_if: "local".into(),
-        host_ip: "127.0.0.1".into(),
-        ns_ip: "127.0.0.1".into(),
-        port: 0,
-        endpoint: "local".into(),
-        pubkey: String::new(),
-        privkey: String::new(),
-        addr: vec![],
-        dns: vec![],
-        egress: None,
-    }
-}
-
-fn load_targets(p: &PathBuf) -> Result<Vec<Target>, String> {
-    let raw = std::fs::read(p).map_err(|e| e.to_string())?;
+fn load_targets(p: &Path) -> Result<Vec<Target>, String> {
+    let raw = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
     let s = simdutf8::basic::from_utf8(&raw).map_err(|e| e.to_string())?;
     let v: serde_json::Value = serde_json::from_str(s).map_err(|e| e.to_string())?;
     let mut out: Vec<Target> = Vec::new();
@@ -157,7 +124,7 @@ fn load_targets(p: &PathBuf) -> Result<Vec<Target>, String> {
         }
     }
     if out.is_empty() {
-        return Err("targets.json: no http targets".into());
+        return Err(format!("{}: no http targets", p.display()));
     }
     Ok(out)
 }
@@ -176,42 +143,16 @@ async fn run() -> Result<(), String> {
     let t0 = Instant::now();
     let t0ms = now_ms();
     let root = PathBuf::from(std::env::var("AF_ROOT").unwrap_or_else(|_| ".".into()));
-    let local = std::env::var("AF_LOCAL").is_ok() || test;
-    if !local && !is_root() {
-        return Err("run as root or set AF_LOCAL=1".into());
-    }
     let browse = Duration::from_secs(env_u64("AF_BROWSE_SECS", if test { 200 } else { 2280 }));
     let hard = Duration::from_secs(env_u64("AF_HARD_SECS", if test { 320 } else { 39 * 60 }));
     let stage = PathBuf::from("/tmp/afeye/stage");
     let out = root.join("dumps");
     let (tx, rx) = crossbeam_channel::unbounded::<FxEvent>();
     let (atx, arx) = crossbeam_channel::unbounded::<events::Art>();
-    let targets = load_targets(&root.join("targets.json"))?;
-    let mut tunnels: Vec<Tunnel> = Vec::new();
-    if !local {
-        let wgdir = root.join("wg");
-        let mut confs: Vec<(String, String)> = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&wgdir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.extension().map(|x| x == "conf").unwrap_or(false) {
-                    if let Ok(b) = std::fs::read(&p) {
-                        if let Ok(s) = simdutf8::basic::from_utf8(&b) {
-                            let name = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                            confs.push((name, s.to_owned()));
-                        }
-                    }
-                }
-            }
-        }
-        confs.sort();
-        for (i, (name, raw)) in confs.iter().enumerate() {
-            match wg::parse_conf(i as u32 + 1, name, raw) {
-                Ok(t) => tunnels.push(t),
-                Err(e) => eprintln!("[afeye] skip {name}: {e}"),
-            }
-        }
-    }
+    let tpath = std::env::var("AF_TARGETS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("targets.example.json"));
+    let targets = load_targets(&tpath)?;
     let interner = arena::Interner::new();
     for t in &targets {
         interner.intern(&t.host);
@@ -219,12 +160,15 @@ async fn run() -> Result<(), String> {
     for (_, v) in ctx::VENDORS {
         interner.intern(v);
     }
-    let binding = format!("_k{}z", t0ms % 997);
+    let tun = interner.intern("local");
     let slot = timefmt::slot(t0ms, 30);
     let rid = timefmt::run_id(t0ms);
     let stage_run = stage.join(&slot);
     std::fs::create_dir_all(&stage_run).map_err(|e| e.to_string())?;
-    let raw_dir = std::env::var("AF_RAW_DIR").unwrap_or_else(|_| "/tmp/afeye-raw".into());
+    let collect_dir = stage_run.join("collect");
+    let raw_dir = PathBuf::from(
+        std::env::var("AFEYE_RAW_DIR").unwrap_or_else(|_| collect::DEFAULT_RAW_DIR.to_owned()),
+    );
     let _ = std::fs::create_dir_all(&raw_dir);
     #[cfg(unix)]
     {
@@ -242,14 +186,9 @@ async fn run() -> Result<(), String> {
             }
         }
     }
-    let collector = collect::Collector::spawn(&stage_run);
-    let chrome = find_chrome().ok_or("chrome binary not found")?;
+    let collector = collect::Collector::spawn_dirs(raw_dir, collect_dir.clone());
+    let chrome = find_chrome(&root)?;
     let ua = user_agent_for(&chrome);
-    let xv = if local {
-        None
-    } else {
-        Some(browser::spawn_xvfb()?)
-    };
     let ctx = Arc::new(Ctx {
         stage: stage_run.clone(),
         slot: slot.clone(),
@@ -259,20 +198,14 @@ async fn run() -> Result<(), String> {
         tx: tx.clone(),
         art: atx.clone(),
         interner,
-        cn: Cn::new(),
+        cn: ctx::Cn::new(),
         targets,
-        tunnels,
-        binding: binding.clone(),
         budget: std::sync::atomic::AtomicU64::new(0),
+        img_budget: std::sync::atomic::AtomicU64::new(0),
         chrome: chrome.clone(),
         ua,
-        display: xv.as_ref().map(|x| x.display.clone()).unwrap_or_default(),
         endpoints: dashmap::DashMap::new(),
-        gl_spoof: std::env::var("AF_GL_SPOOF").is_ok(),
     });
-    for t in &ctx.tunnels {
-        ctx.interner.intern(&t.endpoint.replace(':', "_"));
-    }
     let writer = writer::spawn(rx, arx, ctx.clone());
     {
         let probe = collector.hellos_handle();
@@ -283,151 +216,46 @@ async fn run() -> Result<(), String> {
                 let n = probe();
                 if n == 0 {
                     eprintln!(
-                        "[afeye] WARN sink layer DEAD: chrome has no afeye sinks (stock build?) - deep v8/blink/net raw records missing, CDP layer only"
+                        "[afeye] WARN no sink-hello after 30s: the integrity gate will reject this run"
                     );
                 } else {
-                    eprintln!("[afeye] sink layer alive: {n} sink-hello records");
+                    eprintln!("[afeye] sink layers alive: {n} sink-hello records");
                 }
             })
             .ok();
     }
-    let runner_ip = if local {
-        "local".into()
-    } else {
-        wg::runner_ip().await
-    };
     eprintln!(
-        "[afeye] run {rid} slot {slot} runner {runner_ip} targets {} tunnels {}",
-        ctx.targets.len(),
-        ctx.tunnels.len()
+        "[afeye] run {rid} slot {slot} chrome {} targets {}",
+        chrome.display(),
+        ctx.targets.len()
     );
-    let mut good: Vec<Arc<Tunnel>> = Vec::new();
-    if !local {
-        let work = PathBuf::from("/tmp/afeye/wg");
-        let _ = std::fs::create_dir_all(&work);
-        let setups: Vec<_> = ctx
-            .tunnels
-            .iter()
-            .map(|t| async {
-                let ok = wg::prep_user_dirs(t).await.is_ok()
-                    && wg::setup(t, &work).await.is_ok();
-                (t.clone(), ok)
-            })
-            .collect();
-        for (t, ok) in join_all(setups).await {
-            if !ok {
-                eprintln!("[afeye] {} setup failed", t.name);
-                let _ = wg::teardown(&t).await;
-            }
-        }
-        let verifies: Vec<_> = ctx
-            .tunnels
-            .iter()
-            .map(|t| async { (t.clone(), wg::verify(t).await) })
-            .collect();
-        for (t, res) in join_all(verifies).await {
-            let mut tt = t;
-            match res {
-                Ok(ip) => {
-                    tt.egress = Some(ip.clone());
-                    eprintln!("[afeye] {} egress {ip}", tt.name);
-                    let mut j = events::J::new(128);
-                    j.open();
-                    j.fkey("egress");
-                    j.s(&ip);
-                    j.key("endpoint");
-                    j.s(&tt.endpoint);
-                    j.key("ok");
-                    j.bool(true);
-                    meta_ev(&ctx, tt.i, j.fin());
-                    good.push(Arc::new(tt));
-                }
-                Err(e) => {
-                    eprintln!("[afeye] {} verify failed: {e}", tt.name);
-                    let mut j = events::J::new(160);
-                    j.open();
-                    j.fkey("egress");
-                    j.s("");
-                    j.key("endpoint");
-                    j.s(&tt.endpoint);
-                    j.key("ok");
-                    j.bool(false);
-                    j.key("err");
-                    j.s(&e);
-                    meta_ev(&ctx, tt.i, j.fin());
-                    let _ = wg::teardown(&tt).await;
-                }
-            }
-        }
-    }
+    let port: u16 = env_u64("AF_LOCAL_PORT", 9600) as u16;
+    let child = browser::launch_chrome_local(&ctx, port).await?;
+    let cdp = browser::connect(&ctx, "127.0.0.1", port).await?;
     let mut tbs: Vec<capture::Tb> = Vec::new();
-    let mut children: Vec<tokio::process::Child> = Vec::new();
-    let _dummy = Arc::new(dummy_tunnel());
-    let spawn_tabs = |b: chromiumoxide::Browser, tun: u32| {
-        let b = Arc::new(b);
-        let jobs: Vec<_> = ctx
-            .targets
-            .iter()
-            .enumerate()
-            .map(|(i, tg)| {
-                let b2 = b.clone();
-                let ctx3 = ctx.clone();
-                async move {
-                    let page = match tokio::time::timeout(TAB_UP, b2.new_page("about:blank")).await {
-                        Ok(Ok(p)) => p,
-                        _ => return None,
-                    };
-                    let site = ctx3.interner.intern(&tg.host);
-                    let tb = capture::Tb {
-                        ctx: ctx3.clone(),
-                        tun,
-                        site,
-                        tab: i as u32,
-                        page,
-                        meta: capture::Meta::default(),
-                    };
-                    let _ = tokio::time::timeout(TAB_UP, capture::instrument(tb.clone(), &tg.url)).await;
-                    Some(tb)
-                }
-            })
-            .collect();
-        jobs
-    };
-    if local {
-        let port: u16 = env_u64("AF_LOCAL_PORT", 9600) as u16;
-        if let Ok(c) = browser::launch_chrome_local(&ctx, port).await {
-            children.push(c);
-            match browser::connect(&ctx, "127.0.0.1", port).await {
-                Ok(b) => {
-                    let tun = ctx.interner.intern("local");
-                    tbs.extend(join_all(spawn_tabs(b, tun)).await.into_iter().flatten());
-                }
-                Err(e) => eprintln!("[afeye] connect: {e}"),
+    for (i, tg) in ctx.targets.iter().enumerate() {
+        let page = match tokio::time::timeout(TAB_UP, cdp.new_page("about:blank")).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                eprintln!("[afeye] tab {i} open: {e}");
+                continue;
             }
-        } else {
-            eprintln!("[afeye] chrome: local launch failed");
-        }
-    } else {
-        let mut futs = futures::stream::FuturesUnordered::new();
-        for t in good {
-            let c2 = ctx.clone();
-            futs.push(async move {
-                let tun_id = c2.interner.intern(&t.endpoint.replace(':', "_"));
-                match browser::run_tunnel(&c2, &t).await {
-                    Ok((c, b)) => Ok((c, b, tun_id)),
-                    Err(e) => Err((e, t.name.clone())),
-                }
-            });
-        }
-        while let Some(r) = futs.next().await {
-            match r {
-                Ok((c, b, tun_id)) => {
-                    children.push(c);
-                    tbs.extend(join_all(spawn_tabs(b, tun_id)).await.into_iter().flatten());
-                }
-                Err((e, name)) => eprintln!("[afeye] {name} browser: {e}"),
+            Err(_) => {
+                eprintln!("[afeye] tab {i} open timeout");
+                continue;
             }
-        }
+        };
+        let site = ctx.interner.intern(&tg.host);
+        let tb = capture::Tb {
+            ctx: ctx.clone(),
+            tun,
+            site,
+            tab: i as u32,
+            page,
+            meta: capture::Meta::default(),
+        };
+        let _ = tokio::time::timeout(TAB_UP, capture::instrument(tb.clone(), &tg.url)).await;
+        tbs.push(tb);
     }
     eprintln!(
         "[afeye] browsing tabs={} setup={}s",
@@ -437,165 +265,50 @@ async fn run() -> Result<(), String> {
     let left = ctx
         .deadline
         .saturating_duration_since(Instant::now())
-        .saturating_sub(if hard.as_secs() > 600 { Duration::from_secs(420) } else { Duration::from_secs(90) })
+        .saturating_sub(if hard.as_secs() > 600 {
+            Duration::from_secs(420)
+        } else {
+            Duration::from_secs(90)
+        })
         .max(Duration::from_secs(30));
-    let want = ctx.browse.saturating_sub(Duration::from_secs(t0.elapsed().as_secs()));
+    let want = ctx
+        .browse
+        .saturating_sub(Duration::from_secs(t0.elapsed().as_secs()));
     let session = want.min(left);
     let end = tokio::time::Instant::from_std(Instant::now() + session);
-    let tabs: Vec<capture::Tab> = tbs
-        .iter()
-        .map(|tb| capture::Tab {
-            page: tb.page.clone(),
-            site: tb.site,
-            tun: tb.tun,
-            tab: tb.tab,
-        })
-        .collect();
-    let hb = tokio::spawn(human::drive(ctx.clone(), tabs.clone()));
-    let relay_on = std::env::var("AFEYE_QUEUE_URL").map(|u| u.starts_with("http")).unwrap_or(false);
-    let rb = if relay_on {
-        Some(tokio::spawn(relay::run(ctx.clone(), tabs)))
-    } else {
-        None
-    };
-    let tb_on = !test
-        && !std::env::var("AFEYE_TG_TOKEN").unwrap_or_default().is_empty()
-        && !std::env::var("AFEYE_TG_CHAT").unwrap_or_default().is_empty();
-    let tg_thread = if tb_on {
-        let ctx2 = ctx.clone();
-        std::thread::Builder::new()
-            .name("afeye-tg".into())
-            .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                    Ok(r) => r,
-                    Err(_) => return tg::TgOut { sent: 0, errors: 0 },
-                };
-                rt.block_on(tg::run(ctx2))
-            })
-            .ok()
-    } else {
-        None
-    };
+    let drive_tabs = tbs.clone();
+    let drive_ctx = ctx.clone();
+    let driver = tokio::spawn(async move {
+        drive::drive(drive_ctx, drive_tabs).await;
+    });
     tokio::select! {
         _ = tokio::time::sleep_until(end) => {}
         _ = tokio::signal::ctrl_c() => {}
     }
     eprintln!("[afeye] session end, finalizing");
     ctx.cn.stop.store(true, Ordering::Release);
-    hb.abort();
-    let _ = hb.await;
-    let relay_out = match rb {
-        Some(h) => match h.await {
-            Ok(o) => o,
-            Err(_) => relay::RelayOut { executed: 0, errors: 0 },
-        },
-        None => relay::RelayOut { executed: 0, errors: 0 },
-    };
-    let tg_out = match tg_thread.and_then(|h| h.join().ok()) {
-        Some(o) => o,
-        None => tg::TgOut { sent: 0, errors: 0 },
-    };
-    let mut futs = Vec::new();
-    for tb in tbs.iter() {
-        let tb2 = tb.clone();
-        futs.push(tokio::spawn(async move {
-            let _ = capture::finalize(&tb2).await;
-        }));
-    }
-    for f in futs {
-        let _ = f.await;
-    }
-    for mut c in children {
-        #[cfg(unix)]
-        {
-             let _ = c.start_kill();
-            let _ = c.wait().await;
-            let _ = std::process::Command::new("pkill")
-                .args(["-TERM", "-f", &chrome.to_string_lossy()])
-                .status();
-        }
-        let _ = c.kill().await;
-    }
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("pkill")
-            .args(["-KILL", "-f", &chrome.to_string_lossy()])
-            .status();
-    }
-    if !local {
-        for t in &ctx.tunnels {
-            wg::teardown(t).await;
-        }
-    }
-    let cstats = collector.stop();
-    let sink_alive = ["v8/sink-hello", "blink/sink-hello", "net/sink-hello"]
+    let _ = driver.await;
+    let futs: Vec<_> = tbs
         .iter()
-        .filter_map(|k| cstats.per.get(*k).copied())
-        .sum::<u64>()
-        > 0;
-    if !sink_alive {
-        eprintln!(
-            "[afeye] FINAL sink_alive=false: zero sink-hello records - this zip carries CDP-layer capture only (chrome is not afeye-patched)"
-        );
+        .map(|tb| {
+            let tb2 = tb.clone();
+            tokio::spawn(async move {
+                let _ = capture::finalize(&tb2).await;
+            })
+        })
+        .collect();
+    for f in join_all(futs).await {
+        let _ = f;
     }
-    eprintln!(
-        "[afeye] collect: records={} bytes={} truncated={} corrupt={} files={}",
-        cstats.records, cstats.bytes, cstats.truncated, cstats.corrupt, cstats.files
-    );
-    // bctrace (0033): decode the raw Ignition instruction stream, build
-    // per-function CFG, mark dead blocks BY FACT (decoded offset never
-    // appears in the executed stream). Runs before sinkfilter because
-    // sinkfilter deletes collect/raw on success and the trace records
-    // live in part files under collect/raw.
-    let bc_stats = match afeye::bctrace::run(&stage_run.join("collect")) {
-        Ok(bc) => {
-            if bc.instructions > 0 {
-                eprintln!(
-                    "[afeye] bctrace: instructions={} funcs={} blocks live={} dead={} bytes live={} dead={} valuebook={}",
-                    bc.instructions, bc.funcs, bc.live_blocks, bc.dead_blocks,
-                    bc.live_bytes, bc.dead_bytes, bc.valuebook.len()
-                );
-            }
-            bc
-        }
-        Err(e) => {
-            eprintln!("[afeye] bctrace: {e}");
-            afeye::bctrace::Stats::default()
-        }
-    };
-    let mut sf_stats = sinkfilter::SinkFilterStats::default();
-    match sinkfilter::run(
-        &stage_run.join("collect"),
-        &bc_stats.valuebook,
-        &bc_stats.func_scripts,
-    ) {
-        Ok(sf) => {
-            eprintln!(
-                "[afeye] sinkfilter: fragments={} chains={} hot={} cold={} wasm={} net_chains={} token={} dead_end={} net_adjacent={}",
-                sf.fragments, sf.chains, sf.hot_chains, sf.cold_chains, sf.wasm_modules, sf.net_chains,
-                sf.token_chains, sf.dead_end_chains, sf.net_adjacent_chains
-            );
-            eprintln!(
-                "[afeye] verdicts: proven={} heuristic={} dead_end_proven={} unresolved={} graph: nodes={} edges={} tainted={} seeds={} fanout_dropped={}",
-                sf.proven_chains, sf.heuristic_chains, sf.dead_end_proven, sf.unresolved_chains,
-                sf.graph_nodes, sf.graph_edges, sf.graph_tainted, sf.graph_sinks, sf.graph_fanout_dropped
-            );
-            eprintln!(
-                "[afeye] value-provenance: {} distinct executed values matched byte-exact inside sink payloads (Aho-Corasick, no windows/hashes)",
-                sf.value_proven_values
-            );
-            eprintln!(
-                "[afeye] dead-end split: filtered zip carries the {} token-forming chains; all {} chains stay whole in the raw run zip",
-                sf.token_chains, sf.chains
-            );
-            let raw_dir = stage_run.join("collect/raw");
-            if sf.records > 0 {
-                let _ = std::fs::remove_dir_all(&raw_dir);
-            }
-            sf_stats = sf;
-        }
-        Err(e) => eprintln!("[afeye] sinkfilter failed (raw kept for debug): {e}"),
+    let (graceful, term_waited_ms) = terminate(child).await;
+    let mut sj = events::J::new(64);
+    sj.open();
+    sj.fkey("graceful");
+    sj.bool(graceful);
+    sj.key("term_waited_ms");
+    sj.u64v(term_waited_ms);
+    if let Err(e) = std::fs::write(&collect_dir.join("shutdown.json"), &sj.fin()[..]) {
+        eprintln!("[afeye] shutdown.json: {e}");
     }
     let _ = tx.send(FxEvent {
         t: now_ms(),
@@ -612,6 +325,71 @@ async fn run() -> Result<(), String> {
     drop(tx);
     drop(atx);
     let _ = writer.join();
+    let cstats = collector.stop();
+    let h_v8 = cstats.per_count(collect::LAYER_V8, collect::KIND_SINK_HELLO);
+    let h_blink = cstats.per_count(collect::LAYER_BLINK, collect::KIND_SINK_HELLO);
+    let h_net = cstats.per_count(collect::LAYER_NET, collect::KIND_SINK_HELLO);
+    eprintln!(
+        "[afeye] collect: records={} bytes={} truncated={} corrupt={} files={}",
+        cstats.records, cstats.bytes, cstats.truncated, cstats.corrupt, cstats.files
+    );
+    let bc = match afeye::bctrace::run(&collect_dir) {
+        Ok(bc) => {
+            eprintln!(
+                "[afeye] bctrace: instructions={} funcs={} blocks live={} dead={} bytes live={} dead={} valuebook entries={} bytes={} offset_mismatch={}",
+                bc.instructions, bc.funcs, bc.live_blocks, bc.dead_blocks,
+                bc.live_bytes, bc.dead_bytes, bc.valuebook_entries, bc.valuebook_bytes,
+                bc.offset_mismatch
+            );
+            bc
+        }
+        Err(e) => {
+            eprintln!("[afeye] bctrace: {e}");
+            afeye::bctrace::Stats::default()
+        }
+    };
+    if h_v8 == 0 || h_blink == 0 || h_net == 0 || bc.instructions == 0 {
+        eprintln!(
+            "[afeye] GATE FAIL sink-hello v8={h_v8} blink={h_blink} net={h_net} bytecode instructions={}",
+            bc.instructions
+        );
+        eprintln!("[afeye] no zip, no manifest: this run carries no engine-layer evidence");
+        return Err(format!(
+            "integrity gate: sink-hello v8={h_v8} blink={h_blink} net={h_net} instructions={}",
+            bc.instructions
+        ));
+    }
+    let mut sf_stats = sinkfilter::SinkFilterStats::default();
+    match sinkfilter::run(&collect_dir, &bc.func_scripts, &bc.script_ids) {
+        Ok(sf) => {
+            eprintln!(
+                "[afeye] sinkfilter: records={} fragments={} chains={} wasm={} prune_paths={}",
+                sf.records, sf.fragments, sf.chains, sf.wasm_modules, sf.prune_paths
+            );
+            eprintln!(
+                "[afeye] verdicts: proven={} (causality={} value={}) dead_end_proven={} unresolved={} unavailable={}",
+                sf.proven_chains, sf.proven_causality, sf.proven_value,
+                sf.dead_end_proven, sf.unresolved_chains, sf.unavailable_chains
+            );
+            eprintln!(
+                "[afeye] sid-attribution: attributed={} sid_zero={} causality edges={} roots={}",
+                sf.sid_attributed_records, sf.sid_zero_records, sf.causality_edges, sf.causality_roots
+            );
+            eprintln!(
+                "[afeye] value-provenance: {} executed values byte-exact in sink payloads across {} scripts (ac matches={})",
+                sf.value_proven_values, sf.value_proven_scripts, sf.ac_matches
+            );
+            eprintln!(
+                "[afeye] completeness: drop_witnesses={} cap_exhausted={} exec_jit_violations={} incomplete={:?}",
+                sf.drop_witnesses, sf.cap_exhausted, sf.exec_jit_violations, sf.incomplete_reasons
+            );
+            sf_stats = sf;
+        }
+        Err(e) => eprintln!("[afeye] sinkfilter failed (raw kept for debug): {e}"),
+    }
+    if std::env::var("AF_DELETE_RAW").map(|v| v == "1").unwrap_or(false) {
+        let _ = std::fs::remove_dir_all(collect_dir.join("raw"));
+    }
     let cls = classify::run(&stage_run);
     eprintln!(
         "[afeye] classify: af={} garbage={} neutral={} scripts={} kept={} dup={} art_rm={} bytes_rm={}",
@@ -637,7 +415,7 @@ async fn run() -> Result<(), String> {
         } else {
             classify::strict(&fdir);
             let mut dropped = 0usize;
-            if let Ok(rep) = std::fs::read(fdir.join("collect/filtered/report.json")) {
+            if let Ok(rep) = std::fs::read(collect_dir.join("filtered/report.json")) {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&rep) {
                     if let Some(prune) = v.get("prune").and_then(|p| p.as_array()) {
                         for ch in prune {
@@ -647,25 +425,23 @@ async fn run() -> Result<(), String> {
                                 dropped += 1;
                             }
                         }
-                    } else if let Some(chains) = v.get("chains").and_then(|c| c.as_array()) {
-                        for ch in chains {
-                            let token = ch.get("token_forming").and_then(|t| t.as_bool()).unwrap_or(false);
-                            let path = ch.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                            if !token && !path.is_empty() {
-                                let _ = std::fs::remove_file(fdir.join("collect").join(path));
-                                dropped += 1;
-                            }
-                        }
                     }
                 }
             }
-            eprintln!("[afeye] filtered zip: {dropped} dead-end chains removed (token-only)");
+            eprintln!("[afeye] filtered archive: {dropped} pruned chains removed");
             let f7z = out.join(format!("{stem}-filtered.7z"));
             if arch::have_7z() {
                 match arch::sz_pack(&fdir, &f7z, 0).await {
                     Ok(vols) => {
-                        filtered_bytes = vols.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
-                        filtered_name = f7z.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+                        filtered_bytes = vols
+                            .iter()
+                            .filter_map(|p| std::fs::metadata(p).ok())
+                            .map(|m| m.len())
+                            .sum();
+                        filtered_name = f7z
+                            .file_name()
+                            .map(|x| x.to_string_lossy().to_string())
+                            .unwrap_or_default();
                     }
                     Err(e) => eprintln!("[afeye] filtered 7z failed: {e}"),
                 }
@@ -673,7 +449,10 @@ async fn run() -> Result<(), String> {
                 let fzip = out.join(format!("{stem}-filtered.zip"));
                 if zipper::pack(&fdir, &fzip).is_ok() {
                     filtered_bytes = std::fs::metadata(&fzip).map(|m| m.len()).unwrap_or(0);
-                    filtered_name = fzip.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+                    filtered_name = fzip
+                        .file_name()
+                        .map(|x| x.to_string_lossy().to_string())
+                        .unwrap_or_default();
                 }
             }
             let _ = std::fs::remove_dir_all(&fdir);
@@ -682,40 +461,29 @@ async fn run() -> Result<(), String> {
     if !filtered_name.is_empty() {
         eprintln!("[afeye] FILTERED {filtered_name} bytes={filtered_bytes}");
     }
-    let mut mt = MRun {
-        started: rid.clone(),
-        slot: slot.clone(),
+    let mt = MRun {
+        started: rid,
+        slot,
         browse_secs: session.as_secs(),
         chrome: chrome.to_string_lossy().to_string(),
-        binding: binding.clone(),
         targets: ctx.targets.iter().map(|t| t.url.clone()).collect(),
-        runner_ip,
-        tunnels: ctx
-            .tunnels
-            .iter()
-            .map(|t| MTun {
-                name: t.name.clone(),
-                endpoint: t.endpoint.clone(),
-                ns: t.ns.clone(),
-                user: t.user.clone(),
-                egress: t.egress.clone(),
-                ok: t.egress.is_some(),
-            })
-            .collect(),
         events: ctx.cn.ev.load(Ordering::Relaxed),
         requests: ctx.cn.req.load(Ordering::Relaxed),
         responses: ctx.cn.resp.load(Ordering::Relaxed),
         bodies: ctx.cn.body.load(Ordering::Relaxed),
-        scripts: ctx.cn.scripts.load(Ordering::Relaxed),
-        batches: ctx.cn.batch.load(Ordering::Relaxed),
-        pokes: ctx.cn.poke.load(Ordering::Relaxed),
         endpoints: ctx.endpoints.len() as u64,
         artifacts: ctx.cn.art.load(Ordering::Relaxed),
         art_bytes: ctx.cn.bout.load(Ordering::Relaxed),
         dropped: ctx.cn.drop.load(Ordering::Relaxed),
         budget_used: ctx.budget.load(Ordering::Relaxed),
-        relay: relay_out.executed,
-        tg_sent: tg_out.sent,
+        img_budget_used: ctx.img_budget.load(Ordering::Relaxed),
+        bc_instructions: bc.instructions,
+        bc_funcs: bc.funcs,
+        bc_live_blocks: bc.live_blocks,
+        bc_dead_blocks: bc.dead_blocks,
+        valuebook_entries: bc.valuebook_entries,
+        valuebook_bytes: bc.valuebook_bytes,
+        offset_mismatch: bc.offset_mismatch,
         cls_af: cls.af,
         cls_garbage: cls.garbage,
         cls_neutral: cls.neutral,
@@ -724,52 +492,69 @@ async fn run() -> Result<(), String> {
         cls_dup: cls.dup,
         cls_art_rm: cls.art_rm,
         cls_bytes_rm: cls.bytes_rm,
-        zip: zp.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default(),
-        zip_bytes: 0,
-        filtered: filtered_name,
-        filtered_bytes,
         collect_records: cstats.records,
         collect_bytes: cstats.bytes,
         collect_truncated: cstats.truncated,
         collect_corrupt: cstats.corrupt,
-        sink_alive,
         sink_chains: sf_stats.chains,
-        sink_hot: sf_stats.hot_chains,
-        sink_cold: sf_stats.cold_chains,
         sink_wasm: sf_stats.wasm_modules,
+        proven_chains: sf_stats.proven_chains,
+        dead_end_proven: sf_stats.dead_end_proven,
+        unresolved_chains: sf_stats.unresolved_chains,
+        value_proven_values: sf_stats.value_proven_values,
+        graceful_shutdown: graceful,
+        term_waited_ms,
+        gate_passed: true,
+        zip: zp
+            .file_name()
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        zip_bytes: 0,
+        filtered: filtered_name,
+        filtered_bytes,
         test,
     };
-    let mp = stage.join("manifest.json");
+    let mp = stage_run.join("manifest.json");
     let _ = std::fs::write(&mp, serde_json::to_vec_pretty(&mt).unwrap_or_default());
-    let n = zipper::pack(&stage, &zp)?;
+    let n = zipper::pack(&stage_run, &zp)?;
     let size = std::fs::metadata(&zp).map(|m| m.len()).unwrap_or(0);
     if size > 95 * 1024 * 1024 {
         eprintln!("[afeye] WARN zip > 95MB, lower AF_BUDGET_MB");
     }
     let ms = out.join(format!("{stem}.manifest.json"));
-    mt.zip_bytes = size;
-    let _ = std::fs::write(&ms, serde_json::to_vec_pretty(&mt).unwrap_or_default());
+    let mut mt2 = mt;
+    mt2.zip_bytes = size;
+    let _ = std::fs::write(&ms, serde_json::to_vec_pretty(&mt2).unwrap_or_default());
     eprintln!("[afeye] ZIP {} files={n} bytes={size}", zp.display());
     eprintln!("[afeye] done in {}s", t0.elapsed().as_secs());
     Ok(())
 }
 
-fn is_root() -> bool {
-    unsafe { geteuid() == 0 }
-}
-
-unsafe fn geteuid() -> u32 {
-    #[cfg(unix)]
-    {
-        extern "C" {
-            fn geteuid() -> u32;
+async fn terminate(mut c: tokio::process::Child) -> (bool, u64) {
+    let pid = match c.id() {
+        Some(p) => p as i32,
+        None => return (true, 0),
+    };
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let t0 = Instant::now();
+    let mut exited = false;
+    while t0.elapsed() < Duration::from_secs(3) {
+        match c.try_wait() {
+            Ok(Some(_)) | Err(_) => {
+                exited = true;
+                break;
+            }
+            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
-        geteuid()
     }
-    #[cfg(not(unix))]
-    {
-        1
+    let waited = t0.elapsed().as_millis() as u64;
+    if !exited {
+        eprintln!("[afeye] chrome pid {pid} ignored SIGTERM for {waited}ms, sending SIGKILL");
+        let _ = c.kill().await;
     }
+    (exited, waited)
 }
 
 fn user_agent_for(chrome: &PathBuf) -> String {
@@ -783,7 +568,8 @@ fn user_agent_for(chrome: &PathBuf) -> String {
         .split_whitespace()
         .find(|t| {
             t.split('.').count() >= 3
-                && t.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+                && t.split('.')
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
         })
         .unwrap_or("")
         .to_owned();
@@ -794,37 +580,97 @@ fn user_agent_for(chrome: &PathBuf) -> String {
     format!("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36")
 }
 
-fn find_chrome() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("AF_CHROME") {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            return Some(pb);
+const SINK_MARKER: &[u8] = b"afeye-sink/";
+
+fn find_bytes(h: &[u8], n: &[u8]) -> bool {
+    let first = match n.first() {
+        Some(f) => *f,
+        None => return false,
+    };
+    if h.len() < n.len() {
+        return false;
+    }
+    let limit = h.len() - n.len();
+    for (i, &b) in h.iter().enumerate().take(limit + 1) {
+        if b == first && &h[i..i + n.len()] == n {
+            return true;
         }
     }
-    for c in [
-        "google-chrome-stable",
-        "google-chrome",
-        "/tmp/cft/chrome-linux64/chrome",
-        "chromium-browser",
-        "chromium",
-        "/opt/afeye-chrome/chrome",
-        "/opt/afeye-chrome/headless_shell",
-    ] {
-        if c.starts_with('/') {
-            let pb = PathBuf::from(c);
-            if pb.exists() {
-                return Some(pb);
+    false
+}
+
+fn has_sink_marker(p: &Path) -> bool {
+    use std::io::Read;
+    const CHUNK: usize = 4 << 20;
+    const OVL: usize = 64;
+    let mut f = match std::fs::File::open(p) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = vec![0u8; CHUNK + OVL];
+    let mut base = 0usize;
+    loop {
+        let mut got = base;
+        let mut eof = false;
+        while got < buf.len() {
+            match f.read(&mut buf[got..]) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(n) => got += n,
+                Err(_) => return false,
             }
-            continue;
         }
-        if let Ok(o) = std::process::Command::new("which").arg(c).output() {
-            if o.status.success() {
-                let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if !p.is_empty() {
-                    return Some(PathBuf::from(p));
+        if got == 0 {
+            return false;
+        }
+        if find_bytes(&buf[..got], SINK_MARKER) {
+            return true;
+        }
+        if eof {
+            return false;
+        }
+        let start = got - OVL;
+        buf.copy_within(start..got, 0);
+        base = OVL;
+    }
+}
+
+fn find_chrome(root: &Path) -> Result<PathBuf, String> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("AF_CHROME") {
+        if !p.is_empty() {
+            cands.push(PathBuf::from(p));
+        }
+    }
+    cands.push(PathBuf::from("/opt/afeye-chrome/chrome"));
+    for dir in [
+        root.join("out/afeye"),
+        PathBuf::from("out/afeye"),
+        PathBuf::from("/mnt/chromium/src/out/afeye"),
+    ] {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = p.file_name().map(|x| x.to_string_lossy().to_string());
+                if p.is_file() && name.map(|n| n.contains("chrome")).unwrap_or(false) {
+                    cands.push(p);
                 }
             }
         }
     }
-    None
+    for c in &cands {
+        if !c.is_file() {
+            continue;
+        }
+        if has_sink_marker(c) {
+            return Ok(c.clone());
+        }
+        eprintln!(
+            "[afeye] chrome candidate {} has no afeye-sink/ marker (stock build), skipped",
+            c.display()
+        );
+    }
+    Err("no afeye-patched chrome found: build via scripts/build-chromium.sh or set AF_CHROME".into())
 }

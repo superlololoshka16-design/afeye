@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/core/frame/universal_global_scope.cc b/third_party/blink/renderer/core/frame/universal_global_scope.cc
-index 884a285..6a3a55c 100644
+index 884a285..0654829 100644
 --- a/third_party/blink/renderer/core/frame/universal_global_scope.cc
 +++ b/third_party/blink/renderer/core/frame/universal_global_scope.cc
 @@ -4,6 +4,13 @@
@@ -16,20 +16,21 @@ index 884a285..6a3a55c 100644
  #include "base/containers/span.h"
  #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
  #include "third_party/blink/renderer/bindings/core/v8/serialization/post_message_helper.h"
-@@ -20,6 +27,20 @@
+@@ -20,6 +27,21 @@
  
  namespace blink {
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+constexpr uint64_t kAfeyeTaintCap = 100000;
++std::atomic<uint64_t> g_afeye_taint_btoa{0};
++std::atomic<uint64_t> g_afeye_taint_atob{0};
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
 +  return v != nullptr && *v != '\0' && v[0] == '0';
 +}();
-+inline bool AfeyeTaintOn() {
++inline bool AfeyeTaintOn(std::atomic<uint64_t>* ctr, const char* name) {
 +  return !g_afeye_taint_off &&
-+         afeye::g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
++         afeye::AfeyeCapConsume(ctr, 100000, name);
 +}
 +}
 +#endif
@@ -37,13 +38,13 @@ index 884a285..6a3a55c 100644
  String UniversalGlobalScope::btoa(const String& string_to_encode,
                                    ExceptionState& exception_state) {
    if (string_to_encode.IsNull()) {
-@@ -34,6 +55,16 @@ String UniversalGlobalScope::btoa(const String& string_to_encode,
+@@ -34,6 +56,16 @@ String UniversalGlobalScope::btoa(const String& string_to_encode,
      return String();
    }
  
 +#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled() && AfeyeTaintOn() &&
-+      !string_to_encode.empty()) {
++  if (blink::afeye::Enabled() && !string_to_encode.empty() &&
++      AfeyeTaintOn(&g_afeye_taint_btoa, "taint-btoa")) {
 +    base::span<const uint8_t> afeye_l1 =
 +        base::as_byte_span(string_to_encode.Latin1());
 +    blink::afeye::EmitSpan(blink::afeye::kTaintEdge, blink::afeye::NowNs(),
@@ -54,12 +55,13 @@ index 884a285..6a3a55c 100644
    return Base64Encode(base::as_byte_span(string_to_encode.Latin1()));
  }
  
-@@ -58,6 +89,13 @@ String UniversalGlobalScope::atob(const String& encoded_string,
+@@ -58,6 +90,14 @@ String UniversalGlobalScope::atob(const String& encoded_string,
      return String();
    }
  
 +#ifdef BLINK_AFEYE
-+  if (blink::afeye::Enabled() && AfeyeTaintOn() && !out.empty()) {
++  if (blink::afeye::Enabled() && !out.empty() &&
++      AfeyeTaintOn(&g_afeye_taint_atob, "taint-atob")) {
 +    blink::afeye::EmitSpan(blink::afeye::kTaintEdge, blink::afeye::NowNs(),
 +                           "atob", out.data(),
 +                           static_cast<uint32_t>(out.size()));
@@ -69,7 +71,7 @@ index 884a285..6a3a55c 100644
  }
  
 diff --git a/third_party/blink/renderer/core/html/forms/form_data.cc b/third_party/blink/renderer/core/html/forms/form_data.cc
-index 4b46b64..6d7964b 100644
+index 4b46b64..1d82267 100644
 --- a/third_party/blink/renderer/core/html/forms/form_data.cc
 +++ b/third_party/blink/renderer/core/html/forms/form_data.cc
 @@ -30,6 +30,16 @@
@@ -95,14 +97,14 @@ index 4b46b64..6d7964b 100644
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+constexpr uint64_t kAfeyeTaintCap = 100000;
++std::atomic<uint64_t> g_afeye_taint_fd{0};
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
 +  return v != nullptr && *v != '\0' && v[0] == '0';
 +}();
 +inline bool AfeyeTaintOn() {
 +  return !g_afeye_taint_off &&
-+         afeye::g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
++         afeye::AfeyeCapConsume(&g_afeye_taint_fd, 100000, "taint-formdata");
 +}
 +}
 +#endif
@@ -110,7 +112,7 @@ index 4b46b64..6d7964b 100644
  namespace {
  
  class FormDataIterationSource final
-@@ -364,12 +388,48 @@ FormData::Entry::Entry(const String& name, const String& value)
+@@ -364,12 +388,45 @@ FormData::Entry::Entry(const String& name, const String& value)
        << "'name' should be a USVString.";
    DCHECK_EQ(value, ReplaceUnmatchedSurrogates(value))
        << "'value' should be a USVString.";
@@ -119,9 +121,6 @@ index 4b46b64..6d7964b 100644
 +    std::string afeye_name = name.Utf8();
 +    std::string afeye_value = value.IsNull() ? std::string() : value.Utf8();
 +    size_t afeye_ln = afeye_name.size() + afeye_value.size() + 1;
-+    if (afeye_ln > 65536) {
-+      afeye_ln = 65536;
-+    }
 +    Vector<char> afeye_buf(afeye_ln);
 +    char* afeye_p = afeye_buf.data();
 +    size_t afeye_i = 0;
@@ -160,7 +159,7 @@ index 4b46b64..6d7964b 100644
  
  void FormData::Entry::Trace(Visitor* visitor) const {
 diff --git a/third_party/blink/renderer/core/url/url_search_params.cc b/third_party/blink/renderer/core/url/url_search_params.cc
-index 2f4cf50..26e31cb 100644
+index 2f4cf50..11b3927 100644
 --- a/third_party/blink/renderer/core/url/url_search_params.cc
 +++ b/third_party/blink/renderer/core/url/url_search_params.cc
 @@ -4,6 +4,13 @@
@@ -183,14 +182,14 @@ index 2f4cf50..26e31cb 100644
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+constexpr uint64_t kAfeyeTaintCap = 100000;
++std::atomic<uint64_t> g_afeye_taint_usp{0};
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
 +  return v != nullptr && *v != '\0' && v[0] == '0';
 +}();
 +inline bool AfeyeTaintOn() {
 +  return !g_afeye_taint_off &&
-+         afeye::g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
++         afeye::AfeyeCapConsume(&g_afeye_taint_usp, 100000, "taint-usp");
 +}
 +}
 +#endif
@@ -214,7 +213,7 @@ index 2f4cf50..26e31cb 100644
  }
  
 diff --git a/third_party/blink/renderer/modules/encoding/text_decoder.cc b/third_party/blink/renderer/modules/encoding/text_decoder.cc
-index 833f434..577877e 100644
+index 833f434..58205f5 100644
 --- a/third_party/blink/renderer/modules/encoding/text_decoder.cc
 +++ b/third_party/blink/renderer/modules/encoding/text_decoder.cc
 @@ -30,6 +30,13 @@
@@ -237,14 +236,14 @@ index 833f434..577877e 100644
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+constexpr uint64_t kAfeyeTaintCap = 100000;
++std::atomic<uint64_t> g_afeye_taint_tdec{0};
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
 +  return v != nullptr && *v != '\0' && v[0] == '0';
 +}();
 +inline bool AfeyeTaintOn() {
 +  return !g_afeye_taint_off &&
-+         afeye::g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
++         afeye::AfeyeCapConsume(&g_afeye_taint_tdec, 100000, "taint-textdec");
 +}
 +}
 +#endif
@@ -267,7 +266,7 @@ index 833f434..577877e 100644
    if (fatal_ && saw_error) {
      if (!do_not_flush_) {
 diff --git a/third_party/blink/renderer/modules/encoding/text_encoder.cc b/third_party/blink/renderer/modules/encoding/text_encoder.cc
-index 8582a29..c849f77 100644
+index 8582a29..0d8c1d6 100644
 --- a/third_party/blink/renderer/modules/encoding/text_encoder.cc
 +++ b/third_party/blink/renderer/modules/encoding/text_encoder.cc
 @@ -30,6 +30,13 @@
@@ -290,14 +289,14 @@ index 8582a29..c849f77 100644
  
 +#ifdef BLINK_AFEYE
 +namespace {
-+constexpr uint64_t kAfeyeTaintCap = 100000;
++std::atomic<uint64_t> g_afeye_taint_tenc{0};
 +bool g_afeye_taint_off = []() {
 +  const char* v = ::getenv("AFEYE_TRACE_TAINT");
 +  return v != nullptr && *v != '\0' && v[0] == '0';
 +}();
 +inline bool AfeyeTaintOn() {
 +  return !g_afeye_taint_off &&
-+         afeye::g_afeye_taint.fetch_add(1, std::memory_order_relaxed) < kAfeyeTaintCap;
++         afeye::AfeyeCapConsume(&g_afeye_taint_tenc, 100000, "taint-textenc");
 +}
 +}
 +#endif

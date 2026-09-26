@@ -2,10 +2,10 @@
 """afeye: census of sink record files (.rec) - the runtime catch proof.
 
 Walks every <layer>-<pid>.rec in a directory, parses the record stream
-([u32 total_len][u8 kind][u8 flags][u16 rsv][u64 ts_ns][payload]) and
-prints a per-(layer, kind) census. A .rec file that exists but carries
-only the sink-hello record is a DEAD sink, not a catch - so this tool
-also carries assertions:
+([u32 total_len][u8 kind][u8 flags][u32 sid][u16 tid][u32 rsv][u64 ts_ns]
+[payload] - WIRE v3, 24-byte header) and prints a per-(layer, kind) census.
+A .rec file that exists but carries only the sink-hello record is a DEAD
+sink, not a catch - so this tool also carries assertions:
 
     tools/rec_census.py /tmp/afeye-smoke \\
         --expect v8:script-source=1 blink:event-dispatch=1 \\
@@ -67,7 +67,7 @@ KIND_NAMES = {
     40: "bytecode-trace",
 }
 
-HDR = struct.Struct("<IBHI")
+HDR = struct.Struct("<IBBIHIQ")
 
 
 def parse_layer(fname: str) -> str:
@@ -81,11 +81,12 @@ def census(path: str):
     with open(path, "rb") as f:
         buf = f.read()
     off = 0
-    while off + 16 <= len(buf):
-        rec_len, kind, flags, _rsv = HDR.unpack_from(buf, off)
-        if rec_len < 16 or off + rec_len > len(buf):
+    while off + 24 <= len(buf):
+        rec_len, kind, flags, _sid, _tid, _rsv, _ts = HDR.unpack_from(buf, off)
+        if rec_len < 24 or off + rec_len > len(buf):
             tail = len(buf) - off
-            if 16 <= rec_len <= 1 << 20 and 0 <= kind <= 40 and flags <= 1 and tail >= 16:
+            if (24 <= rec_len <= 24 + (1 << 20) and 0 <= kind <= 40
+                    and flags <= 1 and tail >= 24):
                 print(f"torn tail at {path}:{off} rec_len={rec_len} have={tail}")
                 break
             bad += 1

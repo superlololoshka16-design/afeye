@@ -1,5 +1,4 @@
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use tokio::process::Command;
@@ -126,68 +125,28 @@ fn glob_volumes(out: &Path) -> Vec<PathBuf> {
     v
 }
 
-pub fn dir_bytes(p: &Path) -> u64 {
-    let mut n = 0u64;
-    if let Ok(rd) = fs::read_dir(p) {
-        for e in rd.flatten() {
-            let ep = e.path();
-            if ep.is_dir() {
-                n += dir_bytes(&ep);
-            } else if let Ok(m) = fs::metadata(&ep) {
-                n += m.len();
-            }
-        }
-    }
-    n
-}
-
-pub async fn curl_post_file(url: &str, fields: &[(&str, &str)], file_field: &str, path: &Path) -> Result<String, String> {
-    let mut cmd = Command::new("curl");
-    cmd.args(["-sS", "--max-time", "300", "-o", "-"]);
-    cmd.arg(url);
-    for (k, v) in fields {
-        cmd.arg("-F").arg(format!("{k}={v}"));
-    }
-    cmd.arg("-F").arg(format!("{file_field}=@{}", path.display()));
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
-    let o = cmd.output().await.map_err(|e| e.to_string())?;
-    let s = String::from_utf8_lossy(&o.stdout).to_string();
-    if !o.status.success() {
-        return Err(format!("curl rc={}", o.status.code().unwrap_or(-1)));
-    }
-    Ok(s)
-}
-
-pub async fn curl_get(url: &str, hdr: Option<&str>, max_secs: u64) -> Result<String, String> {
-    let mut cmd = Command::new("curl");
-    cmd.args(["-sSL", "--max-time", &max_secs.to_string(), "-o", "-"]);
-    cmd.arg(url);
-    if let Some(h) = hdr {
-        cmd.arg("-H").arg(h);
-    }
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
-    let o = cmd.output().await.map_err(|e| e.to_string())?;
-    if !o.status.success() {
-        return Err(format!("curl rc={}", o.status.code().unwrap_or(-1)));
-    }
-    Ok(String::from_utf8_lossy(&o.stdout).to_string())
-}
-
-pub fn write_append(path: &Path, line: &str) -> io::Result<()> {
-    use std::io::Write;
-    if let Some(d) = path.parent() {
-        fs::create_dir_all(d)?;
-    }
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
-    f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the test needs this: it proves copy_tree loses no bytes. Kept
+    /// out of the prod surface so it cannot be mistaken for live code.
+    fn dir_bytes(p: &Path) -> u64 {
+        let mut n = 0u64;
+        if let Ok(rd) = fs::read_dir(p) {
+            for e in rd.flatten() {
+                let ep = e.path();
+                if ep.is_dir() {
+                    n += dir_bytes(&ep);
+                } else if let Ok(m) = fs::metadata(&ep) {
+                    n += m.len();
+                }
+            }
+        }
+        n
+    }
+
 
     #[tokio::test]
     async fn packs_and_volumes() {
